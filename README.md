@@ -14,8 +14,8 @@ A security-focused Windows 11 software auditing CLI tool for security profession
 - [Architecture](#architecture)
 - [API Rate Limits](#api-rate-limits)
 - [Testing](#testing)
-- [License](#license)
 - [Acknowledgments](#acknowledgments)
+- [License](#license)
 
 ## Overview
 

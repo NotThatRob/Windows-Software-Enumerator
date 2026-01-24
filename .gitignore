@@ -1,0 +1,266 @@
+# =============================================================================
+# Software-Enumerator .gitignore
+# Security-focused exclusions to prevent sensitive data leakage
+# =============================================================================
+
+# =============================================================================
+# SENSITIVE OUTPUT FILES - CRITICAL SECURITY EXCLUSIONS
+# These files contain system inventory and security data
+# =============================================================================
+
+# Audit and application logs (may contain system info, usernames, paths)
+*.log
+logs/
+audit.log
+
+# Software inventory exports (contain full system software lists)
+software.json
+software.csv
+*.inventory.json
+*.inventory.csv
+
+# Baseline snapshots (contain complete software state)
+baseline*.json
+*baseline*.json
+*.baseline
+
+# Vulnerability scan results (contain CVE data about your system)
+vulns*.json
+vulnerabilities*.json
+cve_report*.json
+cve_report*.csv
+scan_results*.json
+
+# =============================================================================
+# CREDENTIALS AND SECRETS - NEVER COMMIT THESE
+# =============================================================================
+
+# Environment files (may contain API keys)
+.env
+.env.*
+.env.local
+.env.development
+.env.production
+.env.test
+*.env
+
+# API key files
+api_key*
+apikey*
+*_api_key*
+*.key
+!*.pub.key
+
+# Credential and secret files
+credentials*
+secrets*
+*.secret
+*.secrets
+*.pem
+*.p12
+*.pfx
+*.cer
+*.crt
+private*.json
+
+# SSH keys (should never be in repo)
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+id_dsa
+id_dsa.*
+*.ppk
+
+# AWS/Cloud credentials
+.aws/
+.azure/
+.gcp/
+credentials.json
+service_account*.json
+
+# =============================================================================
+# IDE AND EDITOR FILES
+# =============================================================================
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.pyproj
+*.pyproj.user
+*.sln
+
+# Visual Studio Code
+.vscode/
+*.code-workspace
+
+# JetBrains IDEs (PyCharm, etc.)
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim/Neovim
+*.swp
+*.swo
+*.swn
+*~
+.netrwhist
+
+# Emacs
+*~
+\#*\#
+.#*
+*.elc
+
+# Claude Code
+.claude/
+*.claude
+
+# =============================================================================
+# PYTHON ARTIFACTS
+# =============================================================================
+
+# Bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+.env/
+virtualenv/
+.virtualenv/
+
+# Distribution and packaging
+dist/
+build/
+eggs/
+*.egg
+*.egg-info/
+.eggs/
+*.whl
+MANIFEST
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Testing and coverage
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+pytestdebug.log
+nosetests.xml
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+.pyre/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Profiling
+*.prof
+*.lprof
+
+# =============================================================================
+# OPERATING SYSTEM FILES
+# =============================================================================
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# =============================================================================
+# TEMPORARY AND BACKUP FILES
+# =============================================================================
+
+# General temp files
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+*.save
+
+# Editor autosave
+*.autosave
+.~lock.*
+
+# =============================================================================
+# OPTIONAL: TEST FILES
+# Uncomment if tests should not be committed
+# =============================================================================
+
+# test_security.py
+
+# =============================================================================
+# OPTIONAL: DOCUMENTATION BUILD
+# =============================================================================
+
+# Sphinx documentation
+docs/_build/
+
+# MkDocs
+site/

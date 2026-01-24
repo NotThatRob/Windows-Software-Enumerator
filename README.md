@@ -247,10 +247,10 @@ The test suite covers:
 - Error message sanitization
 - Audit logging functionality
 
-## License
-
-MIT License - See [LICENSE](LICENSE) for details.
-
 ## Acknowledgments
 
-This project was developed with assistance from [Claude Code](https://claude.ai/claude-code), Anthropic's AI coding assistant. Claude Code helped with code review, security hardening, bug fixes, and documentation.
+This project was developed with assistance from [Claude Code](https://claude.ai/claude-code), Anthropic's AI coding assistant. Claude Code helped with code review, security hardening, bug fixes, and documentation but the core functionality and architecture were human-designed and directed.
+
+## License
+
+See [LICENSE](LICENSE) for details.

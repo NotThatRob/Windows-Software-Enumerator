@@ -62,6 +62,7 @@ secrets*
 *.cer
 *.crt
 private*.json
+*.spec
 
 # SSH keys (should never be in repo)
 id_rsa

@@ -2532,5 +2532,14 @@ Examples:
         enumerator.display_table(software_list)
 
 
+def _running_as_frozen_exe() -> bool:
+    """Check if running as a PyInstaller-bundled executable."""
+    return getattr(sys, 'frozen', False)
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        if _running_as_frozen_exe():
+            input("\nPress Enter to exit...")

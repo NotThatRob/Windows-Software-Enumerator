@@ -474,8 +474,11 @@ class StoreAppScanner:
 
         try:
             # Use PowerShell to get AppxPackages
+            # -NoLogo: Skip the copyright banner (minor startup speedup)
+            # -NoProfile: Skip loading user profile scripts
             cmd = [
                 "powershell",
+                "-NoLogo",
                 "-NoProfile",
                 "-Command",
                 "Get-AppxPackage | Select-Object Name, Version, Publisher, InstallLocation | ConvertTo-Csv -NoTypeInformation"
@@ -669,6 +672,10 @@ class PortableAppScanner:
 
         Symlinks are skipped to prevent traversal attacks where a symlink
         could point to sensitive system locations outside the scan area.
+
+        Uses os.scandir() for performance - DirEntry objects cache stat info
+        from the directory listing, avoiding separate system calls for
+        is_symlink(), is_file(), and is_dir() checks.
         """
         executables = []
         # Resolve the base directory to compare against for symlink validation
@@ -679,21 +686,28 @@ class PortableAppScanner:
                 return
 
             try:
-                for item in path.iterdir():
-                    # Skip all symlinks to prevent directory traversal
-                    if item.is_symlink():
-                        continue
-
-                    if item.is_file() and item.suffix.lower() == ".exe":
-                        # Verify the resolved path is still under the base directory
-                        try:
-                            resolved = item.resolve()
-                            if base_resolved in resolved.parents or resolved.parent == base_resolved:
-                                executables.append(item)
-                        except (OSError, ValueError):
+                # Use os.scandir() instead of Path.iterdir() for performance.
+                # DirEntry objects cache file type info from the directory
+                # listing itself, avoiding extra stat() calls per file.
+                with os.scandir(path) as entries:
+                    for entry in entries:
+                        # DirEntry.is_symlink() uses cached info - no syscall
+                        if entry.is_symlink():
                             continue
-                    elif item.is_dir() and not item.name.startswith("."):
-                        scan_dir(item, depth + 1)
+
+                        name = entry.name
+                        # DirEntry.is_file() and is_dir() use cached info
+                        if entry.is_file(follow_symlinks=False) and name.lower().endswith(".exe"):
+                            # Verify the resolved path is still under the base directory
+                            try:
+                                item_path = Path(entry.path)
+                                resolved = item_path.resolve()
+                                if base_resolved in resolved.parents or resolved.parent == base_resolved:
+                                    executables.append(item_path)
+                            except (OSError, ValueError):
+                                continue
+                        elif entry.is_dir(follow_symlinks=False) and not name.startswith("."):
+                            scan_dir(Path(entry.path), depth + 1)
             except (PermissionError, OSError):
                 pass
 

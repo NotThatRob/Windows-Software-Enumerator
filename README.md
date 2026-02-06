@@ -83,7 +83,8 @@ python Software_Enumerator.py [OPTIONS]
 | `--extensions` | List browser extensions with permission analysis |
 | `--check-vulns` | Scan for known CVEs in installed software |
 | `--nvd-api-key KEY` | NVD API key for faster vulnerability scanning |
-| `--log-file FILE` | Path to audit log file |
+| `--cve-limit N` | Max software items to CVE-check (default: 20, max: 100) |
+| `--log-file FILE` | Path to audit log file (rotated at 5 MB, 3 backups) |
 | `--verbose` | Enable verbose/debug logging |
 
 ### Examples
@@ -125,7 +126,10 @@ python Software_Enumerator.py --check-vulns
 # Use NVD API key for faster scanning
 python Software_Enumerator.py --check-vulns --nvd-api-key YOUR_KEY
 
-# Enable audit logging
+# Scan more software for CVEs (default is 20, max 100)
+python Software_Enumerator.py --check-vulns --cve-limit 50
+
+# Enable audit logging (log files rotate at 5 MB, keeping 3 backups)
 python Software_Enumerator.py --log-file audit.log --verbose
 
 # Combined security audit
@@ -165,7 +169,7 @@ Shows added, removed, and version-changed software since baseline was created:
 Shows available updates with current/available versions and winget package IDs
 
 ### Browser Extensions
-Lists extensions with version, browser, and flags extensions with sensitive permissions (access to all URLs, cookies, history, etc.)
+Lists extensions with version, browser, and flags extensions with sensitive permissions (access to all URLs, cookies, history, storage, notifications, bookmarks, geolocation, local file access, etc.)
 
 ### Vulnerability Scan
 Reports CVEs found with severity ratings (CRITICAL/HIGH/MEDIUM), CVSS scores, and remediation recommendations
@@ -186,8 +190,11 @@ The output of this tool contains sensitive system information:
 
 ### Built-in Security Features
 - **Output Sanitization** - Removes ANSI escape sequences and control characters to prevent terminal injection
-- **Audit Logging** - File-based logging with restricted permissions (0o600)
+- **Audit Logging** - File-based logging with restricted permissions (0o600) and automatic rotation (5 MB max, 3 backups)
 - **Symlink Protection** - Skips symlinks to prevent directory traversal attacks
+- **File Count Safety Limit** - Portable app scanning caps at 500 executables to prevent memory exhaustion
+- **Sliding-Window Rate Limiter** - Tracks API request timestamps in a rolling window with automatic 429 retry
+- **CVE Scan Limit** - Configurable cap (max 100) prevents accidental API abuse
 - **Generic Error Messages** - Prevents information leakage in error output
 - **Generic User-Agent** - Does not identify the scanner tool in API requests
 - **No Hardcoded Credentials** - API keys are passed via environment variables or CLI arguments
@@ -221,15 +228,19 @@ This tool uses only Python standard library modules:
 - `argparse`, `csv`, `json` - CLI and data handling
 - `winreg`, `subprocess` - Windows integration
 - `urllib` - HTTP requests to NVD API
-- `logging` - Audit trail
+- `logging`, `logging.handlers` - Audit trail with log rotation
+- `collections` - Sliding-window rate limiter (deque)
 - `dataclasses` - Data structures
 - `pathlib`, `os` - File system operations
 
 ## API Rate Limits
 
-The CVE scanner uses the NIST NVD API:
-- **Without API key**: 5 requests per 30 seconds
-- **With API key**: 50 requests per 30 seconds
+The CVE scanner uses the NIST NVD API with a sliding-window rate limiter:
+- **Without API key**: 5 requests per 30-second window
+- **With API key**: 50 requests per 30-second window
+- **HTTP 429 handling**: Automatic single retry after a cooldown period
+
+By default, the scanner checks up to 20 software items. Use `--cve-limit N` to increase this (max 100).
 
 Get a free API key at: https://nvd.nist.gov/developers/request-an-api-key
 
@@ -246,6 +257,11 @@ The test suite covers:
 - Symlink protection
 - Error message sanitization
 - Audit logging functionality
+- Log rotation configuration
+- CVE scan limit (default, custom, and cap validation)
+- Portable app file count safety limit
+- Sliding-window rate limiter and HTTP 429 retry
+- Enhanced browser extension permission detection (including Firefox top-level permissions)
 
 ## Acknowledgments
 

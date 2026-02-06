@@ -8,12 +8,14 @@ Enumerates installed software from multiple sources:
 """
 
 import argparse
+import collections
 import csv
 import ctypes
 import getpass
 import io
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import subprocess
@@ -65,8 +67,10 @@ def setup_logging(log_file: str = None, verbose: bool = False) -> None:
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Configure file handler
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        # Configure rotating file handler (5 MB max, keep 3 backups)
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=5*1024*1024, backupCount=3, encoding='utf-8'
+        )
         file_handler.setLevel(level)
         file_handler.setFormatter(logging.Formatter(log_format, date_format))
         logger.addHandler(file_handler)
@@ -298,31 +302,53 @@ class BrowserExtensionInfo:
     permissions: list = field(default_factory=list)
     enabled: bool = True
 
+    # Permissions considered sensitive for security analysis
+    SENSITIVE_PERMISSIONS = [
+        "<all_urls>",
+        "http://*/*",
+        "https://*/*",
+        "*://*/*",
+        "file:///*",
+        "webRequest",
+        "webRequestBlocking",
+        "declarativeNetRequest",
+        "nativeMessaging",
+        "debugger",
+        "cookies",
+        "history",
+        "tabs",
+        "activeTab",
+        "management",
+        "privacy",
+        "proxy",
+        "downloads",
+        "clipboardRead",
+        "clipboardWrite",
+        "storage",
+        "notifications",
+        "alarms",
+        "webNavigation",
+        "bookmarks",
+        "geolocation",
+        "contentSettings",
+    ]
+
     def has_sensitive_permissions(self) -> bool:
         """Check if extension has potentially dangerous permissions."""
-        sensitive = [
-            "<all_urls>",
-            "http://*/*",
-            "https://*/*",
-            "*://*/*",
-            "webRequest",
-            "webRequestBlocking",
-            "nativeMessaging",
-            "debugger",
-            "cookies",
-            "history",
-            "tabs",
-            "management",
-            "privacy",
-            "proxy",
-            "downloads",
-            "clipboardRead",
-            "clipboardWrite",
-        ]
         return any(
-            any(s in p for s in sensitive)
+            any(s in p for s in self.SENSITIVE_PERMISSIONS)
             for p in self.permissions
         )
+
+    def get_sensitive_permission_details(self) -> list[str]:
+        """Return list of matched sensitive permissions."""
+        matched = []
+        for p in self.permissions:
+            for s in self.SENSITIVE_PERMISSIONS:
+                if s in p:
+                    matched.append(p)
+                    break
+        return matched
 
 
 @dataclass
@@ -495,20 +521,18 @@ class StoreAppScanner:
             if result.returncode != 0:
                 return software_list
 
-            lines = result.stdout.strip().split("\n")
-            if len(lines) <= 1:
+            reader = csv.reader(io.StringIO(result.stdout))
+            rows = list(reader)
+            if len(rows) <= 1:
                 return software_list
 
-            # Skip header line
-            for line in lines[1:]:
+            for row in rows[1:]:  # skip header
                 try:
-                    # Parse CSV line (handling quoted values)
-                    parts = self._parse_csv_line(line)
-                    if len(parts) >= 4:
-                        name = parts[0].strip('"')
-                        version = parts[1].strip('"')
-                        publisher = parts[2].strip('"')
-                        install_location = parts[3].strip('"')
+                    if len(row) >= 4:
+                        name = row[0]
+                        version = row[1]
+                        publisher = row[2]
+                        install_location = row[3]
 
                         # Clean up publisher (remove CN= prefix if present)
                         if publisher.startswith("CN="):
@@ -537,25 +561,6 @@ class StoreAppScanner:
             pass
 
         return software_list
-
-    def _parse_csv_line(self, line: str) -> list[str]:
-        """Parse a CSV line, handling quoted values."""
-        parts = []
-        current = ""
-        in_quotes = False
-
-        for char in line:
-            if char == '"':
-                in_quotes = not in_quotes
-                current += char
-            elif char == ',' and not in_quotes:
-                parts.append(current)
-                current = ""
-            else:
-                current += char
-
-        parts.append(current)
-        return parts
 
     def _is_framework_package(self, name: str) -> bool:
         """Check if the package is a framework or system component."""
@@ -667,7 +672,7 @@ class PortableAppScanner:
 
         return software_list
 
-    def _find_executables(self, directory: Path, max_depth: int) -> list[Path]:
+    def _find_executables(self, directory: Path, max_depth: int, max_files: int = 500) -> list[Path]:
         """Find executable files in a directory up to a certain depth.
 
         Symlinks are skipped to prevent traversal attacks where a symlink
@@ -682,7 +687,7 @@ class PortableAppScanner:
         base_resolved = directory.resolve()
 
         def scan_dir(path: Path, depth: int):
-            if depth > max_depth:
+            if depth > max_depth or len(executables) >= max_files:
                 return
 
             try:
@@ -691,6 +696,9 @@ class PortableAppScanner:
                 # listing itself, avoiding extra stat() calls per file.
                 with os.scandir(path) as entries:
                     for entry in entries:
+                        if len(executables) >= max_files:
+                            return
+
                         # DirEntry.is_symlink() uses cached info - no syscall
                         if entry.is_symlink():
                             continue
@@ -712,6 +720,8 @@ class PortableAppScanner:
                 pass
 
         scan_dir(directory, 0)
+        if len(executables) >= max_files:
+            logger.warning(f"File limit ({max_files}) reached scanning {directory}")
         return executables
 
     def _should_skip_exe(self, exe_path: Path) -> bool:
@@ -1181,6 +1191,10 @@ class BrowserExtensionScanner:
                 permissions = addon.get("userPermissions", {}).get("permissions", [])
                 origins = addon.get("userPermissions", {}).get("origins", [])
                 permissions.extend(origins)
+                # Also check top-level permissions (legacy/MV3 format)
+                top_perms = addon.get("permissions", [])
+                if isinstance(top_perms, list):
+                    permissions.extend(top_perms)
 
                 extensions.append(BrowserExtensionInfo(
                     name=name,
@@ -1260,30 +1274,113 @@ class VulnerabilityScanner:
     # Software name mappings to improve CVE search accuracy
     # Maps common software names to their CPE vendor/product names
     SOFTWARE_MAPPINGS = {
+        # Browsers
         "google chrome": ("google", "chrome"),
         "mozilla firefox": ("mozilla", "firefox"),
         "firefox": ("mozilla", "firefox"),
         "microsoft edge": ("microsoft", "edge"),
-        "vlc media player": ("videolan", "vlc_media_player"),
-        "vlc": ("videolan", "vlc_media_player"),
-        "7-zip": ("7-zip", "7-zip"),
+        "opera": ("opera", "opera_browser"),
+        "brave": ("brave", "brave"),
+        "vivaldi": ("vivaldi", "vivaldi"),
+        "tor browser": ("torproject", "tor"),
+        # Dev tools - Editors & IDEs
         "notepad++": ("notepad-plus-plus", "notepad\\+\\+"),
+        "vscode": ("microsoft", "visual_studio_code"),
+        "visual studio code": ("microsoft", "visual_studio_code"),
+        "visual studio": ("microsoft", "visual_studio"),
+        "intellij idea": ("jetbrains", "intellij_idea"),
+        "pycharm": ("jetbrains", "pycharm"),
+        "webstorm": ("jetbrains", "webstorm"),
+        "rider": ("jetbrains", "rider"),
+        "goland": ("jetbrains", "goland"),
+        "clion": ("jetbrains", "clion"),
+        "phpstorm": ("jetbrains", "phpstorm"),
+        "datagrip": ("jetbrains", "datagrip"),
+        "eclipse": ("eclipse", "eclipse_ide"),
+        "sublime text": ("sublimetext", "sublime_text"),
+        "atom": ("atom", "atom"),
+        # Dev tools - Languages & Runtimes
         "python": ("python", "python"),
-        "git": ("git-scm", "git"),
         "nodejs": ("nodejs", "node.js"),
         "node.js": ("nodejs", "node.js"),
         "java": ("oracle", "jre"),
+        "openjdk": ("oracle", "openjdk"),
+        "adoptopenjdk": ("adoptopenjdk", "openjdk"),
+        "go programming language": ("golang", "go"),
+        "rust": ("rust-lang", "rust"),
+        "ruby": ("ruby-lang", "ruby"),
+        "php": ("php", "php"),
+        "perl": ("perl", "perl"),
+        ".net sdk": ("microsoft", ".net"),
+        # Dev tools - Utilities
+        "git": ("git-scm", "git"),
+        "docker desktop": ("docker", "docker"),
+        "wsl": ("microsoft", "windows_subsystem_for_linux"),
+        # Productivity
+        "libreoffice": ("libreoffice", "libreoffice"),
+        "thunderbird": ("mozilla", "thunderbird"),
+        "slack": ("slack", "slack"),
+        "microsoft teams": ("microsoft", "teams"),
+        "notion": ("notion", "notion"),
+        # Media
+        "vlc media player": ("videolan", "vlc_media_player"),
+        "vlc": ("videolan", "vlc_media_player"),
+        "audacity": ("audacityteam", "audacity"),
+        "gimp": ("gimp", "gimp"),
+        "inkscape": ("inkscape", "inkscape"),
+        "blender": ("blender", "blender"),
+        "handbrake": ("handbrake", "handbrake"),
+        "ffmpeg": ("ffmpeg", "ffmpeg"),
+        "kodi": ("kodi", "kodi"),
+        "itunes": ("apple", "itunes"),
+        "obs studio": ("obsproject", "obs_studio"),
+        "spotify": ("spotify", "spotify"),
+        # Security
+        "keepass": ("keepass", "keepass"),
+        "bitwarden": ("bitwarden", "bitwarden"),
+        "openssh": ("openbsd", "openssh"),
+        "winscp": ("winscp", "winscp"),
+        "nmap": ("nmap", "nmap"),
+        "burp suite": ("portswigger", "burp_suite"),
         "openvpn": ("openvpn", "openvpn"),
         "putty": ("putty", "putty"),
         "wireshark": ("wireshark", "wireshark"),
-        "filezilla": ("filezilla-project", "filezilla_client"),
-        "obs studio": ("obsproject", "obs_studio"),
+        # Compression & Utilities
+        "7-zip": ("7-zip", "7-zip"),
+        "winrar": ("rarlab", "winrar"),
+        "peazip": ("peazip", "peazip"),
+        "everything": ("voidtools", "everything"),
+        "sharex": ("sharex", "sharex"),
+        "autohotkey": ("autohotkey", "autohotkey"),
+        "ccleaner": ("piriform", "ccleaner"),
+        "powershell": ("microsoft", "powershell"),
+        # Communication & Collaboration
         "discord": ("discord", "discord"),
         "zoom": ("zoom", "zoom"),
+        "filezilla": ("filezilla-project", "filezilla_client"),
+        # System & Virtualization
+        "vmware workstation": ("vmware", "workstation"),
+        "vmware player": ("vmware", "workstation_player"),
+        "virtualbox": ("oracle", "virtualbox"),
+        "citrix workspace": ("citrix", "workspace"),
+        "teamviewer": ("teamviewer", "teamviewer"),
+        "anydesk": ("anydesk", "anydesk"),
+        # Databases
+        "mysql": ("oracle", "mysql"),
+        "postgresql": ("postgresql", "postgresql"),
+        "mongodb": ("mongodb", "mongodb"),
+        "redis": ("redis", "redis"),
+        "sqlite": ("sqlite", "sqlite"),
+        # Network & Web
+        "nginx": ("f5", "nginx"),
+        "apache": ("apache", "http_server"),
+        "postman": ("postman", "postman"),
+        "curl": ("haxx", "curl"),
+        "wget": ("gnu", "wget"),
+        # Gaming
         "steam": ("valvesoftware", "steam_client"),
-        "spotify": ("spotify", "spotify"),
-        "vscode": ("microsoft", "visual_studio_code"),
-        "visual studio code": ("microsoft", "visual_studio_code"),
+        "epic games launcher": ("epicgames", "epic_games_launcher"),
+        "gog galaxy": ("gog", "galaxy"),
     }
 
     # Software to skip (system components, frameworks, etc.)
@@ -1307,23 +1404,23 @@ class VulnerabilityScanner:
         Direct parameter takes precedence over environment variable.
         """
         self.api_key = api_key or os.environ.get("NVD_API_KEY")
-        self.request_count = 0
-        self.last_request_time = 0
+        self._request_timestamps = collections.deque()
+        self._rate_window = 30.0  # seconds
+        self._rate_max = 50 if self.api_key else 5
 
     def _rate_limit(self):
-        """Implement rate limiting for NVD API (5 requests per 30 seconds without API key)."""
-        if self.api_key:
-            # With API key: 50 requests per 30 seconds
-            min_interval = 0.6
-        else:
-            # Without API key: 5 requests per 30 seconds
-            min_interval = 6.0
-
-        elapsed = time.time() - self.last_request_time
-        if elapsed < min_interval:
-            time.sleep(min_interval - elapsed)
-
-        self.last_request_time = time.time()
+        """Implement sliding-window rate limiting for NVD API."""
+        now = time.time()
+        # Remove timestamps outside the window
+        while self._request_timestamps and now - self._request_timestamps[0] > self._rate_window:
+            self._request_timestamps.popleft()
+        # If at capacity, sleep until oldest exits the window
+        if len(self._request_timestamps) >= self._rate_max:
+            sleep_time = self._rate_window - (now - self._request_timestamps[0])
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            self._request_timestamps.popleft()
+        self._request_timestamps.append(time.time())
 
     def _should_skip_software(self, name: str) -> bool:
         """Check if software should be skipped from vulnerability scanning."""
@@ -1385,7 +1482,17 @@ class VulnerabilityScanner:
                 data = json.loads(response.read().decode('utf-8'))
                 return data.get("vulnerabilities", [])
         except urllib.error.HTTPError as e:
-            if e.code == 403:
+            if e.code == 429:
+                # Too Many Requests — wait and retry once
+                time.sleep(self._rate_window)
+                try:
+                    request = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(request, timeout=30) as response:
+                        data = json.loads(response.read().decode('utf-8'))
+                        return data.get("vulnerabilities", [])
+                except Exception:
+                    raise Exception("NVD API rate limit exceeded. Try again later or use an API key.")
+            elif e.code == 403:
                 raise Exception("NVD API rate limit exceeded. Try again later or use an API key.")
             elif e.code == 404:
                 raise Exception("NVD API endpoint not found.")
@@ -1456,27 +1563,117 @@ class VulnerabilityScanner:
             return "LOW"
         return "UNKNOWN"
 
-    def _version_matches(self, cve_desc: str, installed_version: str) -> bool:
+    @staticmethod
+    def _parse_version(version_str: str) -> tuple:
+        """Parse a version string into a tuple of integers for comparison.
+
+        Handles non-numeric segments by stopping at the first non-numeric part.
+        e.g. "1.2.3-beta" -> (1, 2, 3), "10.0" -> (10, 0), "" -> ()
         """
-        Basic heuristic to check if the CVE might apply to installed version.
-        Returns True if we can't determine (conservative approach).
+        if not version_str:
+            return ()
+        parts = []
+        for segment in version_str.split("."):
+            # Extract leading digits from each segment
+            match = re.match(r'(\d+)', segment)
+            if match:
+                parts.append(int(match.group(1)))
+            else:
+                break
+        return tuple(parts)
+
+    @staticmethod
+    def _version_in_range(installed: tuple, start_inc: str = None,
+                          start_exc: str = None, end_inc: str = None,
+                          end_exc: str = None) -> bool:
+        """Check if an installed version falls within a CPE match range.
+
+        Args:
+            installed: Parsed version tuple, e.g. (1, 2, 3)
+            start_inc: versionStartIncluding boundary (inclusive)
+            start_exc: versionStartExcluding boundary (exclusive)
+            end_inc: versionEndIncluding boundary (inclusive)
+            end_exc: versionEndExcluding boundary (exclusive)
+
+        Returns:
+            True if the version is within the specified range.
+        """
+        parse = VulnerabilityScanner._parse_version
+        if not installed:
+            return True  # Can't compare, assume affected
+
+        if start_inc is not None:
+            bound = parse(start_inc)
+            if bound and installed < bound:
+                return False
+        if start_exc is not None:
+            bound = parse(start_exc)
+            if bound and installed <= bound:
+                return False
+        if end_inc is not None:
+            bound = parse(end_inc)
+            if bound and installed > bound:
+                return False
+        if end_exc is not None:
+            bound = parse(end_exc)
+            if bound and installed >= bound:
+                return False
+        return True
+
+    def _version_matches(self, vuln_data: dict, installed_version: str) -> bool:
+        """Check if a CVE affects the installed version using CPE configuration data.
+
+        Uses the structured configurations/nodes/cpeMatch data from the NVD API
+        response to determine if the installed version falls within any affected
+        version range.
+
+        Returns True (conservative) if no version range data is available.
         """
         if not installed_version:
             return True  # Can't determine, assume it might apply
 
-        # Extract version numbers mentioned in CVE description
-        desc_versions = re.findall(r'(\d+\.\d+(?:\.\d+)*)', cve_desc.lower())
+        installed = self._parse_version(installed_version)
+        if not installed:
+            return True
 
-        if not desc_versions:
-            return True  # No version mentioned, might apply
+        cve = vuln_data.get("cve", {})
+        configurations = cve.get("configurations", [])
+        if not configurations:
+            return True  # No configuration data, conservatively include
 
-        # Simple check: if installed version is mentioned, it might apply
-        installed_base = installed_version.split()[0]  # Remove build numbers etc
-        for v in desc_versions:
-            if installed_base.startswith(v) or v.startswith(installed_base.split('.')[0]):
-                return True
+        has_ranges = False
+        for config in configurations:
+            for node in config.get("nodes", []):
+                for cpe_match in node.get("cpeMatch", []):
+                    if not cpe_match.get("vulnerable", False):
+                        continue
 
-        return True  # Conservative: assume it might apply
+                    start_inc = cpe_match.get("versionStartIncluding")
+                    start_exc = cpe_match.get("versionStartExcluding")
+                    end_inc = cpe_match.get("versionEndIncluding")
+                    end_exc = cpe_match.get("versionEndExcluding")
+
+                    # Only consider entries that have at least one version bound
+                    if not any([start_inc, start_exc, end_inc, end_exc]):
+                        # Exact version match in CPE criteria
+                        criteria = cpe_match.get("criteria", "")
+                        # CPE format: cpe:2.3:a:vendor:product:version:...
+                        cpe_parts = criteria.split(":")
+                        if len(cpe_parts) >= 6 and cpe_parts[5] not in ("*", "-", ""):
+                            has_ranges = True
+                            cpe_ver = self._parse_version(cpe_parts[5])
+                            if cpe_ver and installed == cpe_ver:
+                                return True
+                        continue
+
+                    has_ranges = True
+                    if self._version_in_range(installed, start_inc, start_exc, end_inc, end_exc):
+                        return True
+
+        if not has_ranges:
+            return True  # No version constraints found, conservatively include
+
+        return False  # Version ranges exist but none matched
 
     def scan_software(self, software: SoftwareInfo) -> VulnerabilityResult:
         """Scan a single software for known CVEs."""
@@ -1495,7 +1692,8 @@ class VulnerabilityScanner:
             for vuln in vulnerabilities:
                 cve = self._parse_cve(vuln)
                 if cve and cve.severity in ["CRITICAL", "HIGH", "MEDIUM"]:
-                    result.cves.append(cve)
+                    if self._version_matches(vuln, software.version):
+                        result.cves.append(cve)
 
             # Sort by severity (CRITICAL first)
             severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
@@ -1507,17 +1705,21 @@ class VulnerabilityScanner:
         return result
 
     def scan_software_list(
-        self, software_list: list[SoftwareInfo], progress_callback=None
+        self, software_list: list[SoftwareInfo], progress_callback=None,
+        limit: int = 20,
     ) -> list[VulnerabilityResult]:
         """Scan a list of software for vulnerabilities."""
         results = []
+
+        # Cap limit to prevent API abuse
+        limit = max(1, min(limit, 100))
 
         # Filter to scannable software
         scannable = [s for s in software_list if not self._should_skip_software(s.name)]
 
         # Limit to most important software to avoid excessive API calls
         # Prioritize by having a version number (more likely to be main apps)
-        scannable = [s for s in scannable if s.version][:20]
+        scannable = [s for s in scannable if s.version][:limit]
 
         for i, software in enumerate(scannable):
             if progress_callback:
@@ -2092,6 +2294,14 @@ Examples:
     )
 
     parser.add_argument(
+        "--cve-limit",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Maximum number of software items to check for CVEs (default: 20)",
+    )
+
+    parser.add_argument(
         "--log-file",
         type=str,
         help="Path to audit log file (enables detailed logging)",
@@ -2104,6 +2314,9 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    # Validate --cve-limit
+    args.cve_limit = max(1, min(args.cve_limit, 100))
 
     # Setup logging before any operations
     setup_logging(log_file=args.log_file, verbose=args.verbose)
@@ -2166,7 +2379,7 @@ Examples:
         # Filter to scannable software for progress bar
         vuln_scanner = VulnerabilityScanner(api_key=args.nvd_api_key)
         scannable = [s for s in software_list if not vuln_scanner._should_skip_software(s.name)]
-        scannable = [s for s in scannable if s.version][:20]
+        scannable = [s for s in scannable if s.version][:args.cve_limit]
 
         progress = ProgressBar(total=len(scannable), prefix="CVE Check")
 
@@ -2174,7 +2387,10 @@ Examples:
             progress.update(current, name)
             logger.debug(f"Scanning for CVEs: {name}")
 
-        results = vuln_scanner.scan_software_list(software_list, progress_callback=progress_callback)
+        results = vuln_scanner.scan_software_list(
+            software_list, progress_callback=progress_callback,
+            limit=args.cve_limit,
+        )
         progress.finish("Complete")
 
         total_cves = sum(r.total_count for r in results)

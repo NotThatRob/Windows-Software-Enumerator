@@ -42,7 +42,7 @@ def setup_console_encoding():
             # Set console output to UTF-8
             sys.stdout.reconfigure(encoding='utf-8', errors='replace')
             sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-        except Exception:
+        except (AttributeError, OSError):
             pass
 
 
@@ -119,6 +119,9 @@ def sanitize_output(text: str) -> str:
     text = re.sub(r'\x1b\][^\x07]*\x07', '', text)
     # Remove remaining control characters except newline and tab
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    # Remove Unicode bidirectional overrides and other format characters (category Cf)
+    # Prevents visual spoofing of filenames (e.g., U+202E reverses displayed text)
+    text = ''.join(c for c in text if unicodedata.category(c) != 'Cf')
     return text
 
 
@@ -556,9 +559,13 @@ class StoreAppScanner:
                     continue
 
         except subprocess.TimeoutExpired:
-            pass
-        except Exception:
-            pass
+            logger.warning("PowerShell command timed out while enumerating Store apps")
+        except FileNotFoundError:
+            logger.warning(
+                "PowerShell not found in PATH. Store app enumeration requires PowerShell."
+            )
+        except OSError as e:
+            logger.debug(f"OS error during Store app enumeration: {e}")
 
         return software_list
 
@@ -777,8 +784,8 @@ class PortableAppScanner:
                     version = f"{(ms >> 16) & 0xFFFF}.{ms & 0xFFFF}.{(ls >> 16) & 0xFFFF}.{ls & 0xFFFF}"
                     return version
 
-        except Exception:
-            pass
+        except (OSError, ValueError, OverflowError) as e:
+            logger.debug(f"Could not get file version for {file_path}: {e}")
 
         return ""
 
@@ -811,8 +818,8 @@ class PortableAppScanner:
                     if val_size.value:
                         return ctypes.wstring_at(val_ptr, val_size.value - 1)
 
-        except Exception:
-            pass
+        except (OSError, ValueError, OverflowError) as e:
+            logger.debug(f"Could not get file publisher for {file_path}: {e}")
 
         return ""
 
@@ -864,7 +871,8 @@ class WingetUpdateChecker:
             print("Warning: winget command timed out.")
         except FileNotFoundError:
             print("Warning: winget not found. Please ensure Windows Package Manager is installed.")
-        except Exception:
+        except OSError as e:
+            logger.debug(f"Failed to check for updates: {e}")
             print("Warning: Failed to check for updates.")
 
         return updates
@@ -994,6 +1002,20 @@ class BrowserExtensionScanner:
         extensions.extend(self._scan_firefox_extensions())
         return extensions
 
+    @staticmethod
+    def _discover_profiles(user_data_dir: Path) -> list[str]:
+        """Dynamically discover browser profile directories."""
+        profiles = []
+        if (user_data_dir / "Default").is_dir():
+            profiles.append("Default")
+        try:
+            for entry in user_data_dir.iterdir():
+                if entry.is_dir() and entry.name.startswith("Profile "):
+                    profiles.append(entry.name)
+        except (PermissionError, OSError):
+            pass
+        return profiles
+
     def _scan_chrome_extensions(self) -> list[BrowserExtensionInfo]:
         """Scan Chrome extensions."""
         extensions = []
@@ -1002,8 +1024,7 @@ class BrowserExtensionScanner:
         if not chrome_base.exists():
             return extensions
 
-        # Scan Default profile and any numbered profiles
-        profiles = ["Default"] + [f"Profile {i}" for i in range(1, 10)]
+        profiles = self._discover_profiles(chrome_base)
 
         for profile in profiles:
             extensions_dir = chrome_base / profile / "Extensions"
@@ -1022,7 +1043,7 @@ class BrowserExtensionScanner:
         if not edge_base.exists():
             return extensions
 
-        profiles = ["Default"] + [f"Profile {i}" for i in range(1, 10)]
+        profiles = self._discover_profiles(edge_base)
 
         for profile in profiles:
             extensions_dir = edge_base / profile / "Extensions"
@@ -1490,7 +1511,7 @@ class VulnerabilityScanner:
                     with urllib.request.urlopen(request, timeout=30) as response:
                         data = json.loads(response.read().decode('utf-8'))
                         return data.get("vulnerabilities", [])
-                except Exception:
+                except (urllib.error.HTTPError, urllib.error.URLError, OSError, json.JSONDecodeError):
                     raise Exception("NVD API rate limit exceeded. Try again later or use an API key.")
             elif e.code == 403:
                 raise Exception("NVD API rate limit exceeded. Try again later or use an API key.")
@@ -1853,7 +1874,7 @@ class SoftwareEnumerator:
         """Sort software list by specified field."""
         sort_keys = {
             "name": lambda s: s.name.lower(),
-            "version": lambda s: s.version.lower(),
+            "version": lambda s: VulnerabilityScanner._parse_version(s.version) or (0,),
             "publisher": lambda s: s.publisher.lower(),
             "source": lambda s: s.source.lower(),
         }
@@ -2048,6 +2069,15 @@ class BaselineManager:
             FileNotFoundError: If baseline file doesn't exist
             ValueError: If baseline format is invalid or incompatible version
         """
+        # Guard against excessively large baseline files (max 50 MB)
+        file_size = os.path.getsize(filepath)
+        max_baseline_size = 50 * 1024 * 1024
+        if file_size > max_baseline_size:
+            raise ValueError(
+                f"Baseline file too large ({file_size / 1024 / 1024:.1f} MB). "
+                f"Maximum allowed size is {max_baseline_size // 1024 // 1024} MB."
+            )
+
         with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
 
@@ -2061,6 +2091,15 @@ class BaselineManager:
                 f"Incompatible baseline version: {baseline_version}. "
                 f"Expected version 1.x, got {baseline_version}. "
                 f"Please create a new baseline with the current tool version."
+            )
+
+        # Guard against excessively large baselines
+        max_baseline_entries = 50_000
+        entry_count = len(data.get("software", []))
+        if entry_count > max_baseline_entries:
+            raise ValueError(
+                f"Baseline contains {entry_count} entries, exceeding the "
+                f"maximum of {max_baseline_entries}."
             )
 
         software_list = []
@@ -2290,7 +2329,9 @@ Examples:
     parser.add_argument(
         "--nvd-api-key",
         type=str,
-        help="NVD API key for faster vulnerability scanning (optional)",
+        help="NVD API key for faster vulnerability scanning. "
+             "Prefer setting the NVD_API_KEY environment variable instead, "
+             "as CLI arguments are visible in process listings",
     )
 
     parser.add_argument(
@@ -2513,9 +2554,9 @@ Examples:
     # Handle save baseline
     if args.save_baseline:
         if not software_list:
-            print("WARNING: No software found to save in baseline!", file=sys.stderr)
-            print("The baseline will be empty. This may not be intended.", file=sys.stderr)
-            print("Check your --source and --search options.", file=sys.stderr)
+            print("ERROR: No software found to save in baseline!", file=sys.stderr)
+            print("The baseline would be empty. Check your --source and --search options.", file=sys.stderr)
+            sys.exit(1)
 
         BaselineManager.save_baseline(software_list, args.save_baseline, sources=sources)
         print(f"Baseline saved to: {args.save_baseline}")

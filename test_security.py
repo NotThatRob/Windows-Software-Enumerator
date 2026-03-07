@@ -77,6 +77,33 @@ class TestOutputSanitization(unittest.TestCase):
         self.assertIn("Visible", result)
 
 
+    def test_removes_bidi_overrides(self):
+        """Unicode bidirectional override characters should be stripped."""
+        malicious = "safe\u202eexe.doc"
+        result = se.sanitize_output(malicious)
+        self.assertNotIn("\u202e", result)
+        self.assertEqual(result, "safeexe.doc")
+
+    def test_removes_all_bidi_characters(self):
+        """All Unicode bidi control characters should be stripped."""
+        bidi_chars = [
+            "\u200e", "\u200f",  # LRM, RLM
+            "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",  # LRE..RLO
+            "\u2066", "\u2067", "\u2068", "\u2069",  # LRI..PDI
+        ]
+        for char in bidi_chars:
+            text = f"before{char}after"
+            result = se.sanitize_output(text)
+            self.assertEqual(result, "beforeafter",
+                             f"Failed to strip U+{ord(char):04X}")
+
+    def test_removes_zero_width_format_chars(self):
+        """Zero-width format characters (Cf category) should be stripped."""
+        text = "app\u200bname\ufeff.exe"
+        result = se.sanitize_output(text)
+        self.assertEqual(result, "appname.exe")
+
+
 class TestApiKeyEnvironmentVariable(unittest.TestCase):
     """Test that API key can be read from environment variable."""
 
@@ -798,6 +825,159 @@ class TestEnhancedPermissions(unittest.TestCase):
             os.unlink(temp_path)
 
 
+class TestBaselineLimits(unittest.TestCase):
+    """Test that baseline loading enforces size and entry limits."""
+
+    def test_rejects_oversized_baseline_file(self):
+        """Baseline files larger than 50 MB should be rejected."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump({"version": "1.0", "software": []}, f)
+            temp_path = f.name
+        try:
+            with patch('os.path.getsize', return_value=60 * 1024 * 1024):
+                with self.assertRaises(ValueError) as ctx:
+                    se.BaselineManager.load_baseline(temp_path)
+                self.assertIn("too large", str(ctx.exception))
+        finally:
+            os.unlink(temp_path)
+
+    def test_rejects_too_many_entries(self):
+        """Baselines with more than 50,000 entries should be rejected."""
+        baseline_data = {
+            "version": "1.0",
+            "software": [{"name": f"App{i}", "version": "1.0",
+                         "publisher": "", "install_date": "",
+                         "source": "Registry", "install_location": ""}
+                        for i in range(50001)]
+        }
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(baseline_data, f)
+            temp_path = f.name
+        try:
+            with patch('os.path.getsize', return_value=1024):
+                with self.assertRaises(ValueError) as ctx:
+                    se.BaselineManager.load_baseline(temp_path)
+                self.assertIn("50000", str(ctx.exception).replace(",", "").replace("_", ""))
+        finally:
+            os.unlink(temp_path)
+
+
+class TestSoftwareExporter(unittest.TestCase):
+    """Test SoftwareExporter output formats."""
+
+    def _make_software(self, name="TestApp", version="1.0",
+                       publisher="TestPub", source="Registry"):
+        return se.SoftwareInfo(
+            name=name, version=version, publisher=publisher,
+            install_date="2025-01-01", source=source,
+            install_location="C:\\Apps"
+        )
+
+    def test_to_json_produces_valid_json(self):
+        """to_json() output should parse as valid JSON."""
+        items = [self._make_software(), self._make_software("App2", "2.0")]
+        result = se.SoftwareExporter.to_json(items)
+        data = json.loads(result)
+        self.assertIn("metadata", data)
+        self.assertIn("software", data)
+        self.assertEqual(len(data["software"]), 2)
+
+    def test_to_json_metadata_fields(self):
+        """JSON metadata should contain expected fields."""
+        items = [self._make_software()]
+        data = json.loads(se.SoftwareExporter.to_json(items))
+        meta = data["metadata"]
+        self.assertIn("generated_at", meta)
+        self.assertIn("hostname", meta)
+        self.assertIn("total_count", meta)
+        self.assertEqual(meta["total_count"], 1)
+
+    def test_to_csv_well_formed(self):
+        """to_csv() should produce parseable CSV with correct header."""
+        items = [self._make_software()]
+        csv_output = se.SoftwareExporter.to_csv(items)
+        reader = csv.DictReader(io.StringIO(csv_output))
+        rows = list(reader)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["name"], "TestApp")
+        self.assertEqual(rows[0]["version"], "1.0")
+
+    def test_to_csv_handles_special_characters(self):
+        """CSV should correctly quote fields with commas and quotes."""
+        items = [self._make_software(name='App "Pro", v2', publisher="A, B & C")]
+        csv_output = se.SoftwareExporter.to_csv(items)
+        reader = csv.DictReader(io.StringIO(csv_output))
+        rows = list(reader)
+        self.assertEqual(rows[0]["name"], 'App "Pro", v2')
+        self.assertEqual(rows[0]["publisher"], "A, B & C")
+
+
+class TestBaselineManagerRoundtrip(unittest.TestCase):
+    """Test BaselineManager save/load roundtrip and compare."""
+
+    def setUp(self):
+        self.temp_file = tempfile.NamedTemporaryFile(
+            mode='w', suffix='.json', delete=False
+        )
+        self.temp_file.close()
+
+    def tearDown(self):
+        try:
+            os.unlink(self.temp_file.name)
+        except Exception:
+            pass
+
+    def _make_software(self, name="TestApp", version="1.0"):
+        return se.SoftwareInfo(
+            name=name, version=version, publisher="Pub",
+            install_date="2025-01-01", source="Registry",
+            install_location="C:\\Apps"
+        )
+
+    def test_save_load_roundtrip(self):
+        """Saved baseline should load back with identical software data."""
+        original = [self._make_software("App1", "1.0"),
+                    self._make_software("App2", "2.0")]
+        se.BaselineManager.save_baseline(original, self.temp_file.name,
+                                         sources=["registry"])
+        loaded, metadata = se.BaselineManager.load_baseline(self.temp_file.name)
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(loaded[0].name, "App1")
+        self.assertEqual(loaded[1].version, "2.0")
+        self.assertEqual(metadata["software_count"], 2)
+
+    def test_compare_detects_added(self):
+        """compare() should detect newly installed software."""
+        baseline = [self._make_software("App1")]
+        current = [self._make_software("App1"), self._make_software("App2")]
+        diff = se.BaselineManager.compare(baseline, current)
+        self.assertEqual(len(diff.added), 1)
+        self.assertEqual(diff.added[0].name, "App2")
+
+    def test_compare_detects_removed(self):
+        """compare() should detect uninstalled software."""
+        baseline = [self._make_software("App1"), self._make_software("App2")]
+        current = [self._make_software("App1")]
+        diff = se.BaselineManager.compare(baseline, current)
+        self.assertEqual(len(diff.removed), 1)
+        self.assertEqual(diff.removed[0].name, "App2")
+
+    def test_compare_detects_changed_version(self):
+        """compare() should detect version changes."""
+        baseline = [self._make_software("App1", "1.0")]
+        current = [self._make_software("App1", "2.0")]
+        diff = se.BaselineManager.compare(baseline, current)
+        self.assertEqual(len(diff.changed), 1)
+        self.assertEqual(diff.changed[0][0].version, "1.0")
+        self.assertEqual(diff.changed[0][1].version, "2.0")
+
+    def test_compare_no_changes(self):
+        """compare() should report no changes for identical lists."""
+        items = [self._make_software("App1", "1.0")]
+        diff = se.BaselineManager.compare(items, list(items))
+        self.assertFalse(diff.has_changes)
+
+
 class SecurityTestSuite(unittest.TestSuite):
     """Aggregate all security tests."""
 
@@ -819,6 +999,9 @@ class SecurityTestSuite(unittest.TestSuite):
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestPortableAppFileLimit))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestSlidingWindowRateLimit))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestEnhancedPermissions))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestBaselineLimits))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestSoftwareExporter))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestBaselineManagerRoundtrip))
 
 
 def run_security_tests():

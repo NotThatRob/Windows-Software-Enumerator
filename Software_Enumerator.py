@@ -9,6 +9,7 @@ Enumerates installed software from multiple sources:
 
 import argparse
 import collections
+import concurrent.futures
 import csv
 import ctypes
 import getpass
@@ -44,6 +45,49 @@ def setup_console_encoding():
             sys.stderr.reconfigure(encoding='utf-8', errors='replace')
         except (AttributeError, OSError):
             pass
+
+
+def _load_env_file() -> None:
+    """Load variables from .env files into os.environ (without overwriting existing values).
+
+    Searches for api.env or .env in the script's directory, then the current
+    working directory. Only sets variables that are not already in the environment,
+    so explicit env vars and CLI args always take precedence.
+    """
+    search_dirs = []
+    # Script's own directory
+    script_dir = Path(__file__).resolve().parent
+    search_dirs.append(script_dir)
+    # Current working directory (if different)
+    cwd = Path.cwd()
+    if cwd != script_dir:
+        search_dirs.append(cwd)
+
+    env_filenames = ["api.env", ".env"]
+
+    for search_dir in search_dirs:
+        for filename in env_filenames:
+            env_path = search_dir / filename
+            try:
+                if not env_path.is_file():
+                    continue
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        # Skip comments and blank lines
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" not in line:
+                            continue
+                        key, _, value = line.partition("=")
+                        key = key.strip()
+                        value = value.strip().strip("'\"")
+                        if key and key not in os.environ:
+                            os.environ[key] = value
+                logger.debug(f"Loaded env file: {env_path}")
+                return  # Stop after first file found
+            except (OSError, UnicodeDecodeError) as e:
+                logger.debug(f"Could not read {env_path}: {e}")
 
 
 def setup_logging(log_file: str = None, verbose: bool = False) -> None:
@@ -656,8 +700,7 @@ class PortableAppScanner:
                     if self._should_skip_exe(exe_path):
                         continue
 
-                    version = self._get_file_version(str(exe_path))
-                    publisher = self._get_file_publisher(str(exe_path))
+                    version, publisher = self._get_file_info(str(exe_path))
 
                     if app_name and not app_name.startswith("."):
                         seen_apps.add(app_name)
@@ -740,18 +783,20 @@ class PortableAppScanner:
         exe_name = exe_path.stem.lower()
         return any(skip in exe_name for skip in skip_names)
 
-    def _get_file_version(self, file_path: str) -> str:
-        """Get the version of an executable file using Windows API."""
+    def _get_file_info(self, file_path: str) -> tuple[str, str]:
+        """Get version and publisher from an executable's PE header in a single read."""
+        version = ""
+        publisher = ""
         try:
             size = ctypes.windll.version.GetFileVersionInfoSizeW(file_path, None)
             if size == 0:
-                return ""
+                return version, publisher
 
             buffer = ctypes.create_string_buffer(size)
             if not ctypes.windll.version.GetFileVersionInfoW(file_path, 0, size, buffer):
-                return ""
+                return version, publisher
 
-            # Query for file version
+            # Extract version from VS_FIXEDFILEINFO
             val_ptr = ctypes.c_void_p()
             val_size = ctypes.c_uint()
 
@@ -759,7 +804,6 @@ class PortableAppScanner:
                 buffer, "\\", ctypes.byref(val_ptr), ctypes.byref(val_size)
             ):
                 if val_size.value:
-                    # VS_FIXEDFILEINFO structure
                     class VS_FIXEDFILEINFO(ctypes.Structure):
                         _fields_ = [
                             ("dwSignature", ctypes.c_uint32),
@@ -780,27 +824,9 @@ class PortableAppScanner:
                     info = ctypes.cast(val_ptr, ctypes.POINTER(VS_FIXEDFILEINFO)).contents
                     ms = info.dwFileVersionMS
                     ls = info.dwFileVersionLS
-
                     version = f"{(ms >> 16) & 0xFFFF}.{ms & 0xFFFF}.{(ls >> 16) & 0xFFFF}.{ls & 0xFFFF}"
-                    return version
 
-        except (OSError, ValueError, OverflowError) as e:
-            logger.debug(f"Could not get file version for {file_path}: {e}")
-
-        return ""
-
-    def _get_file_publisher(self, file_path: str) -> str:
-        """Get the publisher/company name from an executable file."""
-        try:
-            size = ctypes.windll.version.GetFileVersionInfoSizeW(file_path, None)
-            if size == 0:
-                return ""
-
-            buffer = ctypes.create_string_buffer(size)
-            if not ctypes.windll.version.GetFileVersionInfoW(file_path, 0, size, buffer):
-                return ""
-
-            # Try common language/codepage combinations
+            # Extract publisher from StringFileInfo
             lang_codepages = [
                 "040904B0",  # US English, Unicode
                 "040904E4",  # US English, Windows Multilingual
@@ -816,12 +842,21 @@ class PortableAppScanner:
                     buffer, query, ctypes.byref(val_ptr), ctypes.byref(val_size)
                 ):
                     if val_size.value:
-                        return ctypes.wstring_at(val_ptr, val_size.value - 1)
+                        publisher = ctypes.wstring_at(val_ptr, val_size.value - 1)
+                        break
 
         except (OSError, ValueError, OverflowError) as e:
-            logger.debug(f"Could not get file publisher for {file_path}: {e}")
+            logger.debug(f"Could not get file info for {file_path}: {e}")
 
-        return ""
+        return version, publisher
+
+    def _get_file_version(self, file_path: str) -> str:
+        """Get the version of an executable file using Windows API."""
+        return self._get_file_info(file_path)[0]
+
+    def _get_file_publisher(self, file_path: str) -> str:
+        """Get the publisher/company name from an executable file."""
+        return self._get_file_info(file_path)[1]
 
     def get_all_portable_apps(self) -> list[SoftwareInfo]:
         """Get all portable applications from configured locations."""
@@ -1428,6 +1463,7 @@ class VulnerabilityScanner:
         self._request_timestamps = collections.deque()
         self._rate_window = 30.0  # seconds
         self._rate_max = 50 if self.api_key else 5
+        self._compiled_skip_patterns = [re.compile(p) for p in self.SKIP_PATTERNS]
 
     def _rate_limit(self):
         """Implement sliding-window rate limiting for NVD API."""
@@ -1446,7 +1482,7 @@ class VulnerabilityScanner:
     def _should_skip_software(self, name: str) -> bool:
         """Check if software should be skipped from vulnerability scanning."""
         name_lower = name.lower()
-        return any(re.search(pattern, name_lower) for pattern in self.SKIP_PATTERNS)
+        return any(pattern.search(name_lower) for pattern in self._compiled_skip_patterns)
 
     def _normalize_software_name(self, name: str) -> str:
         """Normalize software name for better CVE matching."""
@@ -1735,12 +1771,9 @@ class VulnerabilityScanner:
         # Cap limit to prevent API abuse
         limit = max(1, min(limit, 100))
 
-        # Filter to scannable software
-        scannable = [s for s in software_list if not self._should_skip_software(s.name)]
-
-        # Limit to most important software to avoid excessive API calls
-        # Prioritize by having a version number (more likely to be main apps)
-        scannable = [s for s in scannable if s.version][:limit]
+        # Filter to scannable software with version numbers, capped at limit
+        scannable = [s for s in software_list
+                     if not self._should_skip_software(s.name) and s.version][:limit]
 
         for i, software in enumerate(scannable):
             if progress_callback:
@@ -1818,42 +1851,43 @@ class SoftwareEnumerator:
         self.portable_scanner = PortableAppScanner()
 
     def scan_all(self, sources: list[str] = None, show_progress: bool = True) -> list[SoftwareInfo]:
-        """Scan all or specified sources for installed software."""
+        """Scan all or specified sources for installed software.
+
+        Sources are scanned concurrently using a thread pool for faster results.
+        """
         if sources is None:
             sources = ["registry", "store", "portable"]
 
+        source_callables = {
+            "registry": self.registry_scanner.get_all_registry_software,
+            "store": self.store_scanner.get_store_apps,
+            "portable": self.portable_scanner.get_all_portable_apps,
+        }
+
         all_software = []
         total_sources = len(sources)
-        current_source = 0
 
         if show_progress:
             progress = ProgressBar(total=total_sources, prefix="Scanning")
 
-        if "registry" in sources:
-            current_source += 1
-            if show_progress:
-                progress.update(current_source - 1, "Registry...")
-            all_software.extend(self.registry_scanner.get_all_registry_software())
-            if show_progress:
-                progress.update(current_source, f"Registry: {len(all_software)} found")
-
-        if "store" in sources:
-            current_source += 1
-            if show_progress:
-                progress.update(current_source - 1, "Store apps...")
-            store_apps = self.store_scanner.get_store_apps()
-            all_software.extend(store_apps)
-            if show_progress:
-                progress.update(current_source, f"Store: {len(store_apps)} found")
-
-        if "portable" in sources:
-            current_source += 1
-            if show_progress:
-                progress.update(current_source - 1, "Portable apps...")
-            portable_apps = self.portable_scanner.get_all_portable_apps()
-            all_software.extend(portable_apps)
-            if show_progress:
-                progress.update(current_source, f"Portable: {len(portable_apps)} found")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            future_to_source = {
+                executor.submit(source_callables[src]): src
+                for src in sources if src in source_callables
+            }
+            completed = 0
+            for future in concurrent.futures.as_completed(future_to_source):
+                src_name = future_to_source[future]
+                completed += 1
+                try:
+                    result = future.result()
+                    all_software.extend(result)
+                    if show_progress:
+                        progress.update(completed, f"{src_name}: {len(result)} found")
+                except Exception as e:
+                    logger.error(f"Error scanning {src_name}: {e}")
+                    if show_progress:
+                        progress.update(completed, f"{src_name}: error")
 
         if show_progress:
             progress.finish(f"Complete: {len(all_software)} total")
@@ -1882,7 +1916,7 @@ class SoftwareEnumerator:
         key_func = sort_keys.get(sort_by, sort_keys["name"])
         return sorted(software_list, key=key_func)
 
-    def display_table(self, software_list: list[SoftwareInfo]) -> None:
+    def display_table(self, software_list: list[SoftwareInfo], quiet: bool = False) -> None:
         """Display software list as a formatted table."""
         if not software_list:
             print("No software found.")
@@ -1917,7 +1951,8 @@ class SoftwareEnumerator:
             ]
             print(header_fmt.format(*row))
 
-        print(f"\nTotal: {len(software_list)} software items found.")
+        if not quiet:
+            print(f"\nTotal: {len(software_list)} software items found.")
 
 
 class SoftwareExporter:
@@ -1975,14 +2010,7 @@ class SoftwareExporter:
         writer.writeheader()
 
         for software in software_list:
-            writer.writerow({
-                "name": sanitize_output(software.name),
-                "version": sanitize_output(software.version),
-                "publisher": sanitize_output(software.publisher),
-                "install_date": software.install_date,
-                "source": software.source,
-                "install_location": sanitize_output(software.install_location),
-            })
+            writer.writerow(SoftwareExporter._sanitize_software_dict(software))
 
         return output.getvalue()
 
@@ -2354,6 +2382,12 @@ Examples:
         help="Enable verbose logging (includes debug information)",
     )
 
+    parser.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Suppress progress bars and informational output. Data output is still printed.",
+    )
+
     args = parser.parse_args()
 
     # Validate --cve-limit
@@ -2361,6 +2395,9 @@ Examples:
 
     # Setup logging before any operations
     setup_logging(log_file=args.log_file, verbose=args.verbose)
+
+    # Load API keys from .env files (won't overwrite existing env vars)
+    _load_env_file()
 
     # Log session start
     log_audit_event(
@@ -2373,28 +2410,33 @@ Examples:
     # Handle update checking mode
     if args.check_updates:
         log_audit_event("SCAN_START", "Update check via winget", mode="check-updates")
-        spinner = Spinner("Checking for updates via winget")
-        spinner.spin()
+        if not args.quiet:
+            spinner = Spinner("Checking for updates via winget")
+            spinner.spin()
 
         update_checker = WingetUpdateChecker()
         updates = update_checker.check_for_updates()
 
-        spinner.finish(f"Found {len(updates)} available updates")
+        if not args.quiet:
+            spinner.finish(f"Found {len(updates)} available updates")
         log_audit_event("SCAN_END", "Update check completed", updates_found=len(updates))
-        print()
+        if not args.quiet:
+            print()
         update_checker.display_updates_table(updates)
         return
 
     # Handle browser extensions mode
     if args.extensions:
         log_audit_event("SCAN_START", "Browser extension scan", mode="extensions")
-        spinner = Spinner("Scanning browser extensions")
-        spinner.spin("Chrome, Edge, Firefox...")
+        if not args.quiet:
+            spinner = Spinner("Scanning browser extensions")
+            spinner.spin("Chrome, Edge, Firefox...")
 
         extension_scanner = BrowserExtensionScanner()
         extensions = extension_scanner.get_all_extensions()
 
-        spinner.finish(f"Found {len(extensions)} extensions")
+        if not args.quiet:
+            spinner.finish(f"Found {len(extensions)} extensions")
         sensitive_count = sum(1 for e in extensions if e.has_sensitive_permissions())
         log_audit_event(
             "SCAN_END",
@@ -2402,37 +2444,43 @@ Examples:
             extensions_found=len(extensions),
             sensitive_permissions=sensitive_count,
         )
-        print()
+        if not args.quiet:
+            print()
         extension_scanner.display_extensions_table(extensions)
         return
 
     # Handle vulnerability scanning mode
     if args.check_vulns:
         log_audit_event("SCAN_START", "Vulnerability scan via NVD", mode="check-vulns")
-        print("Scanning for known vulnerabilities (CVEs)...")
-        print("This may take a while due to API rate limits.\n")
+        if not args.quiet:
+            print("Scanning for known vulnerabilities (CVEs)...")
+            print("This may take a while due to API rate limits.\n")
 
         # First, enumerate software from registry (most reliable source)
         enumerator = SoftwareEnumerator()
-        software_list = enumerator.scan_all(["registry"], show_progress=True)
-        print()
+        software_list = enumerator.scan_all(["registry"], show_progress=not args.quiet)
+        if not args.quiet:
+            print()
 
         # Filter to scannable software for progress bar
         vuln_scanner = VulnerabilityScanner(api_key=args.nvd_api_key)
-        scannable = [s for s in software_list if not vuln_scanner._should_skip_software(s.name)]
-        scannable = [s for s in scannable if s.version][:args.cve_limit]
+        scannable = [s for s in software_list
+                     if not vuln_scanner._should_skip_software(s.name) and s.version][:args.cve_limit]
 
-        progress = ProgressBar(total=len(scannable), prefix="CVE Check")
+        progress_callback = None
+        if not args.quiet:
+            progress = ProgressBar(total=len(scannable), prefix="CVE Check")
 
-        def progress_callback(current, total, name):
-            progress.update(current, name)
-            logger.debug(f"Scanning for CVEs: {name}")
+            def progress_callback(current, total, name):
+                progress.update(current, name)
+                logger.debug(f"Scanning for CVEs: {name}")
 
         results = vuln_scanner.scan_software_list(
             software_list, progress_callback=progress_callback,
             limit=args.cve_limit,
         )
-        progress.finish("Complete")
+        if not args.quiet:
+            progress.finish("Complete")
 
         total_cves = sum(r.total_count for r in results)
         critical_count = sum(r.critical_count for r in results)
@@ -2444,7 +2492,8 @@ Examples:
             critical_cves=critical_count,
         )
 
-        print()
+        if not args.quiet:
+            print()
         vuln_scanner.display_results(results)
         return
 
@@ -2464,8 +2513,8 @@ Examples:
     )
 
     enumerator = SoftwareEnumerator()
-    # Suppress progress output if outputting to JSON/CSV (for clean piping)
-    show_progress = args.output == "table" and not args.diff
+    # Suppress progress output if outputting to JSON/CSV (for clean piping) or quiet mode
+    show_progress = args.output == "table" and not args.diff and not args.quiet
     software_list = enumerator.scan_all(sources, show_progress=show_progress)
     software_list = enumerator.filter_results(software_list, args.search)
     software_list = enumerator.sort_results(software_list, args.sort)
@@ -2559,9 +2608,10 @@ Examples:
             sys.exit(1)
 
         BaselineManager.save_baseline(software_list, args.save_baseline, sources=sources)
-        print(f"Baseline saved to: {args.save_baseline}")
-        print(f"Software count: {len(software_list)}")
-        print(f"Sources: {', '.join(sources)}")
+        if not args.quiet:
+            print(f"Baseline saved to: {args.save_baseline}")
+            print(f"Software count: {len(software_list)}")
+            print(f"Sources: {', '.join(sources)}")
         return
 
     # Output in requested format
@@ -2570,7 +2620,7 @@ Examples:
     elif args.output == "csv":
         SoftwareExporter.export(software_list, "csv")
     else:
-        enumerator.display_table(software_list)
+        enumerator.display_table(software_list, quiet=args.quiet)
 
 
 def _running_as_frozen_exe() -> bool:

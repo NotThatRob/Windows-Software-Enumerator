@@ -231,9 +231,9 @@ class ProgressBar:
 
         self._last_line_length = len(line) - padding
 
-        # Print without newline
-        sys.stdout.write(line)
-        sys.stdout.flush()
+        # Print without newline (stderr so redirected stdout stays clean)
+        sys.stderr.write(line)
+        sys.stderr.flush()
 
     def _format_time(self, seconds: float) -> str:
         """Format seconds as MM:SS or HH:MM:SS."""
@@ -251,7 +251,7 @@ class ProgressBar:
     def finish(self, message: str = ""):
         """Complete the progress bar and move to next line."""
         self.update(self.total, message)
-        print()  # Move to next line
+        print(file=sys.stderr)  # Move to next line
 
 
 class Spinner:
@@ -268,7 +268,7 @@ class Spinner:
         self._last_line_length = 0
         # Test if unicode works
         try:
-            sys.stdout.write("\r⠋\r ")
+            sys.stderr.write("\r⠋\r ")
             self.frames = self.FRAMES
         except UnicodeEncodeError:
             self.frames = self.FRAMES_ASCII
@@ -296,8 +296,8 @@ class Spinner:
 
         self._last_line_length = len(line) - padding
 
-        sys.stdout.write(line)
-        sys.stdout.flush()
+        sys.stderr.write(line)
+        sys.stderr.flush()
 
     def finish(self, message: str = ""):
         """Complete the spinner."""
@@ -306,7 +306,7 @@ class Spinner:
         line = f"\r✓ {final_msg} ({elapsed:.1f}s)"
         padding = max(0, self._last_line_length - len(line))
         line += " " * padding
-        print(line)
+        print(line, file=sys.stderr)
 
 
 @dataclass
@@ -2421,7 +2421,7 @@ Examples:
             spinner.finish(f"Found {len(updates)} available updates")
         log_audit_event("SCAN_END", "Update check completed", updates_found=len(updates))
         if not args.quiet:
-            print()
+            print(file=sys.stderr)
         update_checker.display_updates_table(updates)
         return
 
@@ -2445,7 +2445,7 @@ Examples:
             sensitive_permissions=sensitive_count,
         )
         if not args.quiet:
-            print()
+            print(file=sys.stderr)
         extension_scanner.display_extensions_table(extensions)
         return
 
@@ -2453,8 +2453,8 @@ Examples:
     if args.check_vulns:
         log_audit_event("SCAN_START", "Vulnerability scan via NVD", mode="check-vulns")
         if not args.quiet:
-            print("Scanning for known vulnerabilities (CVEs)...")
-            print("This may take a while due to API rate limits.\n")
+            print("Scanning for known vulnerabilities (CVEs)...", file=sys.stderr)
+            print("This may take a while due to API rate limits.\n", file=sys.stderr)
 
         # First, enumerate software from registry (most reliable source)
         enumerator = SoftwareEnumerator()
@@ -2493,7 +2493,7 @@ Examples:
         )
 
         if not args.quiet:
-            print()
+            print(file=sys.stderr)
         vuln_scanner.display_results(results)
         return
 

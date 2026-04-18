@@ -149,16 +149,16 @@ class TestUserAgent(unittest.TestCase):
             except:
                 pass  # We just want to capture the request
 
-            # Check the request that was made
-            if mock_urlopen.called:
-                call_args = mock_urlopen.call_args
-                request = call_args[0][0]
-                user_agent = request.get_header('User-agent')
+            # Verify the mock was actually called before checking headers
+            self.assertTrue(mock_urlopen.called, "urlopen was never called — test is not exercising the code path")
+            call_args = mock_urlopen.call_args
+            request = call_args[0][0]
+            user_agent = request.get_header('User-agent')
 
-                # Should not contain identifying information
-                self.assertNotIn("Software-Enumerator", user_agent or "")
-                self.assertNotIn("Security", user_agent or "")
-                self.assertNotIn("Audit", user_agent or "")
+            # Should not contain identifying information
+            self.assertNotIn("Software-Enumerator", user_agent or "")
+            self.assertNotIn("Security", user_agent or "")
+            self.assertNotIn("Audit", user_agent or "")
 
 
 class TestSymlinkProtection(unittest.TestCase):
@@ -280,15 +280,19 @@ class TestAuditLogging(unittest.TestCase):
         self.temp_log = tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False)
         self.temp_log.close()
 
-        # Clear any existing handlers
-        se.logger.handlers = []
+        # Save original handlers and clear
+        self._original_handlers = list(se.logger.handlers)
+        se.logger.handlers.clear()
 
     def tearDown(self):
-        """Clean up temporary log file."""
-        se.logger.handlers = []
+        """Clean up: close handlers, restore originals, remove temp file."""
+        for handler in se.logger.handlers:
+            handler.close()
+        se.logger.handlers.clear()
+        se.logger.handlers.extend(self._original_handlers)
         try:
             os.unlink(self.temp_log.name)
-        except:
+        except OSError:
             pass
 
     def test_log_file_created(self):
@@ -1204,6 +1208,207 @@ class TestLoadEnvFile(unittest.TestCase):
                 os.environ.pop("TEST_ENV_PARSED", None)
 
 
+class TestWingetUpdateChecker(unittest.TestCase):
+    """Tests for WingetUpdateChecker parsing logic."""
+
+    def setUp(self):
+        self.checker = se.WingetUpdateChecker()
+
+    def test_parse_standard_output(self):
+        """Standard winget upgrade output should be parsed correctly."""
+        output = (
+            "Name                            Id                          Version     Available   Source\n"
+            "─────────────────────────────────────────────────────────────────────────────────────────────\n"
+            "Google Chrome                   Google.Chrome               124.0.6367  125.0.6422  winget\n"
+            "Visual Studio Code              Microsoft.VisualStudioCode  1.89.0      1.90.1      winget\n"
+            "2 upgrades available.\n"
+        )
+        updates = self.checker._parse_winget_output(output)
+        self.assertEqual(len(updates), 2)
+        self.assertEqual(updates[0].name, "Google Chrome")
+        self.assertEqual(updates[0].current_version, "124.0.6367")
+        self.assertEqual(updates[0].available_version, "125.0.6422")
+        self.assertEqual(updates[0].winget_id, "Google.Chrome")
+
+    def test_parse_empty_output(self):
+        """Empty output should return no updates."""
+        updates = self.checker._parse_winget_output("")
+        self.assertEqual(updates, [])
+
+    def test_parse_no_updates_available(self):
+        """Output with no upgradeable packages should return empty list."""
+        output = "No installed package found matching input criteria.\n"
+        updates = self.checker._parse_winget_output(output)
+        self.assertEqual(updates, [])
+
+    def test_parse_no_header(self):
+        """Output without a recognizable header should return empty list."""
+        output = "Some random output\nAnother line\n"
+        updates = self.checker._parse_winget_output(output)
+        self.assertEqual(updates, [])
+
+    def test_parse_skips_separator_lines(self):
+        """Separator lines (dashes, box-drawing chars) should be skipped."""
+        output = (
+            "Name    Id          Version  Available  Source\n"
+            "-----------------------------------------------\n"
+            "Firefox Mozilla.Firefox  126.0    127.0      winget\n"
+        )
+        updates = self.checker._parse_winget_output(output)
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0].name, "Firefox")
+
+    def test_parse_skips_same_version(self):
+        """Entries where current == available should be skipped."""
+        output = (
+            "Name    Id          Version  Available  Source\n"
+            "-----------------------------------------------\n"
+            "App     Some.App    1.0.0    1.0.0      winget\n"
+        )
+        updates = self.checker._parse_winget_output(output)
+        self.assertEqual(len(updates), 0)
+
+    def test_warnings_go_to_stderr(self):
+        """Warning messages should print to stderr, not stdout."""
+        import io as _io
+        captured_stderr = _io.StringIO()
+        with patch('subprocess.run', side_effect=FileNotFoundError):
+            with patch('sys.stderr', captured_stderr):
+                self.checker.check_for_updates()
+        self.assertIn("winget not found", captured_stderr.getvalue())
+
+
+class TestStoreAppScanner(unittest.TestCase):
+    """Tests for StoreAppScanner parsing logic."""
+
+    def _make_mock_result(self, stdout, returncode=0):
+        mock = MagicMock()
+        mock.stdout = stdout
+        mock.returncode = returncode
+        return mock
+
+    @patch('subprocess.run')
+    def test_parse_csv_output(self, mock_run):
+        """Standard CSV output from PowerShell should be parsed correctly."""
+        csv_output = (
+            '"Name","Version","Publisher","InstallLocation"\n'
+            '"SpotifyAB.SpotifyMusic","1.230.0","CN=Spotify AB, O=Spotify","C:\\Program Files"\n'
+        )
+        mock_run.return_value = self._make_mock_result(csv_output)
+        scanner = se.StoreAppScanner()
+        apps = scanner.get_store_apps()
+        self.assertGreaterEqual(len(apps), 1)
+        self.assertEqual(apps[0].source, "Store")
+
+    @patch('subprocess.run')
+    def test_nonzero_returncode_returns_empty(self, mock_run):
+        """Non-zero return code should return empty list."""
+        mock_run.return_value = self._make_mock_result("", returncode=1)
+        scanner = se.StoreAppScanner()
+        apps = scanner.get_store_apps()
+        self.assertEqual(apps, [])
+
+    @patch('subprocess.run')
+    def test_empty_csv_returns_empty(self, mock_run):
+        """CSV with only headers should return empty list."""
+        csv_output = '"Name","Version","Publisher","InstallLocation"\n'
+        mock_run.return_value = self._make_mock_result(csv_output)
+        scanner = se.StoreAppScanner()
+        apps = scanner.get_store_apps()
+        self.assertEqual(apps, [])
+
+    @patch('subprocess.run')
+    def test_cleans_cn_prefix_from_publisher(self, mock_run):
+        """Publisher CN= prefix should be stripped."""
+        csv_output = (
+            '"Name","Version","Publisher","InstallLocation"\n'
+            '"TestApp","1.0","CN=Contoso Ltd, O=Contoso","C:\\Apps"\n'
+        )
+        mock_run.return_value = self._make_mock_result(csv_output)
+        scanner = se.StoreAppScanner()
+        apps = scanner.get_store_apps()
+        self.assertEqual(apps[0].publisher, "Contoso Ltd")
+
+
+class TestExcludeFilter(unittest.TestCase):
+    """Tests for --exclude pattern support."""
+
+    def setUp(self):
+        self.software_list = [
+            se.SoftwareInfo(name="Google Chrome", version="125.0", publisher="Google LLC", source="Registry"),
+            se.SoftwareInfo(name="Microsoft .NET Runtime", version="8.0", publisher="Microsoft", source="Registry"),
+            se.SoftwareInfo(name="Visual C++ Redistributable", version="14.0", publisher="Microsoft", source="Registry"),
+            se.SoftwareInfo(name="Firefox", version="127.0", publisher="Mozilla", source="Registry"),
+        ]
+        self.enumerator = se.SoftwareEnumerator()
+
+    def test_exclude_single_term(self):
+        """Single exclude term should filter matching software."""
+        result = self.enumerator.filter_results(self.software_list, exclude_terms=[".NET"])
+        names = [s.name for s in result]
+        self.assertNotIn("Microsoft .NET Runtime", names)
+        self.assertEqual(len(result), 3)
+
+    def test_exclude_multiple_terms(self):
+        """Multiple exclude terms should filter all matching software."""
+        result = self.enumerator.filter_results(self.software_list, exclude_terms=[".NET", "Redistributable"])
+        names = [s.name for s in result]
+        self.assertNotIn("Microsoft .NET Runtime", names)
+        self.assertNotIn("Visual C++ Redistributable", names)
+        self.assertEqual(len(result), 2)
+
+    def test_exclude_by_publisher(self):
+        """Exclude should match against publisher too."""
+        result = self.enumerator.filter_results(self.software_list, exclude_terms=["Microsoft"])
+        names = [s.name for s in result]
+        self.assertNotIn("Microsoft .NET Runtime", names)
+        self.assertNotIn("Visual C++ Redistributable", names)
+        self.assertIn("Google Chrome", names)
+
+    def test_exclude_case_insensitive(self):
+        """Exclude matching should be case-insensitive."""
+        result = self.enumerator.filter_results(self.software_list, exclude_terms=["GOOGLE"])
+        names = [s.name for s in result]
+        self.assertNotIn("Google Chrome", names)
+
+    def test_exclude_with_search_combined(self):
+        """Exclude and search should work together."""
+        result = self.enumerator.filter_results(
+            self.software_list, search_term="Microsoft", exclude_terms=["Redistributable"]
+        )
+        # Search matches .NET and Redistributable (both have Microsoft publisher), exclude removes Redistributable
+        names = [s.name for s in result]
+        self.assertIn("Microsoft .NET Runtime", names)
+        self.assertNotIn("Visual C++ Redistributable", names)
+
+    def test_exclude_no_match(self):
+        """Exclude term that matches nothing should return all software."""
+        result = self.enumerator.filter_results(self.software_list, exclude_terms=["nonexistent"])
+        self.assertEqual(len(result), len(self.software_list))
+
+    def test_exclude_none(self):
+        """None exclude_terms should return all software."""
+        result = self.enumerator.filter_results(self.software_list, exclude_terms=None)
+        self.assertEqual(len(result), len(self.software_list))
+
+
+class TestExitCodes(unittest.TestCase):
+    """Tests for structured exit code constants."""
+
+    def test_exit_code_constants_exist(self):
+        """Exit code constants should be defined."""
+        self.assertEqual(se.EXIT_SUCCESS, 0)
+        self.assertEqual(se.EXIT_ERROR, 1)
+        self.assertEqual(se.EXIT_NO_SOFTWARE, 2)
+        self.assertEqual(se.EXIT_API_FAILURE, 3)
+        self.assertEqual(se.EXIT_PERMISSION_DENIED, 4)
+
+    def test_exit_codes_are_distinct(self):
+        """All exit codes should be unique values."""
+        codes = [se.EXIT_SUCCESS, se.EXIT_ERROR, se.EXIT_NO_SOFTWARE, se.EXIT_API_FAILURE, se.EXIT_PERMISSION_DENIED]
+        self.assertEqual(len(codes), len(set(codes)))
+
+
 class SecurityTestSuite(unittest.TestSuite):
     """Aggregate all security tests."""
 
@@ -1233,6 +1438,10 @@ class SecurityTestSuite(unittest.TestSuite):
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCsvSanitizationConsistency))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCompiledSkipPatterns))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestLoadEnvFile))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestWingetUpdateChecker))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestStoreAppScanner))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestExcludeFilter))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestExitCodes))
 
 
 def run_security_tests():

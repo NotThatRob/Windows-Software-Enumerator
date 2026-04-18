@@ -13,6 +13,7 @@ A security-focused Windows 11 software auditing CLI tool for security profession
 - [Security Considerations](#security-considerations)
 - [Architecture](#architecture)
 - [API Rate Limits](#api-rate-limits)
+- [Exit Codes](#exit-codes)
 - [Testing](#testing)
 - [Acknowledgments](#acknowledgments)
 - [License](#license)
@@ -75,6 +76,7 @@ python Software_Enumerator.py [OPTIONS]
 |--------|-------------|
 | `--source {registry,store,portable,all}` | Source to scan (default: all) |
 | `--search TERM` | Filter results by name, publisher, or version |
+| `--exclude PATTERNS` | Exclude software matching patterns (comma-separated) |
 | `--sort {name,version,publisher,source}` | Sort results by field (default: name) |
 | `--output {table,json,csv}` | Output format (default: table) |
 | `--save-baseline FILE` | Save current state as baseline JSON file |
@@ -86,6 +88,7 @@ python Software_Enumerator.py [OPTIONS]
 | `--cve-limit N` | Max software items to CVE-check (default: 20, max: 100) |
 | `--log-file FILE` | Path to audit log file (rotated at 5 MB, 3 backups) |
 | `--verbose` | Enable verbose/debug logging |
+| `--quiet` | Suppress progress output, print only results |
 
 ### Examples
 
@@ -98,6 +101,12 @@ python Software_Enumerator.py --source store
 
 # Search for Chrome-related software
 python Software_Enumerator.py --search chrome
+
+# Exclude noisy entries (comma-separated patterns)
+python Software_Enumerator.py --exclude "redistributable,.NET Runtime"
+
+# Combine search and exclude
+python Software_Enumerator.py --search microsoft --exclude "redistributable,framework"
 
 # Export to JSON
 python Software_Enumerator.py --output json > software.json
@@ -134,6 +143,9 @@ python Software_Enumerator.py --log-file audit.log --verbose
 
 # Combined security audit
 python Software_Enumerator.py --check-updates --extensions --check-vulns --log-file audit.log
+
+# Quiet mode for scripting (results only, no progress output)
+python Software_Enumerator.py --quiet --output json > inventory.json
 ```
 
 ## Output Formats
@@ -189,20 +201,22 @@ The output of this tool contains sensitive system information:
 - Redact sensitive data before sharing reports
 
 ### Built-in Security Features
-- **Output Sanitization** - Removes ANSI escape sequences and control characters to prevent terminal injection
+- **Output Sanitization** - Removes ANSI escape sequences, control characters, and Unicode bidi overrides to prevent terminal injection
 - **Audit Logging** - File-based logging with restricted permissions (0o600) and automatic rotation (5 MB max, 3 backups)
 - **Symlink Protection** - Skips symlinks to prevent directory traversal attacks
 - **File Count Safety Limit** - Portable app scanning caps at 500 executables to prevent memory exhaustion
+- **Baseline Size Limits** - Rejects baseline files larger than 50 MB or containing more than 50,000 entries
 - **Sliding-Window Rate Limiter** - Tracks API request timestamps in a rolling window with automatic 429 retry
 - **CVE Scan Limit** - Configurable cap (max 100) prevents accidental API abuse
+- **Literal Search Matching** - Search and exclude filters use literal substring matching (not regex) to prevent regex injection
 - **Generic Error Messages** - Prevents information leakage in error output
 - **Generic User-Agent** - Does not identify the scanner tool in API requests
-- **No Hardcoded Credentials** - API keys are passed via environment variables or CLI arguments
+- **No Hardcoded Credentials** - API keys are passed via environment variables, CLI arguments, or local `.env` files
 
 ### API Key Security
-- Store your NVD API key in an environment variable, not in scripts
+- Store your NVD API key in an environment variable or a local `api.env` file (auto-loaded at startup)
 - Never commit API keys to version control
-- The `.gitignore` includes patterns to prevent accidental credential commits
+- The `.gitignore` includes patterns to prevent accidental credential commits (`*.env`, `api.env`)
 
 ## Architecture
 
@@ -229,6 +243,7 @@ This tool uses only Python standard library modules:
 - `winreg`, `subprocess` - Windows integration
 - `urllib` - HTTP requests to NVD API
 - `logging`, `logging.handlers` - Audit trail with log rotation
+- `concurrent.futures` - Parallel source scanning
 - `collections` - Sliding-window rate limiter (deque)
 - `dataclasses` - Data structures
 - `pathlib`, `os` - File system operations
@@ -244,16 +259,34 @@ By default, the scanner checks up to 20 software items. Use `--cve-limit N` to i
 
 Get a free API key at: https://nvd.nist.gov/developers/request-an-api-key
 
+## Exit Codes
+
+Structured exit codes for scripting and CI/CD integration:
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | Generic error |
+| 2 | No software found |
+| 3 | API failure (NVD unreachable) |
+| 4 | Permission denied |
+
 ## Testing
 
 Run the security test suite:
 ```bash
 python test_security.py
+
+# Run a single test class
+python -m unittest test_security.TestWingetUpdateChecker
+
+# Run a single test method
+python -m unittest test_security.TestOutputSanitization.test_removes_ansi_color_codes
 ```
 
 The test suite covers:
-- Output sanitization (ANSI codes, control characters)
-- API key handling (environment variables, CLI arguments)
+- Output sanitization (ANSI codes, control characters, Unicode bidi overrides)
+- API key handling (environment variables, CLI arguments, `.env` file loading)
 - Symlink protection
 - Error message sanitization
 - Audit logging functionality
@@ -262,6 +295,13 @@ The test suite covers:
 - Portable app file count safety limit
 - Sliding-window rate limiter and HTTP 429 retry
 - Enhanced browser extension permission detection (including Firefox top-level permissions)
+- Baseline size limits, save/load roundtrip, and change detection
+- Winget output parsing (header detection, column extraction, edge cases)
+- Store app CSV parsing and publisher cleanup
+- Exclude filter (single/multiple terms, publisher matching, combined with search)
+- Structured exit code constants
+- Parallel source scanning (all sources, single source, error isolation)
+- Quiet mode (progress suppression)
 
 ## Acknowledgments
 

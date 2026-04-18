@@ -35,6 +35,13 @@ from typing import Optional
 # Module-level logger
 logger = logging.getLogger("software_enumerator")
 
+# Exit codes for scripting/CI-CD integration
+EXIT_SUCCESS = 0
+EXIT_ERROR = 1
+EXIT_NO_SOFTWARE = 2
+EXIT_API_FAILURE = 3
+EXIT_PERMISSION_DENIED = 4
+
 
 def setup_console_encoding():
     """Configure console for UTF-8 output on Windows."""
@@ -328,6 +335,14 @@ class SoftwareInfo:
             or search_lower in self.version.lower()
         )
 
+    def matches_exclude(self, exclude_term: str) -> bool:
+        """Check if the software matches an exclusion term (literal, case-insensitive)."""
+        term_lower = exclude_term.lower()
+        return (
+            term_lower in self.name.lower()
+            or term_lower in self.publisher.lower()
+        )
+
 
 @dataclass
 class UpdateInfo:
@@ -562,6 +577,8 @@ class StoreAppScanner:
                 capture_output=True,
                 text=True,
                 timeout=60,
+                encoding='utf-8',
+                errors='replace',
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
 
@@ -850,14 +867,6 @@ class PortableAppScanner:
 
         return version, publisher
 
-    def _get_file_version(self, file_path: str) -> str:
-        """Get the version of an executable file using Windows API."""
-        return self._get_file_info(file_path)[0]
-
-    def _get_file_publisher(self, file_path: str) -> str:
-        """Get the publisher/company name from an executable file."""
-        return self._get_file_info(file_path)[1]
-
     def get_all_portable_apps(self) -> list[SoftwareInfo]:
         """Get all portable applications from configured locations."""
         all_software = []
@@ -903,12 +912,12 @@ class WingetUpdateChecker:
             updates = self._parse_winget_output(result.stdout)
 
         except subprocess.TimeoutExpired:
-            print("Warning: winget command timed out.")
+            print("Warning: winget command timed out.", file=sys.stderr)
         except FileNotFoundError:
-            print("Warning: winget not found. Please ensure Windows Package Manager is installed.")
+            print("Warning: winget not found. Please ensure Windows Package Manager is installed.", file=sys.stderr)
         except OSError as e:
             logger.debug(f"Failed to check for updates: {e}")
-            print("Warning: Failed to check for updates.")
+            print("Warning: Failed to check for updates.", file=sys.stderr)
 
         return updates
 
@@ -1268,7 +1277,7 @@ class BrowserExtensionScanner:
         return extensions
 
     def display_extensions_table(
-        self, extensions: list[BrowserExtensionInfo], show_all_permissions: bool = False
+        self, extensions: list[BrowserExtensionInfo]
     ) -> None:
         """Display browser extensions as a formatted table."""
         if not extensions:
@@ -1895,12 +1904,18 @@ class SoftwareEnumerator:
         return all_software
 
     def filter_results(
-        self, software_list: list[SoftwareInfo], search_term: str = None
+        self, software_list: list[SoftwareInfo], search_term: str = None,
+        exclude_terms: list[str] = None
     ) -> list[SoftwareInfo]:
-        """Filter software list by search term."""
-        if not search_term:
-            return software_list
-        return [s for s in software_list if s.matches_search(search_term)]
+        """Filter software list by search term and exclusion patterns."""
+        if search_term:
+            software_list = [s for s in software_list if s.matches_search(search_term)]
+        if exclude_terms:
+            software_list = [
+                s for s in software_list
+                if not any(s.matches_exclude(term) for term in exclude_terms)
+            ]
+        return software_list
 
     def sort_results(
         self, software_list: list[SoftwareInfo], sort_by: str = "name"
@@ -2284,6 +2299,7 @@ Examples:
   %(prog)s --source store           List only Microsoft Store apps
   %(prog)s --source portable        List only portable applications
   %(prog)s --search chrome          Search for software containing 'chrome'
+  %(prog)s --exclude "redistributable,.NET"  Exclude matching software
   %(prog)s --sort publisher         Sort results by publisher
   %(prog)s --output json            Output as JSON
   %(prog)s --output csv > list.csv  Export to CSV file
@@ -2306,6 +2322,12 @@ Examples:
         "--search",
         type=str,
         help="Search/filter results by name, publisher, or version",
+    )
+
+    parser.add_argument(
+        "--exclude",
+        type=str,
+        help="Exclude software matching patterns (comma-separated, e.g. 'redistributable,.NET Runtime')",
     )
 
     parser.add_argument(
@@ -2516,7 +2538,8 @@ Examples:
     # Suppress progress output if outputting to JSON/CSV (for clean piping) or quiet mode
     show_progress = args.output == "table" and not args.diff and not args.quiet
     software_list = enumerator.scan_all(sources, show_progress=show_progress)
-    software_list = enumerator.filter_results(software_list, args.search)
+    exclude_terms = [t.strip() for t in args.exclude.split(",")] if args.exclude else None
+    software_list = enumerator.filter_results(software_list, args.search, exclude_terms)
     software_list = enumerator.sort_results(software_list, args.sort)
 
     log_audit_event(
@@ -2593,10 +2616,10 @@ Examples:
 
         except FileNotFoundError:
             print(f"Error: Baseline file not found: {args.diff}", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(EXIT_ERROR)
         except (json.JSONDecodeError, ValueError) as e:
             print(f"Error: Invalid baseline file: {e}", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(EXIT_ERROR)
 
         return
 
@@ -2604,8 +2627,8 @@ Examples:
     if args.save_baseline:
         if not software_list:
             print("ERROR: No software found to save in baseline!", file=sys.stderr)
-            print("The baseline would be empty. Check your --source and --search options.", file=sys.stderr)
-            sys.exit(1)
+            print("The baseline would be empty. Check your --source, --search, and --exclude options.", file=sys.stderr)
+            sys.exit(EXIT_NO_SOFTWARE)
 
         BaselineManager.save_baseline(software_list, args.save_baseline, sources=sources)
         if not args.quiet:
@@ -2621,6 +2644,9 @@ Examples:
         SoftwareExporter.export(software_list, "csv")
     else:
         enumerator.display_table(software_list, quiet=args.quiet)
+
+    if not software_list:
+        sys.exit(EXIT_NO_SOFTWARE)
 
 
 def _running_as_frozen_exe() -> bool:

@@ -13,6 +13,7 @@ Tests to verify security fixes are working correctly:
 
 import csv
 import io
+import logging
 import os
 import sys
 import tempfile
@@ -1573,6 +1574,110 @@ class TestExecutableResolution(unittest.TestCase):
         self.assertEqual(fixed, "REAL", "absolute path must run the real PowerShell")
 
 
+class TestLogFilePermissions(unittest.TestCase):
+    """Log files are really restricted to their owner (and SYSTEM) on Windows.
+
+    os.chmod(0o600) used to be the only protection, and on Windows it changes nothing.
+    """
+
+    OWNER_ONLY_ACES = {"(A;;FA;;;OW)", "(A;;FA;;;SY)"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self._saved_handlers = list(se.logger.handlers)
+
+    def tearDown(self):
+        for h in list(se.logger.handlers):
+            if h not in self._saved_handlers:
+                h.close()
+        se.logger.handlers = self._saved_handlers
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _dacl(path):
+        """The file's DACL as SDDL, via icacls /save (UTF-16LE without BOM, not localized)."""
+        import re
+        import subprocess
+        out = Path(tempfile.mkdtemp()) / "acl.txt"
+        try:
+            subprocess.run([str(se._system_dir() / "icacls.exe"), str(path), "/save", str(out)],
+                           capture_output=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            dacl = out.read_text(encoding="utf-16-le").splitlines()[1]
+        finally:
+            out.unlink(missing_ok=True)
+            out.parent.rmdir()
+        return dacl, set(re.findall(r"\([^)]*\)", dacl))
+
+    def _assert_owner_only(self, path):
+        dacl, aces = self._dacl(path)
+        self.assertTrue(dacl.startswith("D:P"), f"DACL not protected from inheritance: {dacl}")
+        self.assertEqual(aces, self.OWNER_ONLY_ACES, f"unexpected entries: {dacl}")
+
+    def _flush(self):
+        for h in se.logger.handlers:
+            h.flush()
+
+    def test_setup_logging_creates_owner_only_file(self):
+        log = self.dir / "audit.log"
+        se.setup_logging(log_file=str(log))
+        se.log_audit_event("TEST", "hello")
+        self._flush()
+        self._assert_owner_only(log)
+        self.assertIn("hello", log.read_text(encoding="utf-8"))   # owner can still write and read
+
+    def test_existing_explicit_grant_is_removed(self):
+        import subprocess
+        log = self.dir / "audit.log"
+        log.write_text("old\n", encoding="utf-8")
+        subprocess.run([str(se._system_dir() / "icacls.exe"), str(log), "/grant", "*S-1-1-0:R"],  # Everyone:R
+                       capture_output=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        self.assertIn("(A;;FR;;;WD)", self._dacl(log)[1])
+        se.setup_logging(log_file=str(log))
+        self._assert_owner_only(log)
+
+    def test_rotated_files_are_owner_only(self):
+        log = self.dir / "rot.log"
+        handler = se._RestrictedRotatingFileHandler(log, maxBytes=200, backupCount=2, encoding="utf-8")
+        test_logger = logging.getLogger("test_rotation_acl")
+        test_logger.addHandler(handler)
+        try:
+            for i in range(30):
+                test_logger.warning("line %03d padding padding padding", i)
+        finally:
+            test_logger.removeHandler(handler)
+            handler.close()
+        for path in (log, Path(f"{log}.1"), Path(f"{log}.2")):
+            self.assertTrue(path.exists(), path)
+            self._assert_owner_only(path)
+
+    def test_setup_logging_uses_restricted_handler(self):
+        se.setup_logging(log_file=str(self.dir / "a.log"))
+        handlers = [h for h in se.logger.handlers if isinstance(h, se._RestrictedRotatingFileHandler)]
+        self.assertEqual(len(handlers), 1)
+
+    def test_failure_warns_once_and_logging_continues(self):
+        log = self.dir / "fail.log"
+        captured = io.StringIO()
+        with patch.object(se, "_restrict_to_owner", side_effect=OSError("unsupported")), \
+             patch("sys.stderr", captured):
+            handler = se._RestrictedRotatingFileHandler(log, maxBytes=200, backupCount=2, encoding="utf-8")
+            test_logger = logging.getLogger("test_acl_failure")
+            test_logger.addHandler(handler)
+            try:
+                for i in range(30):                    # several rollovers, each calls _open()
+                    test_logger.warning("line %03d padding padding padding", i)
+            finally:
+                test_logger.removeHandler(handler)
+                handler.close()
+        self.assertEqual(captured.getvalue().count("could not restrict log file permissions"), 1)
+        self.assertIn("line 029", log.read_text(encoding="utf-8"))
+
+    def test_restrict_to_owner_raises_oserror_for_missing_file(self):
+        with self.assertRaises(OSError):
+            se._restrict_to_owner(str(self.dir / "does-not-exist.log"))
+
+
 def subprocess_run_text(cmd, **kwargs):
     import subprocess
     return subprocess.run(cmd, capture_output=True, text=True, timeout=60, **kwargs).stdout
@@ -1918,6 +2023,7 @@ class SecurityTestSuite(unittest.TestSuite):
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestRegistryMalformedValues))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestBrowserMalformedInput))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestExecutableResolution))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestLogFilePermissions))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCompiledSkipPatterns))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestLoadEnvFile))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestWingetUpdateChecker))

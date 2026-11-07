@@ -12,6 +12,7 @@ import collections
 import concurrent.futures
 import csv
 import ctypes
+from ctypes import wintypes
 import getpass
 import io
 import json
@@ -143,6 +144,71 @@ def _load_env_file() -> None:
                 logger.debug(f"Could not read {env_path}: {e}")
 
 
+# Owner-only DACL for log files, as SDDL: "P" = protected (no entries inherited from the
+# folder); full access ("FA") for the file's owner ("OW", OWNER RIGHTS S-1-3-4) and SYSTEM ("SY").
+# The whole DACL is replaced, so pre-existing explicit entries (e.g. Everyone:Read) go too.
+_OWNER_ONLY_SDDL = "D:P(A;;FA;;;OW)(A;;FA;;;SY)"
+_SDDL_REVISION_1 = 1
+_DACL_SECURITY_INFORMATION = 0x4
+
+
+def _restrict_to_owner(path: str) -> None:
+    """Replace a file's access list with owner + SYSTEM only. Raises OSError on failure.
+
+    os.chmod(path, 0o600) can't do this on Windows: it only toggles the read-only flag.
+    """
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    to_descriptor = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    to_descriptor.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                              ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+    to_descriptor.restype = wintypes.BOOL
+    set_file_security = advapi32.SetFileSecurityW
+    set_file_security.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
+    set_file_security.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    descriptor = ctypes.c_void_p()
+    if not to_descriptor(_OWNER_ONLY_SDDL, _SDDL_REVISION_1, ctypes.byref(descriptor), None):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        if not set_file_security(path, _DACL_SECURITY_INFORMATION, descriptor):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+class _RestrictedRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler whose files are accessible only to their owner (and SYSTEM).
+
+    _open() runs when the file is first opened and after every rollover, so the
+    current file is always restricted, and rotated backups keep their access list
+    when renamed. The restriction is applied before any record is written. A process
+    that opened the empty file in the instant between creation and restriction
+    would keep its access, because Windows checks permissions when a handle is opened.
+
+    If the access list can't be set (e.g. FAT32/exFAT drives, some network shares),
+    one warning is printed and logging continues: the audit must not stop over this.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._acl_warning_shown = False  # set before super().__init__, which calls _open()
+        super().__init__(*args, **kwargs)
+
+    def _open(self):
+        stream = super()._open()
+        try:
+            _restrict_to_owner(self.baseFilename)
+        except OSError:
+            if not self._acl_warning_shown:
+                self._acl_warning_shown = True
+                # print, not logger: this can run inside emit() during a rollover
+                print("Warning: could not restrict log file permissions to the current user; "
+                      "the log file uses its folder's permissions.", file=sys.stderr)
+        return stream
+
+
 def setup_logging(log_file: str = None, verbose: bool = False) -> None:
     """Configure logging for audit trail.
 
@@ -160,23 +226,16 @@ def setup_logging(log_file: str = None, verbose: bool = False) -> None:
     level = logging.DEBUG if verbose else logging.INFO
 
     if log_file:
-        # Ensure log file has restricted permissions on creation
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Configure rotating file handler (5 MB max, keep 3 backups)
-        file_handler = RotatingFileHandler(
+        # Rotating file handler (5 MB max, keep 3 backups); files are owner-only
+        file_handler = _RestrictedRotatingFileHandler(
             log_file, maxBytes=5*1024*1024, backupCount=3, encoding='utf-8'
         )
         file_handler.setLevel(level)
         file_handler.setFormatter(logging.Formatter(log_format, date_format))
         logger.addHandler(file_handler)
-
-        # Try to set restrictive permissions (owner read/write only)
-        try:
-            os.chmod(log_file, 0o600)
-        except (OSError, AttributeError):
-            pass  # Windows may not support chmod, or file doesn't exist yet
 
     # Always add a stderr handler for warnings/errors (but not info/debug)
     stderr_handler = logging.StreamHandler(sys.stderr)

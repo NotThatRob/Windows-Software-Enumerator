@@ -22,6 +22,7 @@ from logging.handlers import RotatingFileHandler
 import msvcrt
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -167,15 +168,29 @@ _OWNER_ONLY_SDDL = "D:P(A;;FA;;;OW)(A;;FA;;;SY)"
 _SDDL_REVISION_1 = 1
 _OWNER_SECURITY_INFORMATION = 0x1
 _DACL_SECURITY_INFORMATION = 0x4
+_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 _SE_FILE_OBJECT = 1
 _TOKEN_QUERY = 0x0008
 _TOKEN_USER = 1
 _TOKEN_OWNER = 4
 _GENERIC_WRITE = 0x40000000
-_FILE_SHARE_READ_WRITE_DELETE = 0x7
+_READ_CONTROL = 0x00020000
+_WRITE_DAC = 0x00040000
+_FILE_READ_ATTRIBUTES = 0x0080
+_LOG_FILE_ACCESS = _GENERIC_WRITE | _WRITE_DAC | _FILE_READ_ATTRIBUTES
+_PROBE_ACCESS = _READ_CONTROL | _FILE_READ_ATTRIBUTES
+# No FILE_SHARE_DELETE: while the log is open nobody can delete or rename it, or rename
+# its folder, so it can't be swapped for another file (e.g. via a directory junction).
+_FILE_SHARE_READ_WRITE = 0x3
 _CREATE_NEW = 1
+_OPEN_EXISTING = 3
 _FILE_ATTRIBUTE_NORMAL = 0x80
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000  # open a symlink itself instead of following it
+_FILE_PERSISTENT_ACLS = 0x00000008
+_ERROR_FILE_NOT_FOUND = 2
+_ERROR_ACCESS_DENIED = 5
 _ERROR_FILE_EXISTS = 80
+_INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 # Owners that can already read every file on the machine, so a log they own leaks nothing new
 _ALWAYS_TRUSTED_OWNER_SIDS = frozenset({"S-1-5-18", "S-1-5-32-544"})  # SYSTEM, Administrators
 
@@ -208,8 +223,17 @@ def _win32() -> types.SimpleNamespace:
                           [wintypes.LPCWSTR, wintypes.DWORD, pp, ctypes.c_void_p], wintypes.BOOL),
         sid_to_string=bind(advapi32.ConvertSidToStringSidW,
                            [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)], wintypes.BOOL),
-        set_file_security=bind(advapi32.SetFileSecurityW,
-                               [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p], wintypes.BOOL),
+        get_sd_dacl=bind(advapi32.GetSecurityDescriptorDacl,
+                         [ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL), pp, ctypes.POINTER(wintypes.BOOL)],
+                         wintypes.BOOL),
+        set_security_info=bind(advapi32.SetSecurityInfo,
+                               [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p,
+                                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p], wintypes.DWORD),
+        get_volume_information=bind(kernel32.GetVolumeInformationByHandleW,
+                                    [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD,
+                                     ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+                                     ctypes.POINTER(wintypes.DWORD), wintypes.LPWSTR, wintypes.DWORD],
+                                    wintypes.BOOL),
         get_security_info=bind(advapi32.GetSecurityInfo,
                                [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, pp, pp, pp, pp, pp],
                                wintypes.DWORD),
@@ -236,42 +260,101 @@ def _owner_only_descriptor() -> ctypes.c_void_p:
     return descriptor
 
 
-def _restrict_to_owner(path: str) -> None:
-    """Replace a file's access list with owner + SYSTEM only. Raises OSError on failure.
+def _restrict_handle_to_owner(handle) -> None:
+    """Replace an open file's access list with owner + SYSTEM only, protected from
+    inheritance. Raises OSError on failure.
 
     os.chmod(path, 0o600) can't do this on Windows: it only toggles the read-only flag.
+    Working on the handle (not the path) guarantees it applies to the file being written.
     """
     api = _win32()
     descriptor = _owner_only_descriptor()
     try:
-        if not api.set_file_security(path, _DACL_SECURITY_INFORMATION, descriptor):
+        present, defaulted, dacl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
+        if not api.get_sd_dacl(descriptor, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)):
             raise ctypes.WinError(ctypes.get_last_error())
-    finally:
-        api.local_free(descriptor)
-
-
-def _create_owner_only_file(path: str) -> bool:
-    """Create a new, empty file with the owner-only access list applied at creation.
-
-    Returns False if the file already exists: CREATE_NEW never opens an existing
-    file, so a file someone else created can't be mistaken for ours. Raises OSError
-    for other failures.
-    """
-    api = _win32()
-    descriptor = _owner_only_descriptor()
-    try:
-        attributes = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), descriptor, False)
-        handle = api.create_file(path, _GENERIC_WRITE, _FILE_SHARE_READ_WRITE_DELETE,
-                                 ctypes.byref(attributes), _CREATE_NEW, _FILE_ATTRIBUTE_NORMAL, None)
-        if handle == wintypes.HANDLE(-1).value:  # INVALID_HANDLE_VALUE
-            error = ctypes.get_last_error()
-            if error == _ERROR_FILE_EXISTS:
-                return False
+        error = api.set_security_info(handle, _SE_FILE_OBJECT,
+                                      _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION,
+                                      None, None, dacl, None)
+        if error:
             raise ctypes.WinError(error)
-        api.close_handle(handle)
-        return True
     finally:
         api.local_free(descriptor)
+
+
+def _volume_supports_acls(handle) -> bool:
+    """True if the file's drive stores access lists (NTFS/ReFS do; FAT32/exFAT don't, and
+    silently ignore the access list requested when a file is created there)."""
+    flags = wintypes.DWORD()
+    if not _win32().get_volume_information(handle, None, 0, None, None, ctypes.byref(flags), None, 0):
+        return False  # can't tell: treat as unprotected so the user is warned
+    return bool(flags.value & _FILE_PERSISTENT_ACLS)
+
+
+def _create_file_handle(path: str, access: int, disposition: int, flags: int,
+                        descriptor=None) -> tuple:
+    """CreateFileW wrapper. Returns (handle, 0) on success, or (None, Windows error code)."""
+    attributes = None
+    if descriptor is not None:
+        security = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), descriptor, False)
+        attributes = ctypes.byref(security)
+    handle = _win32().create_file(path, access, _FILE_SHARE_READ_WRITE, attributes, disposition, flags, None)
+    if handle == _INVALID_HANDLE_VALUE:
+        return None, ctypes.get_last_error()
+    return handle, 0
+
+
+def _open_log_handle(path: str) -> tuple:
+    """Open the log file and return (handle, created). The caller writes through this
+    handle, so the file is never reopened by name.
+
+    - New file: CreateFileW(CREATE_NEW) with the owner-only access list, so it is protected
+      from the instant it exists. CREATE_NEW never opens an existing file.
+    - Existing file: CreateFileW(OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT), so a symlink
+      at the path is opened as itself (and then refused) rather than followed.
+
+    Raises LogFileOwnershipError if access is denied because another account owns the
+    file, or OSError (e.g. PermissionError) for other failures.
+    """
+    for _ in range(3):  # retry if the file appears or disappears between the two calls
+        descriptor = _owner_only_descriptor()
+        try:
+            handle, error = _create_file_handle(path, _LOG_FILE_ACCESS, _CREATE_NEW,
+                                                _FILE_ATTRIBUTE_NORMAL, descriptor)
+        finally:
+            _win32().local_free(descriptor)
+        if handle is not None:
+            return handle, True
+        if error != _ERROR_FILE_EXISTS:
+            raise ctypes.WinError(error)
+
+        handle, error = _create_file_handle(path, _LOG_FILE_ACCESS, _OPEN_EXISTING,
+                                            _FILE_FLAG_OPEN_REPARSE_POINT)
+        if handle is not None:
+            return handle, False
+        if error == _ERROR_FILE_NOT_FOUND:
+            continue
+        if error == _ERROR_ACCESS_DENIED:
+            _raise_if_owned_by_another_account(path)
+        raise ctypes.WinError(error)
+    raise OSError(f"Log file {path} kept changing while it was being opened")
+
+
+def _raise_if_owned_by_another_account(path: str) -> None:
+    """After an access-denied open: raise LogFileOwnershipError if another account owns
+    the file, so the user gets that explanation rather than a bare permission error."""
+    handle, _ = _create_file_handle(path, _PROBE_ACCESS, _OPEN_EXISTING, _FILE_FLAG_OPEN_REPARSE_POINT)
+    if handle is None:
+        return
+    try:
+        owner = _handle_owner_sid(handle)
+        trusted = _trusted_owner_sids()
+    except OSError:
+        return
+    finally:
+        _win32().close_handle(handle)
+    if owner is not None and owner not in trusted:
+        raise LogFileOwnershipError(_foreign_owner_message(path))
 
 
 def _sid_to_string(psid) -> str:
@@ -307,11 +390,22 @@ def _current_owner_sids() -> frozenset:
         api.close_handle(token)
 
 
-def _open_file_owner_sid(stream) -> Optional[str]:
+def _trusted_owner_sids() -> frozenset:
+    """Owners whose log files we accept: ourselves, plus accounts that can read any file anyway."""
+    return _current_owner_sids() | _ALWAYS_TRUSTED_OWNER_SIDS
+
+
+def _foreign_owner_message(path: str) -> str:
+    return (f"Log file {path} already exists and is owned by another account, which could read "
+            f"everything written to it. Choose a different --log-file path, or delete the file "
+            f"if you trust its owner.")
+
+
+def _handle_owner_sid(handle) -> Optional[str]:
     """Owner SID of an open file, read from its handle (so it is the file actually opened)."""
     api = _win32()
     owner, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
-    error = api.get_security_info(msvcrt.get_osfhandle(stream.fileno()), _SE_FILE_OBJECT,
+    error = api.get_security_info(handle, _SE_FILE_OBJECT,
                                   _OWNER_SECURITY_INFORMATION, ctypes.byref(owner), None, None, None,
                                   ctypes.byref(descriptor))
     if error:
@@ -325,17 +419,22 @@ def _open_file_owner_sid(stream) -> Optional[str]:
 class _RestrictedRotatingFileHandler(RotatingFileHandler):
     """RotatingFileHandler whose files are accessible only to the current user (and SYSTEM).
 
+    The file is opened once with CreateFileW and the stream wraps that handle; it is
+    never reopened by name, and every check below is made on that same handle. While
+    it is open, nobody can delete or rename it or its folder (no FILE_SHARE_DELETE),
+    so it can't be swapped for another file.
+
     - A new log file is created with the owner-only access list already in place
-      (CreateFileW with CREATE_NEW), so it is never unprotected, even briefly.
-    - An existing log file is checked on the opened handle and refused with
-      LogFileOwnershipError if another account owns it, or if it is a symbolic link
-      or has other hard links: another account could read whatever is written to it.
+      (CREATE_NEW), so it is never unprotected, even briefly.
+    - An existing log file is opened without following links and refused with
+      LogFileOwnershipError if it is a symbolic link (reparse point), has other hard
+      links, or is owned by another account: that account could read what is written.
       Otherwise its access list is replaced with the owner-only one.
     - Rollovers go through the same path; renamed backups keep their access list.
       If a refused file appears during a rollover, logging stops with errors rather
       than writing to it.
 
-    If the drive doesn't support access lists (e.g. FAT32/exFAT, some network shares),
+    If the drive doesn't store access lists (e.g. FAT32/exFAT, some network shares),
     one warning is printed and logging continues: the audit must not stop over that.
     """
 
@@ -351,48 +450,51 @@ class _RestrictedRotatingFileHandler(RotatingFileHandler):
                   "the log file uses its folder's permissions.", file=sys.stderr)
 
     def _open(self):
-        path = self.baseFilename
-        created = False
-        if not os.path.lexists(path):
-            try:
-                created = _create_owner_only_file(path)
-            except OSError:
-                created = False  # e.g. unsupported drive: fall back to a normal open below
-        if os.path.islink(path):
-            raise LogFileOwnershipError(f"Log file {path} is a symbolic link; refusing to write through it.")
-
-        stream = super()._open()
-        if created:
-            return stream
+        handle, created = _open_log_handle(self.baseFilename)
         try:
-            self._check_existing_file(stream)
-        except LogFileOwnershipError:
-            stream.close()
+            fd = msvcrt.open_osfhandle(handle, os.O_APPEND)  # fd now owns the handle
+        except OSError:
+            _win32().close_handle(handle)
             raise
         try:
-            _restrict_to_owner(path)
-        except OSError:
-            self._warn_unprotected()
-        return stream
+            self._secure(fd, handle, created)
+        except BaseException:
+            os.close(fd)
+            raise
+        return open(fd, self.mode, encoding=self.encoding, errors=self.errors)
 
-    def _check_existing_file(self, stream) -> None:
-        """Raise LogFileOwnershipError if another account could read this already-existing file."""
+    def _secure(self, fd: int, handle, created: bool) -> None:
+        """Checks and access list for the opened file. Raises LogFileOwnershipError if
+        another account could read it."""
         path = self.baseFilename
-        if os.fstat(stream.fileno()).st_nlink > 1:
-            raise LogFileOwnershipError(
-                f"Log file {path} has other hard links, so it may be readable under another name. "
-                f"Choose a different --log-file path.")
+        if not created:
+            info = os.fstat(fd)
+            if info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                raise LogFileOwnershipError(
+                    f"Log file {path} is a symbolic link or other reparse point; refusing to write through it.")
+            if info.st_nlink > 1:
+                raise LogFileOwnershipError(
+                    f"Log file {path} has other hard links, so it may be readable under another name. "
+                    f"Choose a different --log-file path.")
+
+        if not _volume_supports_acls(handle):
+            self._warn_unprotected()  # e.g. FAT32/exFAT: the requested access list was ignored
+            return
+        if created:
+            return  # created owner-only, and held open since, so it can't have been swapped
+
         try:
-            owner = _open_file_owner_sid(stream)
-            trusted = _current_owner_sids() | _ALWAYS_TRUSTED_OWNER_SIDS
+            owner = _handle_owner_sid(handle)
+            trusted = _trusted_owner_sids()
         except OSError:
             self._warn_unprotected()  # ownership can't be checked on this drive
             return
         if owner is not None and owner not in trusted:
-            raise LogFileOwnershipError(
-                f"Log file {path} already exists and is owned by another account, which could read "
-                f"everything written to it. Choose a different --log-file path, or delete the file "
-                f"if you trust its owner.")
+            raise LogFileOwnershipError(_foreign_owner_message(path))
+        try:
+            _restrict_handle_to_owner(handle)
+        except OSError:
+            self._warn_unprotected()
 
 
 def setup_logging(log_file: str = None, verbose: bool = False) -> None:

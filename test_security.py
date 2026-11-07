@@ -14,7 +14,9 @@ Tests to verify security fixes are working correctly:
 import csv
 import io
 import logging
+import msvcrt
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -1657,12 +1659,11 @@ class TestLogFilePermissions(unittest.TestCase):
         self.assertEqual(len(handlers), 1)
 
     def test_failure_warns_once_and_logging_continues(self):
-        """Simulate a drive without access-list support: both the create-time and the
-        after-open restriction fail."""
+        """A drive without access-list support (FAT32/exFAT): new files and every rollover
+        are unprotected, so warn once and keep logging."""
         log = self.dir / "fail.log"
         captured = io.StringIO()
-        with patch.object(se, "_create_owner_only_file", side_effect=OSError("unsupported")), \
-             patch.object(se, "_restrict_to_owner", side_effect=OSError("unsupported")), \
+        with patch.object(se, "_volume_supports_acls", return_value=False), \
              patch("sys.stderr", captured):
             handler = se._RestrictedRotatingFileHandler(log, maxBytes=200, backupCount=2, encoding="utf-8")
             test_logger = logging.getLogger("test_acl_failure")
@@ -1676,9 +1677,17 @@ class TestLogFilePermissions(unittest.TestCase):
         self.assertEqual(captured.getvalue().count("could not restrict log file permissions"), 1)
         self.assertIn("line 029", log.read_text(encoding="utf-8"))
 
-    def test_restrict_to_owner_raises_oserror_for_missing_file(self):
+    def test_new_file_on_drive_without_acls_warns(self):
+        """FAT32/exFAT silently ignore the access list requested at creation, so a brand-new
+        log there must still produce the warning."""
+        captured = io.StringIO()
+        with patch.object(se, "_volume_supports_acls", return_value=False), patch("sys.stderr", captured):
+            se.setup_logging(log_file=str(self.dir / "fat.log"))
+        self.assertEqual(captured.getvalue().count("could not restrict log file permissions"), 1)
+
+    def test_restrict_handle_to_owner_raises_oserror_for_bad_handle(self):
         with self.assertRaises(OSError):
-            se._restrict_to_owner(str(self.dir / "does-not-exist.log"))
+            se._restrict_handle_to_owner(0)
 
     # --- Files that already exist (pre-created by someone else, or linked) ---------------
 
@@ -1687,22 +1696,76 @@ class TestLogFilePermissions(unittest.TestCase):
     def test_new_file_is_restricted_at_creation(self):
         """A new log gets the access list when it is created, not afterwards."""
         log = self.dir / "new.log"
-        with patch.object(se, "_restrict_to_owner") as after_open:
+        with patch.object(se, "_restrict_handle_to_owner") as after_open:
             se.setup_logging(log_file=str(log))
         after_open.assert_not_called()
         self._assert_owner_only(log)
 
-    def test_create_owner_only_file_never_opens_existing_file(self):
+    def test_open_log_handle_never_creates_over_existing_file(self):
         log = self.dir / "exists.log"
         log.write_text("someone else's\n", encoding="utf-8")
-        self.assertFalse(se._create_owner_only_file(str(log)))
+        handle, created = se._open_log_handle(str(log))
+        se._win32().close_handle(handle)
+        self.assertFalse(created)
         self.assertEqual(log.read_text(encoding="utf-8"), "someone else's\n")
+
+    def test_log_is_never_reopened_by_path(self):
+        """The stream must wrap the handle we created or checked, not a second open by name."""
+        log = self.dir / "audit.log"
+        with patch.object(logging.FileHandler, "_open", side_effect=AssertionError("reopened by path")):
+            se.setup_logging(log_file=str(log))
+            se.log_audit_event("TEST", "through the handle")
+            self._flush()
+        self.assertIn("through the handle", log.read_text(encoding="utf-8"))
+
+    def test_open_log_cannot_be_swapped_or_its_folder_renamed(self):
+        """While the log is open, nobody can replace/delete it or rename its folder, so it
+        can't be swapped (e.g. for a directory junction to someone else's folder)."""
+        logs = self.dir / "logs"
+        logs.mkdir()
+        log = logs / "audit.log"
+        se.setup_logging(log_file=str(log))
+        other = self.dir / "attacker.log"
+        other.write_text("attacker\n", encoding="utf-8")
+        for label, action in (("replace", lambda: os.replace(other, log)),
+                              ("delete", lambda: os.remove(log)),
+                              ("rename folder", lambda: os.rename(logs, self.dir / "moved"))):
+            with self.assertRaises(PermissionError, msg=label):
+                action()
+        se.log_audit_event("TEST", "still ours")
+        self._flush()
+        self.assertIn("still ours", log.read_text(encoding="utf-8"))
+
+    def test_reparse_point_is_refused(self):
+        """A symlink is opened as itself (not followed) and recognised by its reparse attribute.
+        Simulated, since creating a real symlink needs admin or Developer Mode."""
+        log = self.dir / "audit.log"
+        log.write_text("x\n", encoding="utf-8")
+        real_fstat = os.fstat
+
+        class _Stat:
+            def __init__(self, st):
+                self.st_nlink = st.st_nlink
+                self.st_file_attributes = st.st_file_attributes | stat.FILE_ATTRIBUTE_REPARSE_POINT
+
+        with patch.object(se.os, "fstat", lambda fd: _Stat(real_fstat(fd))):
+            with self.assertRaises(se.LogFileOwnershipError) as ctx:
+                se.setup_logging(log_file=str(log))
+        self.assertIn("reparse point", str(ctx.exception))
+
+    def test_access_denied_on_foreign_file_explains_ownership(self):
+        log = self.dir / "audit.log"
+        log.write_text("x\n", encoding="utf-8")
+        with patch.object(se, "_handle_owner_sid", return_value=self.FOREIGN_SID):
+            with self.assertRaises(se.LogFileOwnershipError):
+                se._raise_if_owned_by_another_account(str(log))
+        se._raise_if_owned_by_another_account(str(log))   # our own file: no exception
 
     def test_file_owned_by_another_account_is_refused(self):
         log = self.dir / "audit.log"
         log.write_text("pre-created\n", encoding="utf-8")
         dacl_before = self._dacl(log)[0]
-        with patch.object(se, "_open_file_owner_sid", return_value=self.FOREIGN_SID):
+        with patch.object(se, "_handle_owner_sid", return_value=self.FOREIGN_SID):
             with self.assertRaises(se.LogFileOwnershipError) as ctx:
                 se.setup_logging(log_file=str(log))
         self.assertIn("owned by another account", str(ctx.exception))
@@ -1713,7 +1776,7 @@ class TestLogFilePermissions(unittest.TestCase):
         for sid in ("S-1-5-18", "S-1-5-32-544"):
             log = self.dir / f"trusted-{sid}.log"
             log.write_text("x\n", encoding="utf-8")
-            with patch.object(se, "_open_file_owner_sid", return_value=sid):
+            with patch.object(se, "_handle_owner_sid", return_value=sid):
                 se.setup_logging(log_file=str(log))                          # must not raise
             self._assert_owner_only(log)
             for h in list(se.logger.handlers):   # setup_logging() drops old handlers without closing them
@@ -1729,7 +1792,7 @@ class TestLogFilePermissions(unittest.TestCase):
         self._flush()
         self.assertIn("appended", log.read_text(encoding="utf-8"))
         with open(log, "a", encoding="utf-8") as stream:
-            self.assertIn(se._open_file_owner_sid(stream), se._current_owner_sids())
+            self.assertIn(se._handle_owner_sid(msvcrt.get_osfhandle(stream.fileno())), se._current_owner_sids())
 
     def test_hard_linked_log_file_is_refused(self):
         target = self.dir / "elsewhere.txt"
@@ -1757,7 +1820,7 @@ class TestLogFilePermissions(unittest.TestCase):
         log = self.dir / "audit.log"
         log.write_text("x\n", encoding="utf-8")
         captured = io.StringIO()
-        with patch.object(se, "_open_file_owner_sid", side_effect=OSError("no ACL support")), \
+        with patch.object(se, "_handle_owner_sid", side_effect=OSError("no ACL support")), \
              patch("sys.stderr", captured):
             se.setup_logging(log_file=str(log))
             se.log_audit_event("TEST", "still logging")
@@ -1778,7 +1841,7 @@ class TestLogFilePermissions(unittest.TestCase):
     def test_main_exits_permission_denied_for_foreign_log(self):
         log = self.dir / "audit.log"
         log.write_text("pre-created\n", encoding="utf-8")
-        with patch.object(se, "_open_file_owner_sid", return_value=self.FOREIGN_SID):
+        with patch.object(se, "_handle_owner_sid", return_value=self.FOREIGN_SID):
             code, err = self._run_main("--check-updates", "--quiet", "--log-file", str(log))
         self.assertEqual(code, se.EXIT_PERMISSION_DENIED)
         self.assertIn("owned by another account", err)

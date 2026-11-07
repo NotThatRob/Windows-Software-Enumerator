@@ -219,7 +219,8 @@ The output of this tool contains sensitive system information:
 - **No Hardcoded Credentials** - API keys are passed via environment variables, CLI arguments, or local `.env` files
 
 ### API Key Security
-- Store your NVD API key in an environment variable or a local `api.env` file (auto-loaded at startup)
+- Store your NVD API key in an environment variable or a local `api.env` (or `.env`) file containing `NVD_API_KEY=...`, placed **next to `Software_Enumerator.py`** (or next to the `.exe` for packaged builds). It is auto-loaded at startup
+- Only `NVD_API_KEY` is read from these files, and files in the current working directory are ignored, so a file planted where the tool is run from can't change its settings (e.g. proxy or certificate variables)
 - Never commit API keys to version control
 - The `.gitignore` includes patterns to prevent accidental credential commits (`*.env`, `api.env`)
 
@@ -295,7 +296,7 @@ The test suite covers:
 - Malformed registry values and browser extension files (wrong types, null fields, invalid UTF-8, deeply nested JSON)
 - Absolute executable paths (incl. a planted-binary integration test)
 - Owner-only log file access lists, including rotated files and pre-existing files
-- API key handling (environment variables, CLI arguments, `.env` file loading)
+- API key handling (environment variables, CLI arguments, `.env` file loading: allowlisted key only, tool folder only, values never logged)
 - Symlink protection
 - Error message sanitization
 - Audit logging functionality

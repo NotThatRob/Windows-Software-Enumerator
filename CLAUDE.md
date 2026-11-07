@@ -64,7 +64,7 @@ Everything lives in `Software_Enumerator.py` (~2600 lines). Key classes:
 - **Search and exclude use literal matching** (not regex) to avoid regex injection via `matches_search()` and `matches_exclude()`. `--exclude` is comma-separated and matches against name and publisher
 - **Structured exit codes**: `EXIT_SUCCESS=0`, `EXIT_ERROR=1`, `EXIT_NO_SOFTWARE=2`, `EXIT_API_FAILURE=3`, `EXIT_PERMISSION_DENIED=4` — defined as module-level constants for CI/CD scripting
 - **`SOFTWARE_MAPPINGS` dict** in `VulnerabilityScanner`: maps normalized software names to `(vendor, product)` tuples for NVD CPE queries
-- **Env file loading**: `_load_env_file()` loads `api.env` or `.env` from the script directory or CWD at startup. Does not overwrite existing env vars. The `api.env` file in the repo root is gitignored and is the intended place for NVD API keys during local development
+- **Env file loading**: `_load_env_file()` reads `api.env` (then `.env`) only from the tool's own folder (`_env_search_dirs()`: the script's folder, or the `.exe`'s folder when frozen) — never the CWD — and only accepts keys in `_ENV_FILE_ALLOWED_KEYS` (`NVD_API_KEY`). Other keys are ignored and logged by name, never by value. Does not overwrite existing env vars. The `api.env` file in the repo root is gitignored and is the intended place for NVD API keys during local development. Tests must patch `_env_search_dirs()` so the real `api.env` is never read
 
 ## Testing
 

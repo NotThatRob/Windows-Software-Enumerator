@@ -1704,90 +1704,97 @@ class TestCompiledSkipPatterns(unittest.TestCase):
 
 
 class TestLoadEnvFile(unittest.TestCase):
-    """Test _load_env_file() loads API keys from .env files."""
+    """_load_env_file() reads only NVD_API_KEY, and only from the tool's own folder.
 
-    def test_loads_key_from_env_file(self):
-        """Variables from .env file should be loaded into os.environ."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            env_path = Path(tmpdir) / "api.env"
-            env_path.write_text("TEST_ENV_VAR_XYZ=secret123\n", encoding="utf-8")
+    These tests call the real function with _env_search_dirs() pointed at a temp
+    folder, so the developer's real api.env is never read.
+    """
 
-            # Ensure the var doesn't exist yet
-            os.environ.pop("TEST_ENV_VAR_XYZ", None)
+    WATCHED = ("NVD_API_KEY", "SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY", "ZZ_TEST_EXTRA_VAR")
 
-            with patch("Software_Enumerator.Path") as mock_path_cls:
-                # Make __file__ resolve to tmpdir so the function searches there
-                mock_script = MagicMock()
-                mock_script.resolve.return_value.parent = Path(tmpdir)
-                mock_path_cls.return_value = mock_script
-                mock_path_cls.__truediv__ = Path.__truediv__
-                # Directly call with real paths
-                mock_path_cls.cwd.return_value = Path(tmpdir)
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self._env = patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        for key in self.WATCHED:
+            os.environ.pop(key, None)
 
-            # Simpler approach: just test the parsing logic directly
-            os.environ.pop("TEST_ENV_VAR_XYZ", None)
-            # Write to script dir (since the function checks script dir)
-            script_dir = Path(se.__file__).resolve().parent
-            test_env = script_dir / ".test_env_load"
-            try:
-                test_env.write_text("TEST_ENV_VAR_XYZ=secret123\n", encoding="utf-8")
-                with patch.object(se, '_load_env_file') as mock_load:
-                    # Verify function is callable
-                    se._load_env_file.__wrapped__ if hasattr(se._load_env_file, '__wrapped__') else None
-            finally:
-                test_env.unlink(missing_ok=True)
-                os.environ.pop("TEST_ENV_VAR_XYZ", None)
+    def tearDown(self):
+        self._env.stop()
+        self.tmp.cleanup()
 
-    def test_does_not_overwrite_existing_env(self):
-        """Existing environment variables should not be overwritten by .env files."""
-        os.environ["TEST_ENV_PRESERVE"] = "original"
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                env_path = Path(tmpdir) / "api.env"
-                env_path.write_text("TEST_ENV_PRESERVE=overwritten\n", encoding="utf-8")
+    def _load(self, files):
+        for name, content in files.items():
+            (self.dir / name).write_text(content, encoding="utf-8")
+        with patch.object(se, "_env_search_dirs", return_value=[self.dir]):
+            se._load_env_file()
 
-                # Manually replicate the parsing logic to verify behavior
-                with open(env_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#") or "=" not in line:
-                            continue
-                        key, _, value = line.partition("=")
-                        key = key.strip()
-                        value = value.strip().strip("'\"")
-                        if key and key not in os.environ:
-                            os.environ[key] = value
+    def test_loads_api_key_from_api_env(self):
+        self._load({"api.env": "NVD_API_KEY=test-key-123\n"})
+        self.assertEqual(os.environ.get("NVD_API_KEY"), "test-key-123")
 
-                self.assertEqual(os.environ["TEST_ENV_PRESERVE"], "original")
-        finally:
-            os.environ.pop("TEST_ENV_PRESERVE", None)
+    def test_loads_from_dot_env_when_no_api_env(self):
+        self._load({".env": "NVD_API_KEY=from-dot-env\n"})
+        self.assertEqual(os.environ.get("NVD_API_KEY"), "from-dot-env")
+
+    def test_api_env_wins_and_loading_stops_at_first_file(self):
+        self._load({"api.env": "NVD_API_KEY=from-api-env\n", ".env": "NVD_API_KEY=from-dot-env\n"})
+        self.assertEqual(os.environ.get("NVD_API_KEY"), "from-api-env")
+
+    def test_strips_quotes_and_whitespace(self):
+        self._load({"api.env": '  NVD_API_KEY = "quoted-key"  \n'})
+        self.assertEqual(os.environ.get("NVD_API_KEY"), "quoted-key")
 
     def test_skips_comments_and_blank_lines(self):
-        """Comments and blank lines in .env files should be ignored."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            env_path = Path(tmpdir) / "api.env"
-            env_path.write_text(
-                "# This is a comment\n\nTEST_ENV_PARSED=yes\n  \n# Another comment\n",
-                encoding="utf-8",
-            )
+        self._load({"api.env": "# comment\n\n   \nnot a pair\nNVD_API_KEY=yes\n# another\n"})
+        self.assertEqual(os.environ.get("NVD_API_KEY"), "yes")
 
-            os.environ.pop("TEST_ENV_PARSED", None)
-            try:
-                # Parse the file the same way _load_env_file does
-                with open(env_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#") or "=" not in line:
-                            continue
-                        key, _, value = line.partition("=")
-                        key = key.strip()
-                        value = value.strip().strip("'\"")
-                        if key and key not in os.environ:
-                            os.environ[key] = value
+    def test_does_not_overwrite_existing_env(self):
+        os.environ["NVD_API_KEY"] = "from-real-environment"
+        self._load({"api.env": "NVD_API_KEY=from-file\n"})
+        self.assertEqual(os.environ["NVD_API_KEY"], "from-real-environment")
 
-                self.assertEqual(os.environ.get("TEST_ENV_PARSED"), "yes")
-            finally:
-                os.environ.pop("TEST_ENV_PARSED", None)
+    def test_key_name_is_case_insensitive(self):
+        self._load({"api.env": "nvd_api_key=lower-case-name\n"})
+        self.assertEqual(os.environ.get("NVD_API_KEY"), "lower-case-name")
+
+    def test_other_keys_are_ignored(self):
+        """An env file must not be able to set proxy / CA-bundle (or any other) variables."""
+        self._load({"api.env": "SSL_CERT_FILE=C:\\attacker\\ca.pem\nHTTPS_PROXY=http://127.0.0.1:8080\n"
+                               "HTTP_PROXY=http://127.0.0.1:8080\nZZ_TEST_EXTRA_VAR=1\nNVD_API_KEY=ok\n"})
+        for key in ("SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY", "ZZ_TEST_EXTRA_VAR"):
+            self.assertNotIn(key, os.environ, f"{key} was set from an env file")
+        self.assertEqual(os.environ.get("NVD_API_KEY"), "ok")
+
+    def test_values_are_never_logged(self):
+        with self.assertLogs(se.logger, level="DEBUG") as logs:
+            self._load({"api.env": "SSL_CERT_FILE=secret-value-1\nNVD_API_KEY=secret-value-2\n"})
+        joined = "\n".join(logs.output)
+        self.assertIn("SSL_CERT_FILE", joined)              # ignored key is named...
+        self.assertNotIn("secret-value-1", joined)          # ...but its value isn't logged
+        self.assertNotIn("secret-value-2", joined)
+
+    def test_search_dirs_are_tool_folder_only_not_cwd(self):
+        cwd = os.getcwd()
+        os.chdir(self.dir)
+        try:
+            dirs = se._env_search_dirs()
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(dirs, [Path(se.__file__).resolve().parent])
+        self.assertNotIn(self.dir.resolve(), [d.resolve() for d in dirs])
+
+    def test_frozen_build_uses_executable_folder(self):
+        exe = self.dir / "Software_Enumerator.exe"
+        with patch.object(sys, "frozen", True, create=True), patch.object(sys, "executable", str(exe)):
+            self.assertEqual(se._env_search_dirs(), [self.dir.resolve()])
+
+    def test_unreadable_file_is_skipped_quietly(self):
+        (self.dir / "api.env").write_bytes(b"NVD_API_KEY=\xff\xfe\n")   # invalid UTF-8
+        with patch.object(se, "_env_search_dirs", return_value=[self.dir]):
+            se._load_env_file()                                   # must not raise
+        self.assertNotIn("NVD_API_KEY", os.environ)
 
 
 class TestWingetUpdateChecker(unittest.TestCase):

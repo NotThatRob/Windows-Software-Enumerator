@@ -101,26 +101,37 @@ def _harden_process_environment() -> None:
     os.environ.setdefault("NoDefaultCurrentDirectoryInExePath", "1")
 
 
-def _load_env_file() -> None:
-    """Load variables from .env files into os.environ (without overwriting existing values).
+# Only these keys are read from env files. Anything else (e.g. HTTPS_PROXY or
+# SSL_CERT_FILE, which Python's HTTPS stack honours) is ignored, so an env file
+# can't redirect or intercept the tool's network traffic.
+_ENV_FILE_ALLOWED_KEYS = frozenset({"NVD_API_KEY"})
+_ENV_FILENAMES = ("api.env", ".env")
 
-    Searches for api.env or .env in the script's directory, then the current
-    working directory. Only sets variables that are not already in the environment,
-    so explicit env vars and CLI args always take precedence.
+
+def _env_search_dirs() -> list[Path]:
+    """Folders searched for api.env / .env: only the tool's own folder.
+
+    That is the folder of Software_Enumerator.py, or of the .exe for PyInstaller
+    builds (whose __file__ points into a temporary extraction folder). The current
+    working directory is deliberately not searched: anyone who can drop a file
+    where the tool is run from could otherwise configure it.
     """
-    search_dirs = []
-    # Script's own directory
-    script_dir = Path(__file__).resolve().parent
-    search_dirs.append(script_dir)
-    # Current working directory (if different)
-    cwd = Path.cwd()
-    if cwd != script_dir:
-        search_dirs.append(cwd)
+    if _running_as_frozen_exe():
+        return [Path(sys.executable).resolve().parent]
+    return [Path(__file__).resolve().parent]
 
-    env_filenames = ["api.env", ".env"]
 
-    for search_dir in search_dirs:
-        for filename in env_filenames:
+def _load_env_file() -> None:
+    """Load NVD_API_KEY from api.env or .env in the tool's own folder.
+
+    - Only keys in _ENV_FILE_ALLOWED_KEYS are read; others are ignored and logged
+      by name (never by value) at debug level.
+    - Never overwrites a variable that is already set, so explicit env vars and
+      CLI args take precedence (CLI > env var > file).
+    - Stops after the first file found (api.env before .env).
+    """
+    for search_dir in _env_search_dirs():
+        for filename in _ENV_FILENAMES:
             env_path = search_dir / filename
             try:
                 if not env_path.is_file():
@@ -129,15 +140,17 @@ def _load_env_file() -> None:
                     for line in f:
                         line = line.strip()
                         # Skip comments and blank lines
-                        if not line or line.startswith("#"):
-                            continue
-                        if "=" not in line:
+                        if not line or line.startswith("#") or "=" not in line:
                             continue
                         key, _, value = line.partition("=")
-                        key = key.strip()
-                        value = value.strip().strip("'\"")
-                        if key and key not in os.environ:
-                            os.environ[key] = value
+                        key = key.strip().upper()  # Windows env var names are case-insensitive
+                        if key not in _ENV_FILE_ALLOWED_KEYS:
+                            if key:
+                                logger.debug(f"Ignored {key!r} in {env_path.name}: only "
+                                             f"{', '.join(sorted(_ENV_FILE_ALLOWED_KEYS))} is read from env files")
+                            continue
+                        if key not in os.environ:
+                            os.environ[key] = value.strip().strip("'\"")
                 logger.debug(f"Loaded env file: {env_path}")
                 return  # Stop after first file found
             except (OSError, UnicodeDecodeError) as e:

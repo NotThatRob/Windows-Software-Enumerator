@@ -1657,9 +1657,12 @@ class TestLogFilePermissions(unittest.TestCase):
         self.assertEqual(len(handlers), 1)
 
     def test_failure_warns_once_and_logging_continues(self):
+        """Simulate a drive without access-list support: both the create-time and the
+        after-open restriction fail."""
         log = self.dir / "fail.log"
         captured = io.StringIO()
-        with patch.object(se, "_restrict_to_owner", side_effect=OSError("unsupported")), \
+        with patch.object(se, "_create_owner_only_file", side_effect=OSError("unsupported")), \
+             patch.object(se, "_restrict_to_owner", side_effect=OSError("unsupported")), \
              patch("sys.stderr", captured):
             handler = se._RestrictedRotatingFileHandler(log, maxBytes=200, backupCount=2, encoding="utf-8")
             test_logger = logging.getLogger("test_acl_failure")
@@ -1676,6 +1679,115 @@ class TestLogFilePermissions(unittest.TestCase):
     def test_restrict_to_owner_raises_oserror_for_missing_file(self):
         with self.assertRaises(OSError):
             se._restrict_to_owner(str(self.dir / "does-not-exist.log"))
+
+    # --- Files that already exist (pre-created by someone else, or linked) ---------------
+
+    FOREIGN_SID = "S-1-5-21-1000000000-2000000000-3000000000-1001"
+
+    def test_new_file_is_restricted_at_creation(self):
+        """A new log gets the access list when it is created, not afterwards."""
+        log = self.dir / "new.log"
+        with patch.object(se, "_restrict_to_owner") as after_open:
+            se.setup_logging(log_file=str(log))
+        after_open.assert_not_called()
+        self._assert_owner_only(log)
+
+    def test_create_owner_only_file_never_opens_existing_file(self):
+        log = self.dir / "exists.log"
+        log.write_text("someone else's\n", encoding="utf-8")
+        self.assertFalse(se._create_owner_only_file(str(log)))
+        self.assertEqual(log.read_text(encoding="utf-8"), "someone else's\n")
+
+    def test_file_owned_by_another_account_is_refused(self):
+        log = self.dir / "audit.log"
+        log.write_text("pre-created\n", encoding="utf-8")
+        dacl_before = self._dacl(log)[0]
+        with patch.object(se, "_open_file_owner_sid", return_value=self.FOREIGN_SID):
+            with self.assertRaises(se.LogFileOwnershipError) as ctx:
+                se.setup_logging(log_file=str(log))
+        self.assertIn("owned by another account", str(ctx.exception))
+        self.assertEqual(log.read_text(encoding="utf-8"), "pre-created\n")   # nothing written
+        self.assertEqual(self._dacl(log)[0], dacl_before)                    # and not modified
+
+    def test_file_owned_by_system_or_administrators_is_accepted(self):
+        for sid in ("S-1-5-18", "S-1-5-32-544"):
+            log = self.dir / f"trusted-{sid}.log"
+            log.write_text("x\n", encoding="utf-8")
+            with patch.object(se, "_open_file_owner_sid", return_value=sid):
+                se.setup_logging(log_file=str(log))                          # must not raise
+            self._assert_owner_only(log)
+            for h in list(se.logger.handlers):   # setup_logging() drops old handlers without closing them
+                h.close()
+            se.logger.handlers.clear()
+
+    def test_own_existing_file_is_accepted(self):
+        """Owner of a file this process creates is one of our own SIDs (real check, no mocks)."""
+        log = self.dir / "mine.log"
+        log.write_text("earlier run\n", encoding="utf-8")
+        se.setup_logging(log_file=str(log))
+        se.log_audit_event("TEST", "appended")
+        self._flush()
+        self.assertIn("appended", log.read_text(encoding="utf-8"))
+        with open(log, "a", encoding="utf-8") as stream:
+            self.assertIn(se._open_file_owner_sid(stream), se._current_owner_sids())
+
+    def test_hard_linked_log_file_is_refused(self):
+        target = self.dir / "elsewhere.txt"
+        target.write_text("private\n", encoding="utf-8")
+        log = self.dir / "audit.log"
+        os.link(target, log)
+        with self.assertRaises(se.LogFileOwnershipError) as ctx:
+            se.setup_logging(log_file=str(log))
+        self.assertIn("hard links", str(ctx.exception))
+        self.assertEqual(target.read_text(encoding="utf-8"), "private\n")
+
+    def test_symlinked_log_file_is_refused(self):
+        target = self.dir / "elsewhere.txt"
+        target.write_text("private\n", encoding="utf-8")
+        log = self.dir / "audit.log"
+        try:
+            os.symlink(target, log)
+        except OSError:
+            self.skipTest("Cannot create symlinks (requires admin or Developer Mode on Windows)")
+        with self.assertRaises(se.LogFileOwnershipError):
+            se.setup_logging(log_file=str(log))
+        self.assertEqual(target.read_text(encoding="utf-8"), "private\n")
+
+    def test_unverifiable_owner_warns_and_continues(self):
+        log = self.dir / "audit.log"
+        log.write_text("x\n", encoding="utf-8")
+        captured = io.StringIO()
+        with patch.object(se, "_open_file_owner_sid", side_effect=OSError("no ACL support")), \
+             patch("sys.stderr", captured):
+            se.setup_logging(log_file=str(log))
+            se.log_audit_event("TEST", "still logging")
+            self._flush()
+        self.assertEqual(captured.getvalue().count("could not restrict log file permissions"), 1)
+        self.assertIn("still logging", log.read_text(encoding="utf-8"))
+
+    def _run_main(self, *argv):
+        captured = io.StringIO()
+        with patch.object(sys, "argv", ["Software_Enumerator.py", *argv]), \
+             patch.object(se, "WingetUpdateChecker") as checker, \
+             patch.object(se, "_load_env_file"), patch("sys.stderr", captured):
+            checker.return_value.check_for_updates.return_value = []
+            with self.assertRaises(SystemExit) as ctx:
+                se.main()
+        return ctx.exception.code, captured.getvalue()
+
+    def test_main_exits_permission_denied_for_foreign_log(self):
+        log = self.dir / "audit.log"
+        log.write_text("pre-created\n", encoding="utf-8")
+        with patch.object(se, "_open_file_owner_sid", return_value=self.FOREIGN_SID):
+            code, err = self._run_main("--check-updates", "--quiet", "--log-file", str(log))
+        self.assertEqual(code, se.EXIT_PERMISSION_DENIED)
+        self.assertIn("owned by another account", err)
+
+    def test_main_exits_permission_denied_when_log_unwritable(self):
+        with patch.object(se, "setup_logging", side_effect=PermissionError("denied")):
+            code, err = self._run_main("--check-updates", "--quiet", "--log-file", "x.log")
+        self.assertEqual(code, se.EXIT_PERMISSION_DENIED)
+        self.assertIn("cannot create or write the log file", err)
 
 
 def subprocess_run_text(cmd, **kwargs):

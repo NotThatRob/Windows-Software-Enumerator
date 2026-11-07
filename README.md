@@ -207,7 +207,7 @@ The output of this tool contains sensitive system information:
 - **CSV Formula-Injection Guard** - Exported cells that a spreadsheet would treat as a formula are prefixed with `'`
 - **Trusted Executable Paths** - PowerShell and winget are launched by absolute path (System32 from the OS, winget's per-user alias), never by bare name, so a planted `powershell.exe`/`winget.exe` in the current folder can't run in their place
 - **Malformed-Data Resilience** - Registry values with unexpected types are converted to text (and reported with a warning) instead of hiding the entry or aborting the scan; malformed browser extension files are handled per entry, so one bad file can't crash the extension scan
-- **Audit Logging** - File-based logging with automatic rotation (5 MB max, 3 backups). Log files, including rotated copies, get an owner-only Windows access list (you and SYSTEM; nothing inherited from the folder). If the drive doesn't support access lists (e.g. FAT32/exFAT), a warning is shown and logging continues
+- **Audit Logging** - File-based logging with automatic rotation (5 MB max, 3 backups). Log files, including rotated copies, get an owner-only Windows access list (you and SYSTEM; nothing inherited from the folder). New log files are created with it already in place. The tool refuses (exit code 4) to write to an existing log file that is owned by another account, is a symbolic link, or has other hard links, since someone else could read it. If the drive doesn't support access lists (e.g. FAT32/exFAT), a warning is shown and logging continues
 - **Symlink Protection** - Skips symlinks to prevent directory traversal attacks
 - **File Count Safety Limit** - Portable app scanning caps at 500 executables to prevent memory exhaustion
 - **Baseline Size Limits** - Rejects baseline files larger than 50 MB or containing more than 50,000 entries
@@ -275,7 +275,7 @@ Structured exit codes for scripting and CI/CD integration:
 | 1 | Generic error |
 | 2 | No software found |
 | 3 | API failure (NVD unreachable) |
-| 4 | Permission denied |
+| 4 | Permission denied (e.g. the `--log-file` can't be written, or is owned by another account or linked) |
 
 ## Testing
 
@@ -295,7 +295,7 @@ The test suite covers:
 - CSV formula-injection guard (export and diff CSV)
 - Malformed registry values and browser extension files (wrong types, null fields, invalid UTF-8, deeply nested JSON)
 - Absolute executable paths (incl. a planted-binary integration test)
-- Owner-only log file access lists, including rotated files and pre-existing files
+- Owner-only log file access lists (set at creation, on rotated files, and on pre-existing files), and refusal of log files owned by another account or reached through a link
 - API key handling (environment variables, CLI arguments, `.env` file loading: allowlisted key only, tool folder only, values never logged)
 - Symlink protection
 - Error message sanitization

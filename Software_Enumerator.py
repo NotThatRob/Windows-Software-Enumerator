@@ -13,16 +13,19 @@ import concurrent.futures
 import csv
 import ctypes
 from ctypes import wintypes
+import functools
 import getpass
 import io
 import json
 import logging
 from logging.handlers import RotatingFileHandler
+import msvcrt
 import os
 import re
 import subprocess
 import sys
 import time
+import types
 import unicodedata
 import urllib.request
 import urllib.parse
@@ -162,7 +165,75 @@ def _load_env_file() -> None:
 # The whole DACL is replaced, so pre-existing explicit entries (e.g. Everyone:Read) go too.
 _OWNER_ONLY_SDDL = "D:P(A;;FA;;;OW)(A;;FA;;;SY)"
 _SDDL_REVISION_1 = 1
+_OWNER_SECURITY_INFORMATION = 0x1
 _DACL_SECURITY_INFORMATION = 0x4
+_SE_FILE_OBJECT = 1
+_TOKEN_QUERY = 0x0008
+_TOKEN_USER = 1
+_TOKEN_OWNER = 4
+_GENERIC_WRITE = 0x40000000
+_FILE_SHARE_READ_WRITE_DELETE = 0x7
+_CREATE_NEW = 1
+_FILE_ATTRIBUTE_NORMAL = 0x80
+_ERROR_FILE_EXISTS = 80
+# Owners that can already read every file on the machine, so a log they own leaks nothing new
+_ALWAYS_TRUSTED_OWNER_SIDS = frozenset({"S-1-5-18", "S-1-5-32-544"})  # SYSTEM, Administrators
+
+
+class LogFileOwnershipError(PermissionError):
+    """Refusing to write a log file another account could read: it is owned by another
+    account, is a symbolic link, or has other hard links."""
+
+
+class _SecurityAttributes(ctypes.Structure):
+    _fields_ = [("nLength", wintypes.DWORD),
+                ("lpSecurityDescriptor", ctypes.c_void_p),
+                ("bInheritHandle", wintypes.BOOL)]
+
+
+@functools.lru_cache(maxsize=None)
+def _win32() -> types.SimpleNamespace:
+    """Win32 security functions with argtypes set, on private DLL handles so the
+    shared ctypes.windll objects used elsewhere are left untouched."""
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    pp = ctypes.POINTER(ctypes.c_void_p)
+
+    def bind(fn, argtypes, restype):
+        fn.argtypes, fn.restype = argtypes, restype
+        return fn
+
+    return types.SimpleNamespace(
+        string_to_sd=bind(advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                          [wintypes.LPCWSTR, wintypes.DWORD, pp, ctypes.c_void_p], wintypes.BOOL),
+        sid_to_string=bind(advapi32.ConvertSidToStringSidW,
+                           [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)], wintypes.BOOL),
+        set_file_security=bind(advapi32.SetFileSecurityW,
+                               [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p], wintypes.BOOL),
+        get_security_info=bind(advapi32.GetSecurityInfo,
+                               [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, pp, pp, pp, pp, pp],
+                               wintypes.DWORD),
+        open_process_token=bind(advapi32.OpenProcessToken,
+                                [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)],
+                                wintypes.BOOL),
+        get_token_information=bind(advapi32.GetTokenInformation,
+                                   [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                    ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        get_current_process=bind(kernel32.GetCurrentProcess, [], wintypes.HANDLE),
+        create_file=bind(kernel32.CreateFileW,
+                         [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                          wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE], wintypes.HANDLE),
+        close_handle=bind(kernel32.CloseHandle, [wintypes.HANDLE], wintypes.BOOL),
+        local_free=bind(kernel32.LocalFree, [ctypes.c_void_p], ctypes.c_void_p),
+    )
+
+
+def _owner_only_descriptor() -> ctypes.c_void_p:
+    """Build the owner-only security descriptor. The caller must LocalFree() it."""
+    descriptor = ctypes.c_void_p()
+    if not _win32().string_to_sd(_OWNER_ONLY_SDDL, _SDDL_REVISION_1, ctypes.byref(descriptor), None):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return descriptor
 
 
 def _restrict_to_owner(path: str) -> None:
@@ -170,56 +241,158 @@ def _restrict_to_owner(path: str) -> None:
 
     os.chmod(path, 0o600) can't do this on Windows: it only toggles the read-only flag.
     """
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    to_descriptor = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
-    to_descriptor.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
-                              ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
-    to_descriptor.restype = wintypes.BOOL
-    set_file_security = advapi32.SetFileSecurityW
-    set_file_security.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
-    set_file_security.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
-
-    descriptor = ctypes.c_void_p()
-    if not to_descriptor(_OWNER_ONLY_SDDL, _SDDL_REVISION_1, ctypes.byref(descriptor), None):
-        raise ctypes.WinError(ctypes.get_last_error())
+    api = _win32()
+    descriptor = _owner_only_descriptor()
     try:
-        if not set_file_security(path, _DACL_SECURITY_INFORMATION, descriptor):
+        if not api.set_file_security(path, _DACL_SECURITY_INFORMATION, descriptor):
             raise ctypes.WinError(ctypes.get_last_error())
     finally:
-        kernel32.LocalFree(descriptor)
+        api.local_free(descriptor)
+
+
+def _create_owner_only_file(path: str) -> bool:
+    """Create a new, empty file with the owner-only access list applied at creation.
+
+    Returns False if the file already exists: CREATE_NEW never opens an existing
+    file, so a file someone else created can't be mistaken for ours. Raises OSError
+    for other failures.
+    """
+    api = _win32()
+    descriptor = _owner_only_descriptor()
+    try:
+        attributes = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), descriptor, False)
+        handle = api.create_file(path, _GENERIC_WRITE, _FILE_SHARE_READ_WRITE_DELETE,
+                                 ctypes.byref(attributes), _CREATE_NEW, _FILE_ATTRIBUTE_NORMAL, None)
+        if handle == wintypes.HANDLE(-1).value:  # INVALID_HANDLE_VALUE
+            error = ctypes.get_last_error()
+            if error == _ERROR_FILE_EXISTS:
+                return False
+            raise ctypes.WinError(error)
+        api.close_handle(handle)
+        return True
+    finally:
+        api.local_free(descriptor)
+
+
+def _sid_to_string(psid) -> str:
+    api = _win32()
+    text = wintypes.LPWSTR()
+    if not api.sid_to_string(psid, ctypes.byref(text)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return text.value
+    finally:
+        api.local_free(text)
+
+
+def _current_owner_sids() -> frozenset:
+    """SIDs that own files this process creates: the token's user and its default
+    owner (the Administrators group for some elevated-admin configurations)."""
+    api = _win32()
+    token = wintypes.HANDLE()
+    if not api.open_process_token(api.get_current_process(), _TOKEN_QUERY, ctypes.byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        sids = set()
+        for info_class in (_TOKEN_USER, _TOKEN_OWNER):
+            needed = wintypes.DWORD()
+            api.get_token_information(token, info_class, None, 0, ctypes.byref(needed))
+            buffer = ctypes.create_string_buffer(needed.value)
+            if not api.get_token_information(token, info_class, buffer, needed, ctypes.byref(needed)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            # TOKEN_USER and TOKEN_OWNER both begin with a pointer to the SID
+            sids.add(_sid_to_string(ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]))
+        return frozenset(sids)
+    finally:
+        api.close_handle(token)
+
+
+def _open_file_owner_sid(stream) -> Optional[str]:
+    """Owner SID of an open file, read from its handle (so it is the file actually opened)."""
+    api = _win32()
+    owner, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
+    error = api.get_security_info(msvcrt.get_osfhandle(stream.fileno()), _SE_FILE_OBJECT,
+                                  _OWNER_SECURITY_INFORMATION, ctypes.byref(owner), None, None, None,
+                                  ctypes.byref(descriptor))
+    if error:
+        raise ctypes.WinError(error)
+    try:
+        return _sid_to_string(owner) if owner.value else None
+    finally:
+        api.local_free(descriptor)
 
 
 class _RestrictedRotatingFileHandler(RotatingFileHandler):
-    """RotatingFileHandler whose files are accessible only to their owner (and SYSTEM).
+    """RotatingFileHandler whose files are accessible only to the current user (and SYSTEM).
 
-    _open() runs when the file is first opened and after every rollover, so the
-    current file is always restricted, and rotated backups keep their access list
-    when renamed. The restriction is applied before any record is written. A process
-    that opened the empty file in the instant between creation and restriction
-    would keep its access, because Windows checks permissions when a handle is opened.
+    - A new log file is created with the owner-only access list already in place
+      (CreateFileW with CREATE_NEW), so it is never unprotected, even briefly.
+    - An existing log file is checked on the opened handle and refused with
+      LogFileOwnershipError if another account owns it, or if it is a symbolic link
+      or has other hard links: another account could read whatever is written to it.
+      Otherwise its access list is replaced with the owner-only one.
+    - Rollovers go through the same path; renamed backups keep their access list.
+      If a refused file appears during a rollover, logging stops with errors rather
+      than writing to it.
 
-    If the access list can't be set (e.g. FAT32/exFAT drives, some network shares),
-    one warning is printed and logging continues: the audit must not stop over this.
+    If the drive doesn't support access lists (e.g. FAT32/exFAT, some network shares),
+    one warning is printed and logging continues: the audit must not stop over that.
     """
 
     def __init__(self, *args, **kwargs):
         self._acl_warning_shown = False  # set before super().__init__, which calls _open()
         super().__init__(*args, **kwargs)
 
+    def _warn_unprotected(self) -> None:
+        if not self._acl_warning_shown:
+            self._acl_warning_shown = True
+            # print, not logger: this can run inside emit() during a rollover
+            print("Warning: could not restrict log file permissions to the current user; "
+                  "the log file uses its folder's permissions.", file=sys.stderr)
+
     def _open(self):
+        path = self.baseFilename
+        created = False
+        if not os.path.lexists(path):
+            try:
+                created = _create_owner_only_file(path)
+            except OSError:
+                created = False  # e.g. unsupported drive: fall back to a normal open below
+        if os.path.islink(path):
+            raise LogFileOwnershipError(f"Log file {path} is a symbolic link; refusing to write through it.")
+
         stream = super()._open()
+        if created:
+            return stream
         try:
-            _restrict_to_owner(self.baseFilename)
+            self._check_existing_file(stream)
+        except LogFileOwnershipError:
+            stream.close()
+            raise
+        try:
+            _restrict_to_owner(path)
         except OSError:
-            if not self._acl_warning_shown:
-                self._acl_warning_shown = True
-                # print, not logger: this can run inside emit() during a rollover
-                print("Warning: could not restrict log file permissions to the current user; "
-                      "the log file uses its folder's permissions.", file=sys.stderr)
+            self._warn_unprotected()
         return stream
+
+    def _check_existing_file(self, stream) -> None:
+        """Raise LogFileOwnershipError if another account could read this already-existing file."""
+        path = self.baseFilename
+        if os.fstat(stream.fileno()).st_nlink > 1:
+            raise LogFileOwnershipError(
+                f"Log file {path} has other hard links, so it may be readable under another name. "
+                f"Choose a different --log-file path.")
+        try:
+            owner = _open_file_owner_sid(stream)
+            trusted = _current_owner_sids() | _ALWAYS_TRUSTED_OWNER_SIDS
+        except OSError:
+            self._warn_unprotected()  # ownership can't be checked on this drive
+            return
+        if owner is not None and owner not in trusted:
+            raise LogFileOwnershipError(
+                f"Log file {path} already exists and is owned by another account, which could read "
+                f"everything written to it. Choose a different --log-file path, or delete the file "
+                f"if you trust its owner.")
 
 
 def setup_logging(log_file: str = None, verbose: bool = False) -> None:
@@ -2758,7 +2931,14 @@ Examples:
     args.cve_limit = max(1, min(args.cve_limit, 100))
 
     # Setup logging before any operations
-    setup_logging(log_file=args.log_file, verbose=args.verbose)
+    try:
+        setup_logging(log_file=args.log_file, verbose=args.verbose)
+    except LogFileOwnershipError as e:
+        print(f"Error: {sanitize_output(str(e))}", file=sys.stderr)
+        sys.exit(EXIT_PERMISSION_DENIED)
+    except PermissionError:
+        print(f"Error: cannot create or write the log file: {sanitize_output(args.log_file)}", file=sys.stderr)
+        sys.exit(EXIT_PERMISSION_DENIED)
 
     # Load API keys from .env files (won't overwrite existing env vars)
     _load_env_file()

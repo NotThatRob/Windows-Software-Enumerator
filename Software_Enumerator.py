@@ -514,8 +514,19 @@ class RegistryScanner:
         (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
     ]
 
+    def __init__(self):
+        # Anomaly counters, reset by get_all_registry_software() and reported once per scan.
+        # Real installers store these fields as REG_SZ, so non-zero counts are worth a warning.
+        self.converted_values = 0    # text values stored with another type, converted to text
+        self.unreadable_entries = 0  # entries that could not be parsed at all and were skipped
+
     def scan_registry_key(self, hive: int, path: str) -> list[SoftwareInfo]:
-        """Scan a specific registry key for installed software."""
+        """Scan a specific registry key for installed software.
+
+        Entries are untrusted: any process can write under HKCU. Values are converted to
+        text rather than rejected, so a malformed entry is still reported instead of
+        silently disappearing (or aborting the whole scan).
+        """
         software_list = []
 
         try:
@@ -529,30 +540,31 @@ class RegistryScanner:
             subkey_count = winreg.QueryInfoKey(key)[0]
 
             for i in range(subkey_count):
+                subkey_path = f"{path}\\[{i}]"
                 try:
                     subkey_name = winreg.EnumKey(key, i)
                     subkey_path = f"{path}\\{subkey_name}"
                     subkey = winreg.OpenKey(hive, subkey_path, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
 
                     try:
-                        name = self._get_registry_value(subkey, "DisplayName")
+                        name = self._get_registry_str(subkey, "DisplayName")
                         if not name:
                             continue
 
-                        # Skip system components and updates
-                        system_component = self._get_registry_value(subkey, "SystemComponent")
-                        if system_component == 1:
+                        # Skip system components (Windows' own app list hides these too)
+                        system_component = self._get_registry_str(subkey, "SystemComponent", expect_text=False)
+                        if system_component.strip() == "1":
                             continue
 
                         software = SoftwareInfo(
                             name=name,
-                            version=self._get_registry_value(subkey, "DisplayVersion") or "",
-                            publisher=self._get_registry_value(subkey, "Publisher") or "",
+                            version=self._get_registry_str(subkey, "DisplayVersion"),
+                            publisher=self._get_registry_str(subkey, "Publisher"),
                             install_date=self._format_install_date(
-                                self._get_registry_value(subkey, "InstallDate")
+                                self._get_registry_str(subkey, "InstallDate")
                             ),
                             source="Registry",
-                            install_location=self._get_registry_value(subkey, "InstallLocation") or "",
+                            install_location=self._get_registry_str(subkey, "InstallLocation"),
                         )
                         software_list.append(software)
 
@@ -560,6 +572,11 @@ class RegistryScanner:
                         winreg.CloseKey(subkey)
 
                 except (FileNotFoundError, PermissionError, OSError):
+                    continue
+                except (TypeError, ValueError, AttributeError) as e:
+                    # Backstop: one unparseable entry must not abort the rest of the scan
+                    self.unreadable_entries += 1
+                    logger.debug(f"Skipped unreadable registry entry {subkey_path}: {e}")
                     continue
 
         finally:
@@ -575,9 +592,36 @@ class RegistryScanner:
         except FileNotFoundError:
             return None
 
+    @staticmethod
+    def _registry_value_to_str(value) -> str:
+        """Convert a value returned by winreg to text, whatever registry type it had."""
+        if value is None:
+            return ""
+        if isinstance(value, str):            # REG_SZ, REG_EXPAND_SZ
+            return value
+        if isinstance(value, bytes):          # REG_BINARY, REG_NONE: REG_SZ data is UTF-16LE,
+            return value.decode("utf-16-le", errors="replace").rstrip("\x00")  # so decode it the same way
+        if isinstance(value, (list, tuple)):  # REG_MULTI_SZ
+            return " ".join(str(v) for v in value)
+        return str(value)                     # REG_DWORD, REG_QWORD
+
+    def _get_registry_str(self, key, value_name: str, expect_text: bool = True) -> str:
+        """Read a registry value as text ("" if missing).
+
+        Args:
+            expect_text: True for fields real installers store as REG_SZ. A value of any
+                other type is still converted, but counted as an anomaly.
+        """
+        value = self._get_registry_value(key, value_name)
+        if expect_text and value is not None and not isinstance(value, str):
+            self.converted_values += 1
+            logger.debug(f"Registry value {value_name} has type {type(value).__name__}; converted to text")
+        return self._registry_value_to_str(value)
+
     def _format_install_date(self, date_str: Optional[str]) -> str:
         """Format install date from YYYYMMDD to readable format."""
-        if not date_str or len(date_str) != 8:
+        date_str = self._registry_value_to_str(date_str).strip()
+        if len(date_str) != 8:
             return ""
         try:
             date = datetime.strptime(date_str, "%Y%m%d")
@@ -589,6 +633,8 @@ class RegistryScanner:
         """Get all software from all registry locations."""
         all_software = []
         seen_names = set()
+        self.converted_values = 0
+        self.unreadable_entries = 0
 
         for hive, path in self.REGISTRY_PATHS:
             software_list = self.scan_registry_key(hive, path)
@@ -597,6 +643,14 @@ class RegistryScanner:
                 if software.name not in seen_names:
                     seen_names.add(software.name)
                     all_software.append(software)
+
+        if self.converted_values:
+            logger.warning(
+                f"{self.converted_values} registry value(s) had an unexpected type and were "
+                f"converted to text. Real installers don't do this; the entries are still listed."
+            )
+        if self.unreadable_entries:
+            logger.warning(f"{self.unreadable_entries} registry entry(ies) could not be parsed and were skipped.")
 
         return all_software
 
@@ -1187,42 +1241,80 @@ class BrowserExtensionScanner:
     def _parse_chromium_manifest(
         self, manifest_path: Path, ext_id: str, browser: str
     ) -> Optional[BrowserExtensionInfo]:
-        """Parse a Chromium extension's manifest.json file."""
+        """Parse a Chromium extension's manifest.json file.
+
+        The file is untrusted: fields are type-checked and converted so a malformed
+        manifest can't crash the scan. Returns None if the file is missing, isn't valid
+        JSON, or isn't a JSON object (Chromium won't load such an extension either).
+        """
         try:
             with open(manifest_path, "r", encoding="utf-8", errors="replace") as f:
                 manifest = json.load(f)
+        except (OSError, ValueError, RecursionError):
+            # Missing file, invalid JSON, or nesting deep enough to overflow the parser
+            return None
+        if not isinstance(manifest, dict):
+            return None
 
-            name = manifest.get("name", "Unknown")
+        try:
+            name = self._as_text(manifest.get("name")) or "Unknown"
             # Handle localized names (they start with __MSG_)
             if name.startswith("__MSG_"):
                 name = self._get_localized_name(manifest_path.parent, name) or name
 
-            version = manifest.get("version", "")
-            description = manifest.get("description", "")
+            version = self._as_text(manifest.get("version"))
+            description = self._as_text(manifest.get("description"))
             if description.startswith("__MSG_"):
                 description = ""  # Skip localized descriptions for simplicity
 
             # Gather permissions from multiple sources
             permissions = []
-            permissions.extend(manifest.get("permissions", []))
-            permissions.extend(manifest.get("host_permissions", []))
-            permissions.extend(manifest.get("optional_permissions", []))
+            for field_name in ("permissions", "host_permissions", "optional_permissions"):
+                permissions.extend(self._permission_strings(manifest.get(field_name)))
 
             # Get content script matches as well (these are effectively permissions)
-            for content_script in manifest.get("content_scripts", []):
-                permissions.extend(content_script.get("matches", []))
+            content_scripts = manifest.get("content_scripts")
+            if isinstance(content_scripts, list):
+                for content_script in content_scripts:
+                    if isinstance(content_script, dict):
+                        permissions.extend(self._permission_strings(content_script.get("matches")))
+        except (TypeError, ValueError, AttributeError) as e:
+            # Backstop: still report the extension rather than dropping it
+            logger.debug(f"Could not fully parse {manifest_path}: {e}")
+            return BrowserExtensionInfo(name=ext_id, version="", browser=browser, extension_id=ext_id,
+                                        description="(manifest could not be parsed)")
 
-            return BrowserExtensionInfo(
-                name=name,
-                version=version,
-                browser=browser,
-                extension_id=ext_id,
-                description=description[:100] if description else "",
-                permissions=permissions,
-            )
+        return BrowserExtensionInfo(
+            name=name,
+            version=version,
+            browser=browser,
+            extension_id=ext_id,
+            description=description[:100],
+            permissions=permissions,
+        )
 
-        except (json.JSONDecodeError, KeyError, OSError):
-            return None
+    @staticmethod
+    def _as_text(value) -> str:
+        """Return a manifest field as text ("" for None); untrusted fields may not be strings."""
+        if value is None:
+            return ""
+        return value if isinstance(value, str) else str(value)
+
+    @staticmethod
+    def _permission_strings(value) -> list[str]:
+        """Return a permission list as strings. Dict entries (e.g. Chrome app
+        {"fileSystem": [...]}) contribute their keys; anything that isn't a list gives []."""
+        if not isinstance(value, list):
+            return []
+        result = []
+        for item in value:
+            if isinstance(item, str):
+                result.append(item)
+            elif isinstance(item, dict):
+                result.extend(str(k) for k in item)
+            elif item is not None:
+                result.append(str(item))
+        return result
 
     def _get_localized_name(self, ext_dir: Path, msg_key: str) -> Optional[str]:
         """Try to get the localized name from _locales directory."""
@@ -1237,13 +1329,16 @@ class BrowserExtensionScanner:
             try:
                 with open(messages_path, "r", encoding="utf-8") as f:
                     messages = json.load(f)
-                # Try both lowercase and original case
-                for k in [key, key.lower()]:
-                    if k in messages and "message" in messages[k]:
-                        return messages[k]["message"]
-            except (json.JSONDecodeError, OSError):
-                # File doesn't exist or can't be parsed - try next locale
+            except (OSError, ValueError, RecursionError):
+                # Missing, invalid UTF-8 / JSON (UnicodeDecodeError is a ValueError), or too deep
                 continue
+            if not isinstance(messages, dict):
+                continue
+            # Try both lowercase and original case
+            for k in (key, key.lower()):
+                entry = messages.get(k)
+                if isinstance(entry, dict) and isinstance(entry.get("message"), str):
+                    return entry["message"]
 
         return None
 
@@ -1275,54 +1370,71 @@ class BrowserExtensionScanner:
     def _parse_firefox_extensions_json(
         self, extensions_json: Path
     ) -> list[BrowserExtensionInfo]:
-        """Parse Firefox's extensions.json file."""
+        """Parse Firefox's extensions.json file.
+
+        The file is untrusted: each add-on entry is type-checked and parsed separately,
+        so one malformed entry can't drop the rest of the profile's add-ons.
+        """
         extensions = []
 
         try:
             with open(extensions_json, "r", encoding="utf-8", errors="replace") as f:
                 data = json.load(f)
+        except (OSError, ValueError, RecursionError):
+            return extensions
 
-            for addon in data.get("addons", []):
-                # Skip system/built-in addons
-                if addon.get("location") in ["app-system-defaults", "app-builtin"]:
-                    continue
+        addons = data.get("addons") if isinstance(data, dict) else None
+        if not isinstance(addons, list):
+            return extensions
 
-                addon_type = addon.get("type", "")
-                if addon_type != "extension":
-                    continue
-
-                name = addon.get("defaultLocale", {}).get("name", "")
-                if not name:
-                    name = addon.get("id", "Unknown")
-
-                version = addon.get("version", "")
-                ext_id = addon.get("id", "")
-                description = addon.get("defaultLocale", {}).get("description", "")
-                active = addon.get("active", True)
-
-                # Firefox stores permissions differently
-                permissions = addon.get("userPermissions", {}).get("permissions", [])
-                origins = addon.get("userPermissions", {}).get("origins", [])
-                permissions.extend(origins)
-                # Also check top-level permissions (legacy/MV3 format)
-                top_perms = addon.get("permissions", [])
-                if isinstance(top_perms, list):
-                    permissions.extend(top_perms)
-
-                extensions.append(BrowserExtensionInfo(
-                    name=name,
-                    version=version,
-                    browser="Firefox",
-                    extension_id=ext_id,
-                    description=description[:100] if description else "",
-                    permissions=permissions,
-                    enabled=active,
-                ))
-
-        except (json.JSONDecodeError, KeyError, OSError):
-            pass
+        for addon in addons:
+            try:
+                ext = self._parse_firefox_addon(addon)
+            except (TypeError, ValueError, AttributeError) as e:
+                logger.debug(f"Skipped unreadable add-on entry in {extensions_json}: {e}")
+                continue
+            if ext:
+                extensions.append(ext)
 
         return extensions
+
+    def _parse_firefox_addon(self, addon) -> Optional[BrowserExtensionInfo]:
+        """Parse one entry of extensions.json["addons"]; None if it isn't a user extension."""
+        if not isinstance(addon, dict):
+            return None
+
+        # Skip system/built-in addons
+        if addon.get("location") in ("app-system-defaults", "app-builtin"):
+            return None
+        if addon.get("type") != "extension":
+            return None
+
+        locale = addon.get("defaultLocale")
+        if not isinstance(locale, dict):
+            locale = {}
+        user_permissions = addon.get("userPermissions")   # can be null in real files
+        if not isinstance(user_permissions, dict):
+            user_permissions = {}
+
+        ext_id = self._as_text(addon.get("id"))
+        name = self._as_text(locale.get("name")) or ext_id or "Unknown"
+        description = self._as_text(locale.get("description"))
+        active = addon.get("active", True)
+
+        # Firefox stores permissions differently; also check top-level permissions (legacy/MV3)
+        permissions = (self._permission_strings(user_permissions.get("permissions"))
+                       + self._permission_strings(user_permissions.get("origins"))
+                       + self._permission_strings(addon.get("permissions")))
+
+        return BrowserExtensionInfo(
+            name=name,
+            version=self._as_text(addon.get("version")),
+            browser="Firefox",
+            extension_id=ext_id,
+            description=description[:100],
+            permissions=permissions,
+            enabled=active if isinstance(active, bool) else True,
+        )
 
     def display_extensions_table(
         self, extensions: list[BrowserExtensionInfo]

@@ -1251,6 +1251,231 @@ class TestCsvFormulaInjection(unittest.TestCase):
                     self.assertTrue(cell.startswith("'"), f"not neutralised: {cell!r}")
 
 
+class _FakeRegistry:
+    """Minimal winreg stand-in: {subkey_name: {value_name: value}} under a single path.
+
+    A value that is an Exception instance is raised when read.
+    """
+
+    FUNCS = ("OpenKey", "QueryInfoKey", "EnumKey", "QueryValueEx", "CloseKey")
+
+    def __init__(self, entries):
+        self.entries = entries
+        self.names = list(entries)
+
+    def OpenKey(self, hive, path, *args):
+        return path                                   # a "key" is just its path
+
+    def QueryInfoKey(self, key):
+        return (len(self.names), 0, 0)
+
+    def EnumKey(self, key, i):
+        return self.names[i]
+
+    def QueryValueEx(self, key, value_name):
+        values = self.entries[key.rsplit("\\", 1)[-1]]
+        if value_name not in values:
+            raise FileNotFoundError(value_name)
+        value = values[value_name]
+        if isinstance(value, Exception):
+            raise value
+        return value, 0
+
+    def CloseKey(self, key):
+        pass
+
+    def scan(self, scanner=None):
+        """Run RegistryScanner.scan_registry_key against this fake; returns (scanner, results)."""
+        import contextlib
+        scanner = scanner or se.RegistryScanner()
+        with contextlib.ExitStack() as stack:
+            for name in self.FUNCS:
+                stack.enter_context(patch.object(se.winreg, name, getattr(self, name)))
+            results = scanner.scan_registry_key(se.winreg.HKEY_CURRENT_USER, r"SOFTWARE\Uninstall")
+        return scanner, results
+
+    def scan_all(self):
+        """Run get_all_registry_software with a single registry path pointing at this fake."""
+        import contextlib
+        scanner = se.RegistryScanner()
+        with contextlib.ExitStack() as stack:
+            for name in self.FUNCS:
+                stack.enter_context(patch.object(se.winreg, name, getattr(self, name)))
+            stack.enter_context(patch.object(se.RegistryScanner, "REGISTRY_PATHS",
+                                             [(se.winreg.HKEY_CURRENT_USER, r"SOFTWARE\Uninstall")]))
+            results = scanner.get_all_registry_software()
+        return scanner, results
+
+
+class TestRegistryMalformedValues(unittest.TestCase):
+    """A malformed registry value must not hide software or abort the scan (SEC-1).
+
+    Any process can write under HKCU, so a REG_DWORD InstallDate used to make the whole
+    registry source return nothing.
+    """
+
+    GOOD = {"DisplayName": "Good App", "DisplayVersion": "2.0", "Publisher": "Good Inc"}
+
+    def _by_name(self, results):
+        return {s.name: s for s in results}
+
+    def test_dword_install_date_is_converted_not_fatal(self):
+        reg = _FakeRegistry({"evil": {"DisplayName": "Evil", "InstallDate": 20240101},
+                             "good": self.GOOD})
+        scanner, results = reg.scan()
+        found = self._by_name(results)
+        self.assertEqual(set(found), {"Evil", "Good App"})
+        self.assertEqual(found["Evil"].install_date, "2024-01-01")
+        self.assertEqual(scanner.converted_values, 1)
+
+    def test_dword_display_version_becomes_text(self):
+        _, results = _FakeRegistry({"a": {"DisplayName": "App", "DisplayVersion": 123}}).scan()
+        self.assertEqual(results[0].version, "123")
+
+    def test_binary_display_name_is_decoded(self):
+        raw = "Evil App".encode("utf-16-le") + b"\x00\x00"
+        _, results = _FakeRegistry({"a": {"DisplayName": raw}}).scan()
+        self.assertEqual(results[0].name, "Evil App")
+
+    def test_multi_sz_is_joined(self):
+        _, results = _FakeRegistry({"a": {"DisplayName": "App", "Publisher": ["Part A", "Part B"]}}).scan()
+        self.assertEqual(results[0].publisher, "Part A Part B")
+
+    def test_all_fields_are_strings(self):
+        _, results = _FakeRegistry({"a": {"DisplayName": 7, "DisplayVersion": 1, "Publisher": b"",
+                                          "InstallDate": [], "InstallLocation": 0}}).scan()
+        for field in ("name", "version", "publisher", "install_date", "install_location"):
+            self.assertIsInstance(getattr(results[0], field), str, field)
+
+    def test_system_component_int_or_string_is_skipped(self):
+        reg = _FakeRegistry({"int": {"DisplayName": "Hidden1", "SystemComponent": 1},
+                             "str": {"DisplayName": "Hidden2", "SystemComponent": "1"},
+                             "zero": {"DisplayName": "Shown", "SystemComponent": 0}})
+        scanner, results = reg.scan()
+        self.assertEqual([s.name for s in results], ["Shown"])
+        self.assertEqual(scanner.converted_values, 0)   # DWORD is the normal type for this flag
+
+    def test_unparseable_entry_skipped_others_kept(self):
+        reg = _FakeRegistry({"bad": {"DisplayName": TypeError("boom")}, "good": self.GOOD})
+        scanner, results = reg.scan()
+        self.assertEqual([s.name for s in results], ["Good App"])
+        self.assertEqual(scanner.unreadable_entries, 1)
+
+    def test_scan_warns_once_on_anomalies(self):
+        reg = _FakeRegistry({"a": {"DisplayName": "A", "InstallDate": 20240101},
+                             "b": {"DisplayName": "B", "DisplayVersion": 5}})
+        with self.assertLogs(se.logger, level="WARNING") as logs:
+            _, results = reg.scan_all()
+        self.assertEqual(len(results), 2)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("2 registry value(s)", logs.output[0])
+
+    def test_normal_registry_produces_no_warning(self):
+        with self.assertNoLogs(se.logger, level="WARNING"):
+            _, results = _FakeRegistry({"good": self.GOOD}).scan_all()
+        self.assertEqual(len(results), 1)
+
+
+class TestBrowserMalformedInput(unittest.TestCase):
+    """Malformed browser files must not crash the extension scan (SEC-1)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.scanner = se.BrowserExtensionScanner()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _manifest(self, content, ext_dir=None):
+        ext_dir = ext_dir or self.dir
+        ext_dir.mkdir(parents=True, exist_ok=True)
+        path = ext_dir / "manifest.json"
+        if isinstance(content, (bytes, str)):
+            path.write_bytes(content if isinstance(content, bytes) else content.encode("utf-8"))
+        else:
+            path.write_text(json.dumps(content), encoding="utf-8")
+        return path
+
+    def _firefox(self, data):
+        path = self.dir / "extensions.json"
+        path.write_text(data if isinstance(data, str) else json.dumps(data), encoding="utf-8")
+        return self.scanner._parse_firefox_extensions_json(path)
+
+    # --- Chromium ---------------------------------------------------------------
+
+    def test_chromium_non_string_name_is_converted(self):
+        ext = self.scanner._parse_chromium_manifest(self._manifest({"name": 123, "version": 2}), "id", "Chrome")
+        self.assertEqual((ext.name, ext.version), ("123", "2"))
+
+    def test_chromium_bad_content_scripts_entries_are_ignored(self):
+        path = self._manifest({"name": "X", "content_scripts": ["oops", {"matches": ["<all_urls>"]}, {"matches": 5}]})
+        ext = self.scanner._parse_chromium_manifest(path, "id", "Chrome")
+        self.assertEqual(ext.permissions, ["<all_urls>"])
+        self.assertTrue(ext.has_sensitive_permissions())
+
+    def test_chromium_permission_list_items_are_strings(self):
+        path = self._manifest({"name": "X", "permissions": [{"fileSystem": ["write"]}, 5, None, "tabs"],
+                               "host_permissions": "not-a-list"})
+        ext = self.scanner._parse_chromium_manifest(path, "id", "Chrome")
+        self.assertEqual(ext.permissions, ["fileSystem", "5", "tabs"])
+        ext.has_sensitive_permissions()   # must not raise
+
+    def test_chromium_non_object_manifest_returns_none(self):
+        self.assertIsNone(self.scanner._parse_chromium_manifest(self._manifest([1, 2]), "id", "Chrome"))
+
+    def test_chromium_deeply_nested_manifest_returns_none(self):
+        path = self._manifest("[" * 100000 + "]" * 100000)
+        self.assertIsNone(self.scanner._parse_chromium_manifest(path, "id", "Chrome"))
+
+    def test_localized_name_with_invalid_utf8_falls_back(self):
+        path = self._manifest({"name": "__MSG_appName__"})
+        loc = self.dir / "_locales" / "en"
+        loc.mkdir(parents=True)
+        (loc / "messages.json").write_bytes(b'{"appName": {"message": "\xff\xfe"}}')
+        ext = self.scanner._parse_chromium_manifest(path, "id", "Chrome")
+        self.assertEqual(ext.name, "__MSG_appName__")
+
+    def test_localized_name_with_wrong_types_falls_back(self):
+        path = self._manifest({"name": "__MSG_appName__"})
+        for locale, content in [("en", ["list"]), ("en_US", {"appName": "just a string"}),
+                                ("en_GB", {"appName": {"message": 5}})]:
+            loc = self.dir / "_locales" / locale
+            loc.mkdir(parents=True)
+            (loc / "messages.json").write_text(json.dumps(content), encoding="utf-8")
+        ext = self.scanner._parse_chromium_manifest(path, "id", "Chrome")
+        self.assertEqual(ext.name, "__MSG_appName__")
+
+    def test_chromium_dir_scan_keeps_good_extensions(self):
+        self._manifest({"name": 999}, self.dir / "Extensions" / "badext" / "1.0_0")
+        self._manifest({"name": "Good"}, self.dir / "Extensions" / "goodext" / "1.0_0")
+        found = self.scanner._scan_chromium_extensions_dir(self.dir / "Extensions", "Chrome")
+        self.assertEqual(sorted(e.name for e in found), ["999", "Good"])
+
+    # --- Firefox ----------------------------------------------------------------
+
+    def test_firefox_null_user_permissions(self):
+        exts = self._firefox({"addons": [{"type": "extension", "id": "a@b",
+                                          "defaultLocale": {"name": "A"}, "userPermissions": None}]})
+        self.assertEqual([(e.name, e.permissions) for e in exts], [("A", [])])
+
+    def test_firefox_null_default_locale_falls_back_to_id(self):
+        exts = self._firefox({"addons": [{"type": "extension", "id": "a@b", "defaultLocale": None}]})
+        self.assertEqual(exts[0].name, "a@b")
+
+    def test_firefox_bad_entry_does_not_drop_others(self):
+        exts = self._firefox({"addons": ["not-an-object", 42,
+                                         {"type": "extension", "id": "good@x", "active": "yes",
+                                          "defaultLocale": {"name": "Good"}}]})
+        self.assertEqual([e.name for e in exts], ["Good"])
+        self.assertTrue(exts[0].enabled)
+
+    def test_firefox_wrong_top_level_shapes(self):
+        self.assertEqual(self._firefox([1, 2]), [])
+        self.assertEqual(self._firefox({"addons": "nope"}), [])
+        self.assertEqual(self._firefox("[" * 100000 + "]" * 100000), [])
+
+
 class TestCompiledSkipPatterns(unittest.TestCase):
     """Test that compiled SKIP_PATTERNS work correctly."""
 
@@ -1588,6 +1813,8 @@ class SecurityTestSuite(unittest.TestSuite):
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCsvSanitizationConsistency))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestDiffExportSanitization))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCsvFormulaInjection))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestRegistryMalformedValues))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestBrowserMalformedInput))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCompiledSkipPatterns))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestLoadEnvFile))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestWingetUpdateChecker))

@@ -205,6 +205,7 @@ The output of this tool contains sensitive system information:
 ### Built-in Security Features
 - **Output Sanitization** - Removes terminal escape sequences (7-bit and 8-bit), control characters, and Unicode bidi/format characters to prevent terminal injection. Line breaks and tabs inside names are replaced with spaces, so a name can't overwrite itself on screen or inject fake table rows. Applied to table, JSON, CSV, and baseline-diff output
 - **CSV Formula-Injection Guard** - Exported cells that a spreadsheet would treat as a formula are prefixed with `'`
+- **Malformed-Data Resilience** - Registry values with unexpected types are converted to text (and reported with a warning) instead of hiding the entry or aborting the scan; malformed browser extension files are handled per entry, so one bad file can't crash the extension scan
 - **Audit Logging** - File-based logging with restricted permissions (0o600) and automatic rotation (5 MB max, 3 backups)
 - **Symlink Protection** - Skips symlinks to prevent directory traversal attacks
 - **File Count Safety Limit** - Portable app scanning caps at 500 executables to prevent memory exhaustion
@@ -290,6 +291,7 @@ python -m unittest test_security.TestOutputSanitization.test_removes_ansi_color_
 The test suite covers:
 - Output sanitization (ANSI/8-bit escape sequences, control characters, carriage-return overwrite, Unicode bidi overrides, baseline-diff exports)
 - CSV formula-injection guard (export and diff CSV)
+- Malformed registry values and browser extension files (wrong types, null fields, invalid UTF-8, deeply nested JSON)
 - API key handling (environment variables, CLI arguments, `.env` file loading)
 - Symlink protection
 - Error message sanitization

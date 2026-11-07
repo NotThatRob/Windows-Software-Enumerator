@@ -49,16 +49,57 @@ class TestOutputSanitization(unittest.TestCase):
         self.assertEqual(result, "Real Text")
 
     def test_removes_control_characters(self):
-        """Control characters (except newline/tab) should be stripped."""
+        """Non-line-break control characters should be stripped."""
         malicious = "Normal\x00\x01\x02\x03Text"
         result = se.sanitize_output(malicious)
         self.assertEqual(result, "NormalText")
 
-    def test_preserves_newlines_and_tabs(self):
-        """Newlines and tabs should be preserved."""
+    def test_line_breaks_and_tabs_become_spaces(self):
+        """Newlines and tabs are replaced with spaces (output fields are single-line)."""
         text = "Line1\nLine2\tTabbed"
         result = se.sanitize_output(text)
-        self.assertEqual(result, "Line1\nLine2\tTabbed")
+        self.assertEqual(result, "Line1 Line2 Tabbed")
+
+    def test_carriage_return_cannot_hide_text(self):
+        """A CR must not let a name overwrite itself on screen (SEC-2)."""
+        result = se.sanitize_output("EvilRAT\rGoogle Chrome")
+        self.assertNotIn("\r", result)
+        self.assertEqual(result, "EvilRAT Google Chrome")
+
+    def test_newline_cannot_inject_table_row(self):
+        """A newline must not let a name inject a fake row into table output."""
+        result = se.sanitize_output("EvilRAT\nGoogle Chrome | 131.0 | Google LLC")
+        self.assertNotIn("\n", result)
+
+    def test_all_vertical_whitespace_becomes_space(self):
+        """VT, FF, NEL and Unicode line/paragraph separators become spaces."""
+        for ch in ["\v", "\f", "\x85", " ", " "]:
+            self.assertEqual(se.sanitize_output(f"a{ch}b"), "a b", f"U+{ord(ch):04X}")
+
+    def test_removes_c1_control_characters(self):
+        """C1 controls (0x80-0x9F) are removed, including 8-bit CSI sequences."""
+        self.assertEqual(se.sanitize_output("x\x9b31my"), "xy")   # 8-bit CSI + params
+        self.assertEqual(se.sanitize_output("a\x90b\x9fc"), "abc")
+
+    def test_csi_private_parameters_leave_no_residue(self):
+        """Sequences like ESC[?25l (hide cursor) are fully removed, not left as '[?25l'."""
+        self.assertEqual(se.sanitize_output("A\x1b[?25lB"), "AB")
+        self.assertEqual(se.sanitize_output("A\x1b[>4;1mB"), "AB")
+
+    def test_removes_osc_terminated_by_st(self):
+        """OSC sequences terminated by ST (ESC \\) are removed, not only BEL-terminated ones."""
+        self.assertEqual(se.sanitize_output("A\x1b]0;Fake Title\x1b\\B"), "AB")
+
+    def test_removes_two_byte_escape_sequences(self):
+        """Two-byte escapes (ESC c reset, ESC 7 save cursor, ESC ( B charset) are removed whole,
+        matching how a terminal would consume them."""
+        self.assertEqual(se.sanitize_output("A\x1bcB"), "AB")
+        self.assertEqual(se.sanitize_output("A\x1b7B"), "AB")
+        self.assertEqual(se.sanitize_output("A\x1b(BC"), "AC")
+
+    def test_non_string_input_is_stringified(self):
+        """Non-string values (e.g. a REG_DWORD read from the registry) don't crash."""
+        self.assertEqual(se.sanitize_output(20240101), "20240101")
 
     def test_handles_empty_string(self):
         """Empty strings should be handled gracefully."""
@@ -1101,6 +1142,60 @@ class TestCsvSanitizationConsistency(unittest.TestCase):
                              f"Mismatch in field '{field}': CSV={csv_entry[field]!r}, JSON={json_entry[field]!r}")
 
 
+class TestDiffExportSanitization(unittest.TestCase):
+    """Baseline diff output (table, JSON, CSV) must sanitize every field (SEC-2).
+
+    Removed entries and metadata come from a baseline file on disk, so they are untrusted.
+    """
+
+    EVIL = "Evil\rTrusted\x1b[2K‮"
+
+    def _diff(self):
+        evil = se.SoftwareInfo(name=self.EVIL, version="1.0\x1b[31m", publisher="Pub\nX",
+                               install_date="2025\x07", source="Registry\x9b2J")
+        good = se.SoftwareInfo(name="Good", version="2.0", publisher="P", source="Registry")
+        good_new = se.SoftwareInfo(name="Good", version="2.1\r", publisher="P", source="Registry")
+        return se.BaselineDiff(added=[evil], removed=[evil], changed=[(good, good_new)])
+
+    def _assert_clean(self, text):
+        for bad in ["\x1b", "\r", "‮", "\x07", "\x9b"]:
+            self.assertNotIn(bad, text, f"found {bad!r}")
+
+    def test_diff_csv_sanitizes_all_fields(self):
+        out = se.BaselineManager.diff_to_csv(self._diff())
+        rows = list(csv.reader(io.StringIO(out)))
+        self.assertEqual(rows[0], ["change_type", "name", "baseline_version",
+                                   "current_version", "publisher", "source"])
+        self.assertEqual(len(rows), 4)
+        for row in rows[1:]:
+            for cell in row:
+                self._assert_clean(cell)
+                self.assertNotIn("\n", cell)
+        self.assertEqual(rows[1][1], "Evil Trusted")
+
+    def test_diff_json_sanitizes_all_fields_and_metadata(self):
+        meta = {"created_at": "2026\x1b]0;x\x07", "hostname": "HOST\rFAKE"}
+        data = json.loads(se.BaselineManager.diff_to_json(self._diff(), meta, "base.json"))
+        self.assertEqual(data["summary"]["total_changes"], 3)
+        self.assertEqual(data["metadata"]["baseline_hostname"], "HOST FAKE")
+        self.assertEqual(data["metadata"]["baseline_created"], "2026")
+        for entry in data["added"] + data["removed"]:
+            for value in entry.values():
+                self._assert_clean(value)
+                self.assertNotIn("\n", value)
+        self.assertEqual(data["changed"][0]["current"]["version"], "2.1 ")
+
+    def test_display_diff_sanitizes_metadata(self):
+        meta = {"created_at": "2026\x1b[2J", "hostname": "HOST\rFAKE", "software_count": 0}
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            se.BaselineManager.display_diff(self._diff(), meta)
+        out = buf.getvalue()
+        self._assert_clean(out)
+        self.assertIn("Baseline host: HOST FAKE", out)
+        self.assertIn("Baseline software count: 0", out)  # 0 is a real value, not "unknown"
+
+
 class TestCompiledSkipPatterns(unittest.TestCase):
     """Test that compiled SKIP_PATTERNS work correctly."""
 
@@ -1436,6 +1531,7 @@ class SecurityTestSuite(unittest.TestSuite):
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestParallelScanning))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestQuietMode))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCsvSanitizationConsistency))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestDiffExportSanitization))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCompiledSkipPatterns))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestLoadEnvFile))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestWingetUpdateChecker))

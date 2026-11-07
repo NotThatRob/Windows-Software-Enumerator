@@ -156,24 +156,51 @@ def log_audit_event(event_type: str, details: str = "", **kwargs) -> None:
     logger.info(message)
 
 
-def sanitize_output(text: str) -> str:
-    """Remove ANSI escape sequences and control characters from text.
+# Terminal escape sequences, following the ECMA-48 grammar rather than a fixed list:
+#   CSI  = ESC[ or 8-bit 0x9B, parameter bytes 0x30-0x3F (incl. "?" as in ESC[?25l),
+#          intermediate bytes 0x20-0x2F, one final byte 0x40-0x7E
+#   OSC  = ESC] or 8-bit 0x9D ... terminated by BEL, ESC\ (ST) or 8-bit ST 0x9C
+#   other two-byte escapes (ESC c, ESC 7, ESC ( B, ...)
+_ESCAPE_SEQUENCE_RE = re.compile(
+    r'(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]'
+    r'|(?:\x1b\]|\x9d)[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)'
+    r'|\x1b[ -/]*[0-~]'
+)
 
-    Prevents malicious software from manipulating terminal output
-    or hiding its presence in listings via escape sequences.
+# Characters that break or move the line. Replaced with a space (not removed) so that
+# hidden text becomes visible, e.g. "EvilRAT\rGoogle Chrome" -> "EvilRAT Google Chrome".
+_LINE_BREAK_CHARS = frozenset("\t\n\v\f\r\x85  ")
+
+
+def sanitize_output(text: str) -> str:
+    """Make untrusted text safe to print as a single-line field.
+
+    Prevents malicious software from manipulating terminal output or hiding
+    its presence in listings:
+    - removes terminal escape sequences (7-bit and 8-bit forms)
+    - replaces line breaks, carriage returns and tabs with a space, so a name
+      can't overwrite itself on screen or inject fake table rows
+    - removes all other control characters (C0, DEL, C1) and Unicode format
+      characters (category Cf, e.g. U+202E bidi override, zero-width space)
+
+    None is returned unchanged; other non-string values are converted to str.
     """
+    if text is None:
+        return None
+    if not isinstance(text, str):
+        text = str(text)
     if not text:
         return text
-    # Remove ANSI escape sequences (colors, cursor movement, etc.)
-    text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
-    # Remove other escape sequences (OSC, etc.)
-    text = re.sub(r'\x1b\][^\x07]*\x07', '', text)
-    # Remove remaining control characters except newline and tab
-    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
-    # Remove Unicode bidirectional overrides and other format characters (category Cf)
-    # Prevents visual spoofing of filenames (e.g., U+202E reverses displayed text)
-    text = ''.join(c for c in text if unicodedata.category(c) != 'Cf')
-    return text
+    text = _ESCAPE_SEQUENCE_RE.sub('', text)
+    cleaned = []
+    for c in text:
+        if c in _LINE_BREAK_CHARS:
+            cleaned.append(' ')
+        elif unicodedata.category(c) in ('Cc', 'Cf'):
+            continue
+        else:
+            cleaned.append(c)
+    return ''.join(cleaned)
 
 
 class ProgressBar:
@@ -1975,13 +2002,17 @@ class SoftwareExporter:
 
     @staticmethod
     def _sanitize_software_dict(software: SoftwareInfo) -> dict:
-        """Convert SoftwareInfo to dict with sanitized string fields."""
+        """Convert SoftwareInfo to dict with sanitized string fields.
+
+        Every field is sanitized: entries can come from a baseline file on disk,
+        where even install_date and source are untrusted.
+        """
         return {
             "name": sanitize_output(software.name),
             "version": sanitize_output(software.version),
             "publisher": sanitize_output(software.publisher),
-            "install_date": software.install_date,
-            "source": software.source,
+            "install_date": sanitize_output(software.install_date),
+            "source": sanitize_output(software.source),
             "install_location": sanitize_output(software.install_location),
         }
 
@@ -2221,19 +2252,72 @@ class BaselineManager:
         return diff
 
     @staticmethod
+    def diff_to_json(diff: BaselineDiff, baseline_metadata: dict, baseline_file: str) -> str:
+        """Render a baseline diff as JSON, with every string field sanitized."""
+        sanitize = SoftwareExporter._sanitize_software_dict
+        diff_data = {
+            "metadata": {
+                "generated_at": datetime.now().isoformat(),
+                "baseline_file": sanitize_output(baseline_file),
+                "baseline_created": sanitize_output(baseline_metadata.get("created_at")),
+                "baseline_hostname": sanitize_output(baseline_metadata.get("hostname")),
+            },
+            "summary": {
+                "added_count": len(diff.added),
+                "removed_count": len(diff.removed),
+                "changed_count": len(diff.changed),
+                "total_changes": diff.total_changes,
+            },
+            "added": [sanitize(s) for s in diff.added],
+            "removed": [sanitize(s) for s in diff.removed],
+            "changed": [
+                {"baseline": sanitize(b), "current": sanitize(c)}
+                for b, c in diff.changed
+            ],
+        }
+        return json.dumps(diff_data, indent=2, ensure_ascii=False)
+
+    @staticmethod
+    def diff_to_csv(diff: BaselineDiff) -> str:
+        """Render a baseline diff as CSV, with every field sanitized.
+
+        Columns: change_type, name, baseline_version, current_version, publisher, source
+        """
+        output = io.StringIO()
+        writer = csv.writer(output, quoting=csv.QUOTE_ALL)
+        writer.writerow(["change_type", "name", "baseline_version", "current_version", "publisher", "source"])
+
+        def row(change_type, name, baseline_version, current_version, publisher, source):
+            writer.writerow([change_type] + [sanitize_output(v) for v in
+                            (name, baseline_version, current_version, publisher, source)])
+
+        for s in diff.added:
+            row("added", s.name, "", s.version, s.publisher, s.source)
+        for s in diff.removed:
+            row("removed", s.name, s.version, "", s.publisher, s.source)
+        for b, c in diff.changed:
+            row("changed", c.name, b.version, c.version, c.publisher, c.source)
+
+        return output.getvalue()
+
+    @staticmethod
     def display_diff(diff: BaselineDiff, baseline_metadata: dict) -> None:
         """Display baseline comparison results.
 
         Args:
             diff: BaselineDiff object
-            baseline_metadata: Metadata from the baseline file
+            baseline_metadata: Metadata from the baseline file (untrusted; sanitized on display)
         """
+        def meta(key: str) -> str:
+            value = baseline_metadata.get(key)
+            return "unknown" if value is None else sanitize_output(value)
+
         print("=" * 70)
         print("BASELINE COMPARISON RESULTS")
         print("=" * 70)
-        print(f"Baseline created: {baseline_metadata.get('created_at', 'unknown')}")
-        print(f"Baseline host: {baseline_metadata.get('hostname', 'unknown')}")
-        print(f"Baseline software count: {baseline_metadata.get('software_count', 'unknown')}")
+        print(f"Baseline created: {meta('created_at')}")
+        print(f"Baseline host: {meta('hostname')}")
+        print(f"Baseline software count: {meta('software_count')}")
         print("=" * 70)
 
         if not diff.has_changes:
@@ -2255,7 +2339,7 @@ class BaselineManager:
                     print(f"      Version: {sanitize_output(software.version)}")
                 if software.publisher:
                     print(f"      Publisher: {sanitize_output(software.publisher)}")
-                print(f"      Source: {software.source}")
+                print(f"      Source: {sanitize_output(software.source)}")
 
         if diff.removed:
             print("\n" + "-" * 70)
@@ -2576,41 +2660,9 @@ Examples:
 
             # Output diff in requested format
             if args.output == "json":
-                diff_data = {
-                    "metadata": {
-                        "generated_at": datetime.now().isoformat(),
-                        "baseline_file": args.diff,
-                        "baseline_created": baseline_metadata.get("created_at"),
-                        "baseline_hostname": baseline_metadata.get("hostname"),
-                    },
-                    "summary": {
-                        "added_count": len(diff.added),
-                        "removed_count": len(diff.removed),
-                        "changed_count": len(diff.changed),
-                        "total_changes": diff.total_changes,
-                    },
-                    "added": [asdict(s) for s in diff.added],
-                    "removed": [asdict(s) for s in diff.removed],
-                    "changed": [
-                        {"baseline": asdict(b), "current": asdict(c)}
-                        for b, c in diff.changed
-                    ],
-                }
-                print(json.dumps(diff_data, indent=2, ensure_ascii=False))
+                print(BaselineManager.diff_to_json(diff, baseline_metadata, args.diff))
             elif args.output == "csv":
-                # CSV diff format: change_type, name, baseline_version, current_version
-                output = io.StringIO()
-                writer = csv.writer(output, quoting=csv.QUOTE_ALL)
-                writer.writerow(["change_type", "name", "baseline_version", "current_version", "publisher", "source"])
-
-                for s in diff.added:
-                    writer.writerow(["added", s.name, "", s.version, s.publisher, s.source])
-                for s in diff.removed:
-                    writer.writerow(["removed", s.name, s.version, "", s.publisher, s.source])
-                for b, c in diff.changed:
-                    writer.writerow(["changed", c.name, b.version, c.version, c.publisher, c.source])
-
-                print(output.getvalue())
+                print(BaselineManager.diff_to_csv(diff))
             else:
                 BaselineManager.display_diff(diff, baseline_metadata)
 

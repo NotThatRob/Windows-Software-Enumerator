@@ -51,19 +51,20 @@ Everything lives in `Software_Enumerator.py` (~2600 lines). Key classes:
 
 **UI helpers**: `ProgressBar`, `Spinner` — write progress/status to stderr (not stdout), so piped output stays clean. Suppressed by `--quiet`
 
-**Top-level functions**: `setup_logging()`, `sanitize_output()`, `log_audit_event()`, `_load_env_file()`, `main()`
+**Top-level functions**: `setup_logging()`, `sanitize_output()`, `csv_safe_cell()`, `log_audit_event()`, `_load_env_file()`, `_system_dir()` / `_powershell_path()` / `_winget_path()`, `_harden_process_environment()`, `main()`
 
 ## Key Design Decisions
 
 - **No dependencies**: Uses only Python stdlib (`winreg`, `subprocess`, `urllib`, `csv`, `logging.handlers.RotatingFileHandler`, `dataclasses`, `concurrent.futures`, etc.)
-- **Security-first**: Output sanitization strips ANSI/control chars and Unicode bidi overrides; symlink protection; generic error messages hide internal details; generic User-Agent; file count safety limits; restricted log permissions (0o600)
+- **Security-first**: Output sanitization strips escape sequences, control chars and Unicode format/bidi chars, and turns line breaks/tabs into spaces; CSV cells that would run as spreadsheet formulas are prefixed with `'`; malformed registry/extension data is converted per entry rather than allowed to hide software; symlink protection; generic error messages hide internal details; generic User-Agent; file count safety limits; owner-only log file ACL (`_RestrictedRotatingFileHandler`, SDDL `D:P(A;;FA;;;OW)(A;;FA;;;SY)`; `os.chmod` can't restrict access on Windows). `_open_log_handle()` opens the file once with `CreateFileW` and the stream wraps that handle (never reopened by name; no `FILE_SHARE_DELETE`, so the file and its folder can't be swapped while open). New files: `CREATE_NEW` with the DACL in place. Existing files: opened with `FILE_FLAG_OPEN_REPARSE_POINT` and refused with `LogFileOwnershipError` → exit 4 if a reparse point, hard-linked, or owned by another account (other than SYSTEM/Administrators), otherwise restricted on the handle (`_restrict_handle_to_owner()`). The owner check runs whenever the owner can be read, regardless of the drive check (an unreadable owner on an ACL drive is refused, fail closed); drives without ACLs (`_volume_supports_acls()` false, e.g. FAT32) then only warn once. Win32 calls go through `_win32()` (private DLL handles with argtypes)
+- **Absolute executable paths**: Subprocesses are launched by absolute path (`_powershell_path()`, `_winget_path()`), never by bare name, because Windows searches the current directory before PATH. There is no fallback to the bare name. `main()` also sets `NoDefaultCurrentDirectoryInExePath=1`. New subprocess calls must follow this
 - **stderr/stdout separation**: All progress bars, spinners, and status messages go to stderr. Only final results (table/JSON/CSV) go to stdout. This allows clean piping (`--output json > file.json`)
 - **Rate limiting**: Sliding-window rate limiter using `collections.deque` with automatic HTTP 429 retry. Without API key: 5 req/30s; with key: 50 req/30s
 - **CVE limit**: Default 20, max 100 (`--cve-limit`). Prevents accidental API abuse
 - **Search and exclude use literal matching** (not regex) to avoid regex injection via `matches_search()` and `matches_exclude()`. `--exclude` is comma-separated and matches against name and publisher
-- **Structured exit codes**: `EXIT_SUCCESS=0`, `EXIT_ERROR=1`, `EXIT_NO_SOFTWARE=2`, `EXIT_API_FAILURE=3`, `EXIT_PERMISSION_DENIED=4` — defined as module-level constants for CI/CD scripting
+- **Structured exit codes**: `EXIT_SUCCESS=0`, `EXIT_ERROR=1`, `EXIT_NO_SOFTWARE=2`, `EXIT_API_FAILURE=3`, `EXIT_PERMISSION_DENIED=4` — defined as module-level constants for CI/CD scripting. Exit 4 is currently raised for `--log-file` problems; `EXIT_API_FAILURE` is not yet wired up
 - **`SOFTWARE_MAPPINGS` dict** in `VulnerabilityScanner`: maps normalized software names to `(vendor, product)` tuples for NVD CPE queries
-- **Env file loading**: `_load_env_file()` loads `api.env` or `.env` from the script directory or CWD at startup. Does not overwrite existing env vars. The `api.env` file in the repo root is gitignored and is the intended place for NVD API keys during local development
+- **Env file loading**: `_load_env_file()` reads `api.env` (then `.env`) only from the tool's own folder (`_env_search_dirs()`: the script's folder, or the `.exe`'s folder when frozen) — never the CWD — and only accepts keys in `_ENV_FILE_ALLOWED_KEYS` (`NVD_API_KEY`). Other keys are ignored and logged by name, never by value. Does not overwrite existing env vars. The `api.env` file in the repo root is gitignored and is the intended place for NVD API keys during local development. Tests must patch `_env_search_dirs()` so the real `api.env` is never read
 
 ## Testing
 

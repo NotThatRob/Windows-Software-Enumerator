@@ -171,6 +171,8 @@ Displays a formatted table with: Name, Version, Publisher, Source, Install Date
 ### CSV Export
 Standard CSV with headers: `name,version,publisher,install_date,source,install_location`
 
+Cells that begin with `=`, `+`, `-` or `@` are prefixed with a single quote (`'`) so spreadsheet apps show them as text instead of running them as formulas (CSV injection protection). This also applies to `--diff ... --output csv`.
+
 ### Baseline Comparison
 Shows added, removed, and version-changed software since baseline was created:
 - `[+] ADDED` - New software not in baseline
@@ -201,8 +203,11 @@ The output of this tool contains sensitive system information:
 - Redact sensitive data before sharing reports
 
 ### Built-in Security Features
-- **Output Sanitization** - Removes ANSI escape sequences, control characters, and Unicode bidi overrides to prevent terminal injection
-- **Audit Logging** - File-based logging with restricted permissions (0o600) and automatic rotation (5 MB max, 3 backups)
+- **Output Sanitization** - Removes terminal escape sequences (7-bit and 8-bit), control characters, and Unicode bidi/format characters to prevent terminal injection. Line breaks and tabs inside names are replaced with spaces, so a name can't overwrite itself on screen or inject fake table rows. Applied to table, JSON, CSV, and baseline-diff output
+- **CSV Formula-Injection Guard** - Exported cells that a spreadsheet would treat as a formula are prefixed with `'`
+- **Trusted Executable Paths** - PowerShell and winget are launched by absolute path (System32 from the OS, winget's per-user alias), never by bare name, so a planted `powershell.exe`/`winget.exe` in the current folder can't run in their place
+- **Malformed-Data Resilience** - Registry values with unexpected types are converted to text (and reported with a warning) instead of hiding the entry or aborting the scan; malformed browser extension files are handled per entry, so one bad file can't crash the extension scan
+- **Audit Logging** - File-based logging with automatic rotation (5 MB max, 3 backups). Log files, including rotated copies, get an owner-only Windows access list (you and SYSTEM; nothing inherited from the folder). New log files are created with it already in place. The tool refuses (exit code 4) to write to an existing log file that is owned by another account, is a symbolic link, or has other hard links, since someone else could read it. If the drive doesn't support access lists (e.g. FAT32/exFAT), a warning is shown and logging continues
 - **Symlink Protection** - Skips symlinks to prevent directory traversal attacks
 - **File Count Safety Limit** - Portable app scanning caps at 500 executables to prevent memory exhaustion
 - **Baseline Size Limits** - Rejects baseline files larger than 50 MB or containing more than 50,000 entries
@@ -214,7 +219,8 @@ The output of this tool contains sensitive system information:
 - **No Hardcoded Credentials** - API keys are passed via environment variables, CLI arguments, or local `.env` files
 
 ### API Key Security
-- Store your NVD API key in an environment variable or a local `api.env` file (auto-loaded at startup)
+- Store your NVD API key in an environment variable or a local `api.env` (or `.env`) file containing `NVD_API_KEY=...`, placed **next to `Software_Enumerator.py`** (or next to the `.exe` for packaged builds). It is auto-loaded at startup
+- Only `NVD_API_KEY` is read from these files, and files in the current working directory are ignored, so a file planted where the tool is run from can't change its settings (e.g. proxy or certificate variables)
 - Never commit API keys to version control
 - The `.gitignore` includes patterns to prevent accidental credential commits (`*.env`, `api.env`)
 
@@ -269,7 +275,7 @@ Structured exit codes for scripting and CI/CD integration:
 | 1 | Generic error |
 | 2 | No software found |
 | 3 | API failure (NVD unreachable) |
-| 4 | Permission denied |
+| 4 | Permission denied (e.g. the `--log-file` can't be written, or is owned by another account or linked) |
 
 ## Testing
 
@@ -285,8 +291,12 @@ python -m unittest test_security.TestOutputSanitization.test_removes_ansi_color_
 ```
 
 The test suite covers:
-- Output sanitization (ANSI codes, control characters, Unicode bidi overrides)
-- API key handling (environment variables, CLI arguments, `.env` file loading)
+- Output sanitization (ANSI/8-bit escape sequences, control characters, carriage-return overwrite, Unicode bidi overrides, baseline-diff exports)
+- CSV formula-injection guard (export and diff CSV)
+- Malformed registry values and browser extension files (wrong types, null fields, invalid UTF-8, deeply nested JSON)
+- Absolute executable paths (incl. a planted-binary integration test)
+- Owner-only log file access lists (set at creation, on rotated files, and on pre-existing files), and refusal of log files owned by another account or reached through a link
+- API key handling (environment variables, CLI arguments, `.env` file loading: allowlisted key only, tool folder only, values never logged)
 - Symlink protection
 - Error message sanitization
 - Audit logging functionality

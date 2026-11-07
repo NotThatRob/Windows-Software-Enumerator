@@ -51,12 +51,13 @@ Everything lives in `Software_Enumerator.py` (~2600 lines). Key classes:
 
 **UI helpers**: `ProgressBar`, `Spinner` — write progress/status to stderr (not stdout), so piped output stays clean. Suppressed by `--quiet`
 
-**Top-level functions**: `setup_logging()`, `sanitize_output()`, `log_audit_event()`, `_load_env_file()`, `main()`
+**Top-level functions**: `setup_logging()`, `sanitize_output()`, `csv_safe_cell()`, `log_audit_event()`, `_load_env_file()`, `_system_dir()` / `_powershell_path()` / `_winget_path()`, `_harden_process_environment()`, `main()`
 
 ## Key Design Decisions
 
 - **No dependencies**: Uses only Python stdlib (`winreg`, `subprocess`, `urllib`, `csv`, `logging.handlers.RotatingFileHandler`, `dataclasses`, `concurrent.futures`, etc.)
-- **Security-first**: Output sanitization strips ANSI/control chars and Unicode bidi overrides; symlink protection; generic error messages hide internal details; generic User-Agent; file count safety limits; restricted log permissions (0o600)
+- **Security-first**: Output sanitization strips escape sequences, control chars and Unicode format/bidi chars, and turns line breaks/tabs into spaces; CSV cells that would run as spreadsheet formulas are prefixed with `'`; malformed registry/extension data is converted per entry rather than allowed to hide software; symlink protection; generic error messages hide internal details; generic User-Agent; file count safety limits; restricted log permissions (0o600)
+- **Absolute executable paths**: Subprocesses are launched by absolute path (`_powershell_path()`, `_winget_path()`), never by bare name, because Windows searches the current directory before PATH. There is no fallback to the bare name. `main()` also sets `NoDefaultCurrentDirectoryInExePath=1`. New subprocess calls must follow this
 - **stderr/stdout separation**: All progress bars, spinners, and status messages go to stderr. Only final results (table/JSON/CSV) go to stdout. This allows clean piping (`--output json > file.json`)
 - **Rate limiting**: Sliding-window rate limiter using `collections.deque` with automatic HTTP 429 retry. Without API key: 5 req/30s; with key: 50 req/30s
 - **CVE limit**: Default 20, max 100 (`--cve-limit`). Prevents accidental API abuse

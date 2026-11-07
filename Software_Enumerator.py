@@ -54,6 +54,52 @@ def setup_console_encoding():
             pass
 
 
+# --- Executable resolution -----------------------------------------------
+# Never launch a program by bare name: Windows searches the current directory before
+# PATH, so a planted powershell.exe / winget.exe in the folder the tool is run from
+# would execute instead of the real one.
+
+def _system_dir() -> Path:
+    """Return the Windows System32 directory as reported by the OS.
+
+    Uses GetSystemDirectoryW rather than %SystemRoot%, which the parent process controls.
+    """
+    size = 260
+    while True:
+        buf = ctypes.create_unicode_buffer(size)
+        length = ctypes.windll.kernel32.GetSystemDirectoryW(buf, size)
+        if length == 0:
+            raise OSError("GetSystemDirectoryW failed")
+        if length < size:
+            return Path(buf.value)
+        size = length + 1  # buffer too small; length is the size needed
+
+
+def _powershell_path() -> Path:
+    """Absolute path of Windows PowerShell 5.1 (ships with every Windows 10/11)."""
+    return _system_dir() / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+
+
+def _winget_path() -> Optional[Path]:
+    """Absolute path of winget, or None if it isn't installed for this user.
+
+    winget is an app-execution alias (a 0-byte reparse point) that App Installer
+    creates in %LOCALAPPDATA%\\Microsoft\\WindowsApps; it runs fine by absolute path.
+    There is deliberately no fallback to the bare name.
+    """
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        return None
+    path = Path(local_app_data) / "Microsoft" / "WindowsApps" / "winget.exe"
+    return path if path.is_file() else None
+
+
+def _harden_process_environment() -> None:
+    """Defence in depth: stop Windows searching the current directory for executables,
+    for any subprocess this tool (or its children) starts. Leaves an existing value alone."""
+    os.environ.setdefault("NoDefaultCurrentDirectoryInExePath", "1")
+
+
 def _load_env_file() -> None:
     """Load variables from .env files into os.environ (without overwriting existing values).
 
@@ -667,7 +713,7 @@ class StoreAppScanner:
             # -NoLogo: Skip the copyright banner (minor startup speedup)
             # -NoProfile: Skip loading user profile scripts
             cmd = [
-                "powershell",
+                str(_powershell_path()),  # absolute path, never a PATH/CWD lookup
                 "-NoLogo",
                 "-NoProfile",
                 "-Command",
@@ -725,7 +771,7 @@ class StoreAppScanner:
             logger.warning("PowerShell command timed out while enumerating Store apps")
         except FileNotFoundError:
             logger.warning(
-                "PowerShell not found in PATH. Store app enumeration requires PowerShell."
+                "Windows PowerShell not found. Store app enumeration requires PowerShell."
             )
         except OSError as e:
             logger.debug(f"OS error during Store app enumeration: {e}")
@@ -991,10 +1037,15 @@ class WingetUpdateChecker:
         """Query winget for available updates."""
         updates = []
 
+        winget = _winget_path()
+        if winget is None:
+            print("Warning: winget not found. Please ensure Windows Package Manager is installed.", file=sys.stderr)
+            return updates
+
         try:
             # Run winget upgrade to get list of available updates
             cmd = [
-                "winget", "upgrade",
+                str(winget), "upgrade",  # absolute path, never a PATH/CWD lookup
                 "--include-unknown",
                 "--disable-interactivity",
                 "--accept-source-agreements"
@@ -2505,6 +2556,7 @@ class BaselineManager:
 
 def main():
     """Main entry point for the CLI."""
+    _harden_process_environment()
     setup_console_encoding()
 
     parser = argparse.ArgumentParser(

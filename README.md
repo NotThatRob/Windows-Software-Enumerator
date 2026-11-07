@@ -205,6 +205,7 @@ The output of this tool contains sensitive system information:
 ### Built-in Security Features
 - **Output Sanitization** - Removes terminal escape sequences (7-bit and 8-bit), control characters, and Unicode bidi/format characters to prevent terminal injection. Line breaks and tabs inside names are replaced with spaces, so a name can't overwrite itself on screen or inject fake table rows. Applied to table, JSON, CSV, and baseline-diff output
 - **CSV Formula-Injection Guard** - Exported cells that a spreadsheet would treat as a formula are prefixed with `'`
+- **Trusted Executable Paths** - PowerShell and winget are launched by absolute path (System32 from the OS, winget's per-user alias), never by bare name, so a planted `powershell.exe`/`winget.exe` in the current folder can't run in their place
 - **Malformed-Data Resilience** - Registry values with unexpected types are converted to text (and reported with a warning) instead of hiding the entry or aborting the scan; malformed browser extension files are handled per entry, so one bad file can't crash the extension scan
 - **Audit Logging** - File-based logging with restricted permissions (0o600) and automatic rotation (5 MB max, 3 backups)
 - **Symlink Protection** - Skips symlinks to prevent directory traversal attacks

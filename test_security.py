@@ -1816,17 +1816,40 @@ class TestLogFilePermissions(unittest.TestCase):
             se.setup_logging(log_file=str(log))
         self.assertEqual(target.read_text(encoding="utf-8"), "private\n")
 
-    def test_unverifiable_owner_warns_and_continues(self):
+    def test_unverifiable_owner_on_drive_without_acls_warns_and_continues(self):
+        """FAT32/exFAT have no owners: warn once and keep logging."""
         log = self.dir / "audit.log"
         log.write_text("x\n", encoding="utf-8")
         captured = io.StringIO()
-        with patch.object(se, "_handle_owner_sid", side_effect=OSError("no ACL support")), \
+        with patch.object(se, "_volume_supports_acls", return_value=False), \
+             patch.object(se, "_handle_owner_sid", side_effect=OSError("no owner information")), \
              patch("sys.stderr", captured):
             se.setup_logging(log_file=str(log))
             se.log_audit_event("TEST", "still logging")
             self._flush()
         self.assertEqual(captured.getvalue().count("could not restrict log file permissions"), 1)
         self.assertIn("still logging", log.read_text(encoding="utf-8"))
+
+    def test_unverifiable_owner_on_acl_drive_is_refused(self):
+        """Fail closed: the drive has owners, but this file's can't be read."""
+        log = self.dir / "audit.log"
+        log.write_text("x\n", encoding="utf-8")
+        with patch.object(se, "_handle_owner_sid", side_effect=OSError("cannot read owner")):
+            with self.assertRaises(se.LogFileOwnershipError) as ctx:
+                se.setup_logging(log_file=str(log))
+        self.assertIn("Could not verify who owns", str(ctx.exception))
+        self.assertEqual(log.read_text(encoding="utf-8"), "x\n")
+
+    def test_foreign_owner_refused_even_if_drive_reports_no_acls(self):
+        """The drive check must not switch off the ownership check (fail-open). A failed or
+        misleading capability report still refuses a file another account owns."""
+        log = self.dir / "audit.log"
+        log.write_text("pre-created\n", encoding="utf-8")
+        with patch.object(se, "_volume_supports_acls", return_value=False), \
+             patch.object(se, "_handle_owner_sid", return_value=self.FOREIGN_SID):
+            with self.assertRaises(se.LogFileOwnershipError):
+                se.setup_logging(log_file=str(log))
+        self.assertEqual(log.read_text(encoding="utf-8"), "pre-created\n")
 
     def _run_main(self, *argv):
         captured = io.StringIO()

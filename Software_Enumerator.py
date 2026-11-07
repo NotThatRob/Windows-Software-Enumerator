@@ -467,6 +467,7 @@ class _RestrictedRotatingFileHandler(RotatingFileHandler):
         """Checks and access list for the opened file. Raises LogFileOwnershipError if
         another account could read it."""
         path = self.baseFilename
+        acl_volume = _volume_supports_acls(handle)
         if not created:
             info = os.fstat(fd)
             if info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
@@ -476,21 +477,24 @@ class _RestrictedRotatingFileHandler(RotatingFileHandler):
                 raise LogFileOwnershipError(
                     f"Log file {path} has other hard links, so it may be readable under another name. "
                     f"Choose a different --log-file path.")
+            # Ownership is checked whenever it can be read, whatever the drive reports:
+            # the drive check only decides whether to warn and apply the access list.
+            try:
+                owner = _handle_owner_sid(handle)
+                trusted = _trusted_owner_sids()
+            except OSError:
+                if acl_volume:  # fail closed: the drive has owners, but we can't see this one
+                    raise LogFileOwnershipError(
+                        f"Could not verify who owns log file {path}; refusing to write to it.") from None
+                owner = None    # drives without access lists (FAT32/exFAT) have no owners
+            if owner is not None and owner not in trusted:
+                raise LogFileOwnershipError(_foreign_owner_message(path))
 
-        if not _volume_supports_acls(handle):
-            self._warn_unprotected()  # e.g. FAT32/exFAT: the requested access list was ignored
+        if not acl_volume:
+            self._warn_unprotected()  # e.g. FAT32/exFAT: access lists aren't stored there
             return
         if created:
             return  # created owner-only, and held open since, so it can't have been swapped
-
-        try:
-            owner = _handle_owner_sid(handle)
-            trusted = _trusted_owner_sids()
-        except OSError:
-            self._warn_unprotected()  # ownership can't be checked on this drive
-            return
-        if owner is not None and owner not in trusted:
-            raise LogFileOwnershipError(_foreign_owner_message(path))
         try:
             _restrict_handle_to_owner(handle)
         except OSError:

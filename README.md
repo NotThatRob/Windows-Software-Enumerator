@@ -171,6 +171,8 @@ Displays a formatted table with: Name, Version, Publisher, Source, Install Date
 ### CSV Export
 Standard CSV with headers: `name,version,publisher,install_date,source,install_location`
 
+Cells that begin with `=`, `+`, `-` or `@` are prefixed with a single quote (`'`) so spreadsheet apps show them as text instead of running them as formulas (CSV injection protection). This also applies to `--diff ... --output csv`.
+
 ### Baseline Comparison
 Shows added, removed, and version-changed software since baseline was created:
 - `[+] ADDED` - New software not in baseline
@@ -202,6 +204,7 @@ The output of this tool contains sensitive system information:
 
 ### Built-in Security Features
 - **Output Sanitization** - Removes terminal escape sequences (7-bit and 8-bit), control characters, and Unicode bidi/format characters to prevent terminal injection. Line breaks and tabs inside names are replaced with spaces, so a name can't overwrite itself on screen or inject fake table rows. Applied to table, JSON, CSV, and baseline-diff output
+- **CSV Formula-Injection Guard** - Exported cells that a spreadsheet would treat as a formula are prefixed with `'`
 - **Audit Logging** - File-based logging with restricted permissions (0o600) and automatic rotation (5 MB max, 3 backups)
 - **Symlink Protection** - Skips symlinks to prevent directory traversal attacks
 - **File Count Safety Limit** - Portable app scanning caps at 500 executables to prevent memory exhaustion
@@ -286,6 +289,7 @@ python -m unittest test_security.TestOutputSanitization.test_removes_ansi_color_
 
 The test suite covers:
 - Output sanitization (ANSI/8-bit escape sequences, control characters, carriage-return overwrite, Unicode bidi overrides, baseline-diff exports)
+- CSV formula-injection guard (export and diff CSV)
 - API key handling (environment variables, CLI arguments, `.env` file loading)
 - Symlink protection
 - Error message sanitization

@@ -1137,6 +1137,24 @@ class TestMainModes(_MainHarness, unittest.TestCase):
         r.scan_all.assert_not_called()
 
 
+class TestBaselineFileChecks(_MainHarness, unittest.TestCase):
+    """--diff reads and checks the baseline before scanning; bad files give a message, not a traceback."""
+
+    def test_missing_baseline_fails_before_scanning(self):
+        r = self.run_main("--diff", str(self.tmp / "missing.json"))
+        self.assertEqual(r.code, se.EXIT_ERROR)
+        self.assertIn("Baseline file not found", r.err)
+        r.scan_all.assert_not_called()
+
+    def test_invalid_baseline_fails_before_scanning(self):
+        path = self.tmp / "bad.json"
+        path.write_text("{not json", encoding="utf-8")
+        r = self.run_main("--diff", str(path))
+        self.assertEqual(r.code, se.EXIT_ERROR)
+        self.assertIn("Invalid baseline file", r.err)
+        r.scan_all.assert_not_called()
+
+
 class TestAllVersionsCves(unittest.TestCase):
     """CVEs NVD records for every version of a product (no version info) are listed apart, not counted."""
 

@@ -3455,6 +3455,18 @@ Examples:
     else:
         sources = [args.source]
 
+    # Read the baseline before scanning, so a wrong path or a bad file fails at once
+    # instead of after a full scan
+    if args.diff:
+        try:
+            baseline_list, baseline_metadata = BaselineManager.load_baseline(args.diff)
+        except FileNotFoundError:
+            print(f"Error: Baseline file not found: {args.diff}", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"Error: Invalid baseline file: {e}", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
+
     # Run enumeration
     log_audit_event(
         "SCAN_START",
@@ -3480,44 +3492,34 @@ Examples:
 
     # Handle baseline diff mode
     if args.diff:
-        try:
-            baseline_list, baseline_metadata = BaselineManager.load_baseline(args.diff)
+        # Warn if sources don't match
+        baseline_sources = set(baseline_metadata.get("sources", []))
+        current_sources = set(sources)
+        if baseline_sources and baseline_sources != current_sources:
+            print("WARNING: Source mismatch detected!", file=sys.stderr)
+            print(f"  Baseline sources: {', '.join(sorted(baseline_sources)) or 'unknown'}", file=sys.stderr)
+            print(f"  Current sources:  {', '.join(sorted(current_sources))}", file=sys.stderr)
+            print("  Results may include false positives. Consider using matching --source options.", file=sys.stderr)
+            print(file=sys.stderr)
 
-            # Warn if sources don't match
-            baseline_sources = set(baseline_metadata.get("sources", []))
-            current_sources = set(sources)
-            if baseline_sources and baseline_sources != current_sources:
-                print("WARNING: Source mismatch detected!", file=sys.stderr)
-                print(f"  Baseline sources: {', '.join(sorted(baseline_sources)) or 'unknown'}", file=sys.stderr)
-                print(f"  Current sources:  {', '.join(sorted(current_sources))}", file=sys.stderr)
-                print("  Results may include false positives. Consider using matching --source options.", file=sys.stderr)
-                print(file=sys.stderr)
+        diff = BaselineManager.compare(baseline_list, software_list)
 
-            diff = BaselineManager.compare(baseline_list, software_list)
+        log_audit_event(
+            "BASELINE_DIFF",
+            "Baseline comparison completed",
+            baseline_file=args.diff,
+            added=len(diff.added),
+            removed=len(diff.removed),
+            changed=len(diff.changed),
+        )
 
-            log_audit_event(
-                "BASELINE_DIFF",
-                "Baseline comparison completed",
-                baseline_file=args.diff,
-                added=len(diff.added),
-                removed=len(diff.removed),
-                changed=len(diff.changed),
-            )
-
-            # Output diff in requested format
-            if args.output == "json":
-                print(BaselineManager.diff_to_json(diff, baseline_metadata, args.diff))
-            elif args.output == "csv":
-                print(BaselineManager.diff_to_csv(diff), end="")   # CSV text ends with its own line ending
-            else:
-                BaselineManager.display_diff(diff, baseline_metadata)
-
-        except FileNotFoundError:
-            print(f"Error: Baseline file not found: {args.diff}", file=sys.stderr)
-            sys.exit(EXIT_ERROR)
-        except (json.JSONDecodeError, ValueError) as e:
-            print(f"Error: Invalid baseline file: {e}", file=sys.stderr)
-            sys.exit(EXIT_ERROR)
+        # Output diff in requested format
+        if args.output == "json":
+            print(BaselineManager.diff_to_json(diff, baseline_metadata, args.diff))
+        elif args.output == "csv":
+            print(BaselineManager.diff_to_csv(diff), end="")   # CSV text ends with its own line ending
+        else:
+            BaselineManager.display_diff(diff, baseline_metadata)
 
         return
 

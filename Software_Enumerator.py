@@ -3433,6 +3433,20 @@ def _check_option_combinations(parser: argparse.ArgumentParser, args: argparse.N
     if args.overwrite and not args.save_baseline:
         parser.error("--overwrite only applies to --save-baseline")
 
+    # The audit checks combine with each other; the software list, --save-baseline and
+    # --diff each run on their own (main() would otherwise skip all but one of them)
+    checks = [option for option, given in (("--check-updates", args.check_updates),
+                                           ("--extensions", args.extensions),
+                                           ("--check-vulns", args.check_vulns)) if given]
+    if checks and (args.diff or args.save_baseline):
+        parser.error(f"{' '.join(checks)} can't be combined with "
+                     f"{'--diff' if args.diff else '--save-baseline'}; run them separately")
+    if args.diff and args.save_baseline:
+        parser.error("--diff and --save-baseline can't be combined; run them separately")
+    if checks and args.output != "table":
+        parser.error(f"--output {args.output} isn't available for {' '.join(checks)} yet; "
+                     "they print tables only")
+
 
 def main():
     """Main entry point for the CLI."""

@@ -1382,6 +1382,49 @@ class TestCombinedAudit(_MainHarness, unittest.TestCase):
         self.assertNotIn("BROWSER EXTENSIONS", r.out)
 
 
+class TestRefusedCombinations(_MainHarness, unittest.TestCase):
+    """Options that would be ignored are refused before anything is scanned (usage error, exit 2)."""
+
+    def assert_refused(self, *argv, message):
+        r = self.run_main(*argv)
+        self.assertEqual(r.code, 2, r.err)            # argparse usage error
+        self.assertIn(message, r.err)
+        r.scan_all.assert_not_called()
+        r.check_updates.assert_not_called()
+        r.get_extensions.assert_not_called()
+        self.assertEqual(r.nvd.urls, [])
+        return r
+
+    def test_an_audit_check_with_save_baseline(self):
+        path = self.tmp / "b.json"
+        for check in ("--check-updates", "--extensions", "--check-vulns"):
+            with self.subTest(check):
+                self.assert_refused(check, "--save-baseline", str(path),
+                                    message=f"{check} can't be combined with --save-baseline")
+                self.assertFalse(path.exists())
+
+    def test_an_audit_check_with_diff(self):
+        baseline = self.save_baseline(self.SOFTWARE)
+        self.assert_refused("--check-updates", "--extensions", "--diff", str(baseline),
+                            message="--check-updates --extensions can't be combined with --diff")
+
+    def test_diff_with_save_baseline(self):
+        path = self.tmp / "new.json"
+        self.assert_refused("--diff", str(self.save_baseline(self.SOFTWARE)), "--save-baseline", str(path),
+                            message="--diff and --save-baseline can't be combined")
+        self.assertFalse(path.exists())
+
+    def test_json_or_csv_output_with_an_audit_check(self):
+        for output in ("json", "csv"):
+            with self.subTest(output):
+                self.assert_refused("--check-updates", "--output", output,
+                                    message=f"--output {output} isn't available for --check-updates yet")
+
+    def test_table_output_with_an_audit_check_is_fine(self):
+        r = self.run_main("--check-updates", "--output", "table", "--quiet")
+        self.assertEqual(r.code, se.EXIT_SUCCESS)
+
+
 class TestDiffExitCode(_MainHarness, unittest.TestCase):
     """--diff exits 5 when anything changed, 0 when nothing did, in every output format."""
 

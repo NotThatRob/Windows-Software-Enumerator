@@ -91,6 +91,8 @@ python Software_Enumerator.py [OPTIONS]
 | `--verbose` | Enable verbose/debug logging |
 | `--quiet` | Suppress progress output, print only results |
 
+The three checks (`--check-updates`, `--extensions`, `--check-vulns`) can be combined; they always run in that order. The software list, `--save-baseline` and `--diff` each run on their own. Combining them with each other or with a check is refused with a usage error (exit code 2) before anything is scanned, and so is `--output json`/`csv` with a check (the checks print tables only, for now).
+
 ### Examples
 
 ```bash

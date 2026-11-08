@@ -189,7 +189,7 @@ Shows added, removed, and version-changed software since baseline was created:
 A baseline is always a full snapshot, so `--save-baseline` can't be combined with `--search` or `--exclude`. Use them with `--diff` instead: they then choose which programs are compared, in the baseline and in the current scan alike. (A baseline saved with `--search` or `--exclude` by an older version of the tool makes `--diff` report everything outside that filter as added; save it again.)
 
 ### Update Check
-Shows available updates with current/available versions and winget package IDs
+Shows available updates with current/available versions and winget package IDs. If winget isn't installed, times out or reports an error, the output says the update check couldn't be done (never "up to date") and the exit code is 3
 
 ### Browser Extensions
 Lists extensions with version, browser, and flags extensions with sensitive permissions (access to all URLs, cookies, history, storage, notifications, bookmarks, geolocation, local file access, etc.)
@@ -289,7 +289,7 @@ Structured exit codes for scripting and CI/CD integration:
 | 0 | Success |
 | 1 | Generic error |
 | 2 | No software found |
-| 3 | API failure: `--check-vulns` couldn't query NVD for some programs (results incomplete) |
+| 3 | Check incomplete: `--check-vulns` couldn't query NVD for some programs, or `--check-updates` couldn't run winget (results incomplete) |
 | 4 | Permission denied (e.g. the `--log-file` can't be written, or is owned by another account or linked) |
 | 5 | Changes found: `--diff` found programs added, removed or changed since the baseline |
 

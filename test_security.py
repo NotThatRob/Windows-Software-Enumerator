@@ -1022,19 +1022,27 @@ class _MainHarness:
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name)
 
-    def run_main(self, *argv, software=None, updates=None, extensions=None, nvd_pages=()):
-        """Run main(argv). Returns exit code, stdout, stderr and the mocks (to see what ran)."""
+    def run_main(self, *argv, software=None, updates=None, extensions=None, nvd_pages=(),
+                 real_update_check=False):
+        """Run main(argv). Returns exit code, stdout, stderr and the mocks (to see what ran).
+
+        real_update_check=True keeps the real check_for_updates(), for tests that fake
+        winget itself (its path, exit code and output).
+        """
+        from contextlib import nullcontext
         from types import SimpleNamespace
         scan_all = MagicMock(return_value=list(self.SOFTWARE if software is None else software))
         check_updates = MagicMock(return_value=list(self.UPDATES if updates is None else updates))
         get_extensions = MagicMock(return_value=list(self.EXTENSIONS if extensions is None else extensions))
         nvd = _FakeNvd(*nvd_pages)
         code = 0
+        update_patch = (nullcontext() if real_update_check
+                        else patch.object(se.WingetUpdateChecker, "check_for_updates", check_updates))
         with patch.object(sys, "argv", ["Software_Enumerator.py", *argv]), \
                 patch.object(se, "_load_env_file"), \
                 patch.dict(os.environ, {}, clear=False), \
                 patch.object(se.SoftwareEnumerator, "scan_all", scan_all), \
-                patch.object(se.WingetUpdateChecker, "check_for_updates", check_updates), \
+                update_patch, \
                 patch.object(se.BrowserExtensionScanner, "get_all_extensions", get_extensions), \
                 patch("urllib.request.urlopen", side_effect=nvd), \
                 patch("sys.stdout", io.StringIO()) as out, \
@@ -1228,6 +1236,56 @@ class TestBaselineFileChecks(_MainHarness, unittest.TestCase):
         self.assertIn("Source mismatch", r.err)
         self.assertNotIn("\x1b", r.err)
         self.assertNotIn("\x07", r.err)
+
+
+class TestUpdateCheckFailures(_MainHarness, unittest.TestCase):
+    """--check-updates never reports "up to date" when winget couldn't answer (exit 3 instead)."""
+
+    WINGET = Path("C:/Users/test/AppData/Local/Microsoft/WindowsApps/winget.exe")
+    TABLE = ("Name           Id             Version  Available  Source\n"
+             "--------------------------------------------------------\n"
+             "Google Chrome  Google.Chrome  142.0    143.0      winget\n"
+             "1 upgrades available.\n")
+
+    def check(self, returncode=0, stdout="", side_effect=None, winget=WINGET):
+        result = __import__("subprocess").CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+        with patch.object(se, "_winget_path", return_value=winget), \
+                patch("subprocess.run", return_value=result, side_effect=side_effect):
+            return self.run_main("--check-updates", "--quiet", real_update_check=True)
+
+    def assert_could_not_check(self, r, reason):
+        self.assertEqual(r.code, se.EXIT_API_FAILURE)
+        self.assertNotIn("up to date", r.out)
+        self.assertIn(f"Could not check for updates: {reason}", r.out)
+
+    def test_winget_not_installed(self):
+        self.assert_could_not_check(self.check(winget=None), "winget was not found")
+
+    def test_winget_times_out(self):
+        import subprocess
+        self.assert_could_not_check(self.check(side_effect=subprocess.TimeoutExpired("winget", 120)),
+                                    "winget timed out")
+
+    def test_winget_cannot_be_started(self):
+        self.assert_could_not_check(self.check(side_effect=OSError("bad image")), "winget could not be run")
+
+    def test_winget_error_exit_code(self):
+        # Windows reports HRESULT exit codes unsigned; accept a signed value too
+        for code in (0x8A15000F, 0x8A15000F - 2**32):
+            with self.subTest(code=code):
+                self.assert_could_not_check(self.check(returncode=code), "winget exited with error code 0x8A15000F")
+
+    def test_nothing_to_upgrade_is_still_up_to_date(self):
+        for code in (0, se.WingetUpdateChecker.WINGET_NO_PACKAGES_FOUND):
+            with self.subTest(code=hex(code)):
+                r = self.check(returncode=code, stdout="No installed package found matching input criteria.\n")
+                self.assertEqual(r.code, se.EXIT_SUCCESS)
+                self.assertIn("up to date", r.out)
+
+    def test_updates_are_listed(self):
+        r = self.check(stdout=self.TABLE)
+        self.assertEqual(r.code, se.EXIT_SUCCESS)
+        self.assertIn("Google.Chrome", r.out)
 
 
 class TestDiffExitCode(_MainHarness, unittest.TestCase):
@@ -2361,6 +2419,7 @@ class TestExecutableResolution(unittest.TestCase):
              patch.object(sys, "argv", ["Software_Enumerator.py", "--check-updates", "--quiet"]), \
              patch.object(se, "setup_logging"), patch.object(se, "_load_env_file"):
             checker.return_value.check_for_updates.return_value = []
+            checker.return_value.error = None          # the check completed
             se.main()
         harden.assert_called_once()
 

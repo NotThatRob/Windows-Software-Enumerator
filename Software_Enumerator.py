@@ -44,7 +44,7 @@ logger = logging.getLogger("software_enumerator")
 EXIT_SUCCESS = 0
 EXIT_ERROR = 1
 EXIT_NO_SOFTWARE = 2
-EXIT_API_FAILURE = 3
+EXIT_API_FAILURE = 3        # an online check (NVD, winget) couldn't complete: results incomplete
 EXIT_PERMISSION_DENIED = 4
 EXIT_CHANGES_FOUND = 5      # --diff: programs were added, removed or changed since the baseline
 
@@ -1415,13 +1415,25 @@ class PortableAppScanner:
 class WingetUpdateChecker:
     """Checks for available software updates using winget."""
 
+    # winget's APPINSTALLER_CLI_ERROR_NO_APPLICATIONS_FOUND: in list mode it means winget
+    # matched no installed package at all, so there is nothing to upgrade. winget's list
+    # mode otherwise exits 0, with or without upgrades (failed sources are only warnings).
+    WINGET_NO_PACKAGES_FOUND = 0x8A150014
+
+    def __init__(self):
+        # Why the last check couldn't be completed, or None. An empty update list on its
+        # own doesn't say whether everything is up to date or winget never answered.
+        self.error: Optional[str] = None
+
     def check_for_updates(self) -> list[UpdateInfo]:
-        """Query winget for available updates."""
+        """Query winget for available updates. On failure, self.error says why."""
         updates = []
+        self.error = None
 
         winget = _winget_path()
         if winget is None:
             print("Warning: winget not found. Please ensure Windows Package Manager is installed.", file=sys.stderr)
+            self.error = "winget was not found"
             return updates
 
         try:
@@ -1446,13 +1458,21 @@ class WingetUpdateChecker:
             # Parse the output (winget outputs a table format)
             updates = self._parse_winget_output(result.stdout)
 
+            exit_code = result.returncode & 0xFFFFFFFF   # winget's codes are HRESULTs
+            if exit_code not in (0, self.WINGET_NO_PACKAGES_FOUND):
+                print(f"Warning: winget reported an error (exit code 0x{exit_code:08X}).", file=sys.stderr)
+                self.error = f"winget exited with error code 0x{exit_code:08X}"
+
         except subprocess.TimeoutExpired:
             print("Warning: winget command timed out.", file=sys.stderr)
+            self.error = "winget timed out"
         except FileNotFoundError:
             print("Warning: winget not found. Please ensure Windows Package Manager is installed.", file=sys.stderr)
+            self.error = "winget was not found"
         except OSError as e:
             logger.debug(f"Failed to check for updates: {e}")
             print("Warning: Failed to check for updates.", file=sys.stderr)
+            self.error = "winget could not be run"
 
         return updates
 
@@ -3436,10 +3456,19 @@ Examples:
         updates = update_checker.check_for_updates()
 
         if not args.quiet:
-            spinner.finish(f"Found {len(updates)} available updates")
-        log_audit_event("SCAN_END", "Update check completed", updates_found=len(updates))
+            spinner.finish("Update check failed" if update_checker.error
+                           else f"Found {len(updates)} available updates")
+        log_audit_event("SCAN_END", "Update check completed", updates_found=len(updates),
+                        failed=bool(update_checker.error))
         if not args.quiet:
             print(file=sys.stderr)
+        if update_checker.error:
+            # Never "All software is up to date" when winget didn't answer
+            print(f"Could not check for updates: {update_checker.error}.")
+            if updates:
+                print("Updates winget listed before the error (the list may be incomplete):")
+                update_checker.display_updates_table(updates)
+            sys.exit(EXIT_API_FAILURE)
         update_checker.display_updates_table(updates)
         return
 

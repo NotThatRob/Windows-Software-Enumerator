@@ -3379,6 +3379,9 @@ Examples:
         if not args.quiet:
             print(file=sys.stderr)
         vuln_scanner.display_results(results, plan)
+        if any(r.error for r in results):
+            # Results are incomplete; scripts must not read this as "no CVEs"
+            sys.exit(EXIT_API_FAILURE)
         return
 
     # Determine sources to scan

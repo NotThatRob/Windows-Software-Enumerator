@@ -925,8 +925,9 @@ class TestCheckVulnsMain(unittest.TestCase):
     def tearDown(self):
         se.logger.handlers = self._saved_handlers
 
-    def _run(self, *argv):
-        fake, scan_all = _FakeNvd(), MagicMock(return_value=list(self.SOFTWARE))
+    def _run(self, *argv, pages=()):
+        self.exit_code = None
+        fake, scan_all = _FakeNvd(*pages), MagicMock(return_value=list(self.SOFTWARE))
         with patch.object(sys, "argv", ["Software_Enumerator.py", "--check-vulns", "--quiet", *argv]), \
                 patch.object(se, "_load_env_file"), \
                 patch.dict(os.environ, {}, clear=False), \
@@ -949,6 +950,16 @@ class TestCheckVulnsMain(unittest.TestCase):
     def test_exclude_filter_is_honoured(self):
         fake, _, _ = self._run("--exclude", "mozilla,")
         self.assertFalse(any("firefox" in u.lower() for u in fake.urls))
+
+    def test_nvd_failure_exits_with_api_failure_code(self):
+        import urllib.error
+        _, _, out = self._run("--search", "chrome", pages=[urllib.error.URLError("down")])
+        self.assertEqual(self.exit_code, se.EXIT_API_FAILURE)
+        self.assertIn("Failed: 1 program(s)", out)
+
+    def test_clean_scan_exits_normally(self):
+        self._run("--search", "chrome")
+        self.assertIsNone(self.exit_code)
 
     def test_registry_by_default_and_source_honoured(self):
         _, scan_all, _ = self._run()

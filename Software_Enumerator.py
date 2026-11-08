@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.error
 import winreg
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -875,6 +875,7 @@ class CVEInfo:
     score_source: str = ""   # "NVD" (NVD's own assessment) or "CNA" (assigner / other provider)
     known_exploited: bool = False  # in CISA's Known Exploited Vulnerabilities (KEV) catalog
     kev_added: str = ""            # date CISA added it to KEV
+    status: str = ""               # NVD's vulnStatus, e.g. "Analyzed", "Awaiting Analysis", "Deferred"
 
     @property
     def score_label(self) -> str:
@@ -906,6 +907,9 @@ class VulnerabilityResult:
     not_checked: str = ""    # reason the program wasn't looked up, e.g. "no CPE mapping"
     cpe: str = ""            # CPE name that was looked up
     total_available: int = 0  # CVEs NVD reported (can exceed len(cves) if the page cap was hit)
+    # Recent CVEs that mention the product but that NVD hasn't analysed yet (no product data),
+    # so NVD can't say whether this version is affected. Never counted in the totals above.
+    unconfirmed: list[CVEInfo] = field(default_factory=list)
 
     @property
     def kev_count(self) -> int:
@@ -2041,6 +2045,41 @@ class VulnerabilityScanner:
         "gog galaxy": ("gog", "galaxy"),
     }
 
+    # Phrases that name a product in CVE descriptions, used only to find recent CVEs NVD hasn't
+    # analysed yet (they have no product data, so the CPE query can't see them). Products whose
+    # names are too generic to search for (Git, Everything, Steam, ...) are left out on purpose.
+    SEARCH_PHRASES = {
+        ("google", "chrome"): "Google Chrome",
+        ("mozilla", "firefox"): "Firefox",
+        ("mozilla", "thunderbird"): "Thunderbird",
+        ("microsoft", "edge_chromium"): "Microsoft Edge",
+        ("microsoft", "visual_studio_code"): "Visual Studio Code",
+        ("notepad-plus-plus", "notepad\\+\\+"): "Notepad++",
+        ("python", "python"): "CPython",
+        ("nodejs", "node.js"): "Node.js",
+        ("libreoffice", "libreoffice"): "LibreOffice",
+        ("videolan", "vlc_media_player"): "VLC",
+        ("audacityteam", "audacity"): "Audacity",
+        ("gimp", "gimp"): "GIMP",
+        ("inkscape", "inkscape"): "Inkscape",
+        ("keepass", "keepass"): "KeePass",
+        ("bitwarden", "bitwarden"): "Bitwarden",
+        ("winscp", "winscp"): "WinSCP",
+        ("openvpn", "openvpn"): "OpenVPN",
+        ("putty", "putty"): "PuTTY",
+        ("wireshark", "wireshark"): "Wireshark",
+        ("7-zip", "7-zip"): "7-Zip",
+        ("rarlab", "winrar"): "WinRAR",
+        ("zoom", "workplace_desktop"): "Zoom Workplace",
+        ("filezilla-project", "filezilla_client"): "FileZilla",
+        ("oracle", "virtualbox"): "VirtualBox",
+        ("vmware", "workstation"): "VMware Workstation",
+        ("teamviewer", "teamviewer"): "TeamViewer",
+        ("anydesk", "anydesk"): "AnyDesk",
+    }
+    UNCONFIRMED_DAYS = 119        # NVD allows date ranges of at most 120 days
+    UNCONFIRMED_MAX_PAGES = 2
+
     # Software to skip (system components, frameworks, etc.)
     SKIP_PATTERNS = [
         r"microsoft visual c\+\+",
@@ -2238,6 +2277,24 @@ class VulnerabilityScanner:
                   ("isVulnerable", None), ("noRejected", None)]
         return self._fetch_all_pages(params, self.MAX_PAGES)
 
+    def _query_unanalysed_cves(self, phrase: str) -> list[dict]:
+        """CVEs published in the last UNCONFIRMED_DAYS that mention `phrase` and have no product data.
+
+        Without product (CPE) data NVD can't say which versions a CVE affects, so these are only
+        candidates: the user has to check whether their version is affected.
+        """
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        start = now - timedelta(days=self.UNCONFIRMED_DAYS)
+        fmt = "%Y-%m-%dT%H:%M:%S.000Z"
+        params = [("keywordSearch", phrase)]
+        if " " in phrase:
+            params.append(("keywordExactMatch", None))   # the phrase, not each word anywhere
+        params += [("pubStartDate", start.strftime(fmt)), ("pubEndDate", now.strftime(fmt)),
+                   ("noRejected", None)]
+        vulnerabilities, _ = self._fetch_all_pages(params, self.UNCONFIRMED_MAX_PAGES)
+        return [v for v in vulnerabilities
+                if isinstance(v.get("cve"), dict) and not v["cve"].get("configurations")]
+
     def _parse_cve(self, vuln_data: dict) -> Optional[CVEInfo]:
         """Parse a CVE entry from NVD API response."""
         try:
@@ -2286,6 +2343,7 @@ class VulnerabilityScanner:
                 # NVD includes CISA's KEV fields on CVEs that are known to be exploited
                 known_exploited=isinstance(cve.get("cisaExploitAdd"), str),
                 kev_added=str(cve.get("cisaExploitAdd") or "")[:10],
+                status=str(cve.get("vulnStatus") or ""),
             )
         except (KeyError, TypeError, AttributeError):
             return None
@@ -2365,6 +2423,17 @@ class VulnerabilityScanner:
             if cve:  # every severity, including LOW and not yet scored
                 result.cves.append(cve)
 
+        phrase = self.SEARCH_PHRASES.get((vendor, product))
+        if phrase:
+            try:
+                confirmed = {c.cve_id for c in result.cves}
+                for vuln in self._query_unanalysed_cves(phrase):
+                    cve = self._parse_cve(vuln)
+                    if cve and cve.cve_id not in confirmed:
+                        result.unconfirmed.append(cve)
+            except NvdApiError as e:
+                result.error = str(e)   # the confirmed list above is still valid
+
         # Known-exploited first, then by severity (CRITICAL first) and score
         severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
         result.cves.sort(key=lambda c: (not c.known_exploited, severity_order.get(c.severity, 4), -c.cvss_score))
@@ -2389,10 +2458,23 @@ class VulnerabilityScanner:
                 progress_callback(i + 1, len(scannable), software.name)
 
             result = self.scan_software(software)
-            if result.cves or result.error:
+            if result.cves or result.error or result.unconfirmed:
                 results.append(result)
 
         return results
+
+    @staticmethod
+    def _print_unconfirmed(result: VulnerabilityResult, shown: int = 9) -> None:
+        """List recent CVEs that mention the product but have no NVD product data yet."""
+        print(f"\n  Unconfirmed: {len(result.unconfirmed)} recent CVE(s) mention this product, but NVD hasn't")
+        print("  analysed them yet, so it can't say which versions they affect. Check whether")
+        print("  your version is affected (not counted above):")
+        labels = [f"{sanitize_output(c.cve_id)} ({sanitize_output(c.status) or 'status unknown'})"
+                  for c in result.unconfirmed[:shown]]
+        for i in range(0, len(labels), 3):
+            print("    " + ", ".join(labels[i:i + 3]))
+        if len(result.unconfirmed) > shown:
+            print(f"    ... and {len(result.unconfirmed) - shown} more")
 
     def display_results(self, results: list[VulnerabilityResult]) -> None:
         """Display vulnerability scan results."""
@@ -2413,18 +2495,23 @@ class VulnerabilityScanner:
         print(f"Total CVEs found: {total_cves}")
         print(f"  CRITICAL: {critical_count}")
         print(f"  HIGH: {high_count}")
+        unconfirmed_count = sum(len(r.unconfirmed) for r in results)
+        if unconfirmed_count:
+            print(f"Unconfirmed (not yet analysed by NVD, not counted): {unconfirmed_count}")
         print(f"{'='*80}\n")
 
         for result in results:
             if result.error:
                 print(f"[ERROR] {sanitize_output(result.software_name)}: Query failed")
-                continue
+                if not result.cves and not result.unconfirmed:
+                    continue
 
-            if not result.cves:
+            if not result.cves and not result.unconfirmed:
                 continue
 
             print(f"\n{sanitize_output(result.software_name)} (v{sanitize_output(result.software_version)})")
-            print(f"  Found {result.total_count} potential CVE(s):")
+            if result.cves:
+                print(f"  Found {result.total_count} CVE(s) affecting this version:")
 
             for cve in result.cves[:5]:  # Show top 5 per software
                 kev = " [KEV: known exploited]" if cve.known_exploited else ""
@@ -2439,6 +2526,8 @@ class VulnerabilityScanner:
 
             if len(result.cves) > 5:
                 print(f"\n  ... and {len(result.cves) - 5} more CVE(s)")
+            if result.unconfirmed:
+                self._print_unconfirmed(result)
 
         print(f"\n{'='*80}")
         print("RECOMMENDATIONS:")

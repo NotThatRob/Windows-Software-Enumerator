@@ -12,10 +12,12 @@ Tests to verify security fixes are working correctly:
 """
 
 import csv
+import datetime
 import io
 import logging
 import msvcrt
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -630,6 +632,10 @@ class TestNvdCpeQuery(unittest.TestCase):
     def setUp(self):
         self.scanner = se.VulnerabilityScanner()
         self.scanner._rate_max = 1000          # no rate-limit sleeps in tests
+        # These tests are about the confirmed (CPE) query only; the unconfirmed search has its own tests
+        patcher = patch.object(se.VulnerabilityScanner, "SEARCH_PHRASES", {})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _scan(self, software, *pages):
         fake = _FakeNvd(*pages)
@@ -760,6 +766,54 @@ class TestCveScores(unittest.TestCase):
         self.assertEqual(set(by_id), {"CVE-2026-0001", "CVE-2026-0002"})
         self.assertEqual(by_id["CVE-2026-0001"].severity, "UNKNOWN")
         self.assertEqual(by_id["CVE-2026-0001"].score_label, "not scored yet")
+
+
+class TestUnconfirmedCves(unittest.TestCase):
+    """Recent CVEs NVD hasn't analysed (no product data) are listed separately and never counted."""
+
+    CHROME = se.SoftwareInfo(name="Google Chrome", version="142.0.7444.60")
+    WITH_CPE = [{"nodes": [{"cpeMatch": [{"vulnerable": True,
+                                          "criteria": "cpe:2.3:a:google:chrome:*:*:*:*:*:*:*:*"}]}]}]
+
+    def setUp(self):
+        self.scanner = se.VulnerabilityScanner()
+        self.scanner._rate_max = 1000
+
+    def _scan(self, software, *pages):
+        fake = _FakeNvd(*pages)
+        with patch("urllib.request.urlopen", side_effect=fake):
+            return self.scanner.scan_software(software), fake
+
+    def test_recent_unanalysed_cves_are_listed_separately(self):
+        confirmed = {"totalResults": 1, "vulnerabilities": [_nvd_vuln("CVE-2026-1000", configurations=self.WITH_CPE)]}
+        recent = {"totalResults": 3, "vulnerabilities": [
+            _nvd_vuln("CVE-2026-1000"),                                             # already confirmed
+            _nvd_vuln("CVE-2026-2000", vulnStatus="Awaiting Analysis"),            # no product data yet
+            _nvd_vuln("CVE-2026-3000", configurations=self.WITH_CPE)]}             # analysed: CPE query decides
+        result, fake = self._scan(self.CHROME, confirmed, recent)
+        self.assertEqual([c.cve_id for c in result.cves], ["CVE-2026-1000"])
+        self.assertEqual([c.cve_id for c in result.unconfirmed], ["CVE-2026-2000"])
+        self.assertEqual(result.unconfirmed[0].status, "Awaiting Analysis")
+        self.assertEqual(result.total_count, 1)                                    # not counted
+
+        url = fake.urls[1]
+        self.assertIn("keywordSearch=Google%20Chrome", url)
+        self.assertIn("&keywordExactMatch", url)
+        self.assertIn("&noRejected", url)
+        dates = re.findall(r"pub(?:Start|End)Date=(\d{4}-\d{2}-\d{2})", url)
+        start, end = (datetime.date.fromisoformat(d) for d in dates)
+        self.assertLessEqual((end - start).days, 120)                              # NVD's maximum range
+
+    def test_products_without_a_safe_phrase_get_no_unconfirmed_search(self):
+        _, fake = self._scan(se.SoftwareInfo(name="Git", version="2.40.0"))
+        self.assertEqual(len(fake.urls), 1)
+
+    def test_unconfirmed_search_failure_keeps_the_confirmed_results(self):
+        import urllib.error
+        confirmed = {"totalResults": 1, "vulnerabilities": [_nvd_vuln("CVE-2026-1000", configurations=self.WITH_CPE)]}
+        result, _ = self._scan(self.CHROME, confirmed, urllib.error.URLError("down"))
+        self.assertEqual([c.cve_id for c in result.cves], ["CVE-2026-1000"])
+        self.assertIn("Unable to reach NVD API", result.error)
 
 
 class TestKnownExploitedFlag(unittest.TestCase):

@@ -36,9 +36,9 @@ python Software_Enumerator.py --exclude "redistributable,.NET Runtime"  # filter
 
 ## Architecture
 
-Everything lives in `Software_Enumerator.py` (~3,260 lines). Key classes:
+Everything lives in `Software_Enumerator.py` (~3,500 lines). Key classes:
 
-**Data classes** (`@dataclass`): `SoftwareInfo`, `UpdateInfo`, `BrowserExtensionInfo`, `CVEInfo`, `VulnerabilityResult`
+**Data classes** (`@dataclass`): `SoftwareInfo`, `UpdateInfo`, `BrowserExtensionInfo`, `CVEInfo`, `VulnerabilityResult`, `VulnScanPlan`
 
 **Scanners** (no shared base class or `scan()` method; each has its own entry point returning a list):
 - `RegistryScanner` (`get_all_registry_software()`) — reads HKLM (64/32-bit) and HKCU uninstall keys via `winreg`. Converts values to text by type per entry and warns once per scan if a text field had an unexpected type
@@ -46,7 +46,7 @@ Everything lives in `Software_Enumerator.py` (~3,260 lines). Key classes:
 - `PortableAppScanner` (`get_all_portable_apps()`) — walks common dirs with `os.scandir()`, skips symlinks, caps at 500 files
 - `WingetUpdateChecker` (`check_for_updates()`) — runs `winget upgrade` subprocess
 - `BrowserExtensionScanner` (`get_all_extensions()`) — reads Chrome/Edge/Firefox extension manifests from disk
-- `VulnerabilityScanner` (`scan_software_list()`) — queries NIST NVD REST API with sliding-window rate limiter. Pre-compiles its skip patterns (regex, `SKIP_PATTERNS`) at `__init__` time to leave out framework/runtime entries
+- `VulnerabilityScanner` (`plan_scan()` then `scan_plan()`; `scan_software_list()` does both) — queries the NIST NVD REST API with a sliding-window rate limiter. `plan_scan()` picks mapped programs in name order, once per product + version, and counts what it leaves out (`VulnScanPlan`). `scan_software()` asks NVD `cpeName=cpe:2.3:a:<vendor>:<product>:<version>&isVulnerable&noRejected` (all pages, capped at `MAX_PAGES`) and trusts NVD's version matching (there is no local version matcher). CVEs whose NVD product data has no version at all ("every version") go to `all_versions`, and for products in `SEARCH_PHRASES` recent CVEs without NVD product data go to `unconfirmed`; neither is counted. All requests go through `_nvd_request()`, which raises `NvdApiError` with generic messages. Pre-compiles its skip patterns (regex, `SKIP_PATTERNS`) at `__init__` time to leave out framework/runtime entries
 
 **Orchestration & Output**:
 - `SoftwareEnumerator` — orchestrates scanners; uses `concurrent.futures.ThreadPoolExecutor` for parallel source scanning when `--source all`
@@ -64,10 +64,11 @@ Everything lives in `Software_Enumerator.py` (~3,260 lines). Key classes:
 - **Absolute executable paths**: Subprocesses are launched by absolute path (`_powershell_path()`, `_winget_path()`), never by bare name, because Windows searches the current directory before PATH. There is no fallback to the bare name. `main()` also sets `NoDefaultCurrentDirectoryInExePath=1`. New subprocess calls must follow this
 - **stderr/stdout separation**: All progress bars, spinners, and status messages go to stderr. Only final results (table/JSON/CSV) go to stdout. This allows clean piping (`--output json > file.json`)
 - **Rate limiting**: Sliding-window rate limiter using `collections.deque` with automatic HTTP 429 retry. Without API key: 5 req/30s; with key: 50 req/30s
-- **CVE limit**: Default 20, max 100 (`--cve-limit`). Prevents accidental API abuse
-- **Search and exclude use literal matching** (not regex) to avoid regex injection via `matches_search()` and `matches_exclude()`. `--exclude` is comma-separated and matches against name and publisher
-- **Structured exit codes**: `EXIT_SUCCESS=0`, `EXIT_ERROR=1`, `EXIT_NO_SOFTWARE=2`, `EXIT_API_FAILURE=3`, `EXIT_PERMISSION_DENIED=4` — defined as module-level constants for CI/CD scripting. Exit 4 is currently raised for `--log-file` problems; `EXIT_API_FAILURE` is not yet wired up
-- **`SOFTWARE_MAPPINGS` dict** in `VulnerabilityScanner`: maps normalized software names to CPE-style `(vendor, product)` tuples. **Known problem:** `_query_nvd_api()` currently sends them as free-text `keywordSearch`, not as a CPE query. CPE tokens such as `vlc_media_player` never appear in CVE descriptions, and NVD returns results oldest-first (20 per request, no paging), so the CVE check misses most real CVEs
+- **CVE limit**: `--cve-limit` = number of programs checked, 1–100 (default 20); other values are a usage error, not clamped. Prevents accidental API abuse
+- **Search and exclude use literal matching** (not regex) to avoid regex injection via `matches_search()` and `matches_exclude()`. `--exclude` is comma-separated (empty terms ignored, `_parse_exclude_terms()`) and matches against name and publisher. `--check-vulns` honours `--search`, `--exclude` and `--source` (default: registry)
+- **Structured exit codes**: `EXIT_SUCCESS=0`, `EXIT_ERROR=1`, `EXIT_NO_SOFTWARE=2`, `EXIT_API_FAILURE=3`, `EXIT_PERMISSION_DENIED=4` — defined as module-level constants for CI/CD scripting. Exit 3 when `--check-vulns` couldn't query NVD for some program (results incomplete); exit 4 for `--log-file` problems
+- **`SOFTWARE_MAPPINGS` dict** in `VulnerabilityScanner`: maps display-name keys to CPE `(vendor, product)` pairs exactly as NVD's CPE dictionary names them. Keys match whole words of the normalised name, longest key first (`_find_mapping()`). Every pair must exist in NVD's CPE dictionary (a wrong pair makes the check silently find nothing); unmapped programs are reported as "not checked", never guessed. Installer version quirks (Python `3.11.4150.0`, Java 8 `8.0.4010.10`, PostgreSQL `17.11-5`) are translated via `VERSION_TRANSLATORS`
+- **The CVE report states its coverage**: it always says how many programs were checked and why others weren't; it never prints a bare "no vulnerabilities" when it couldn't look. NVD's own (`Primary`) CVSS score is preferred, newest CVSS version first; unscored and LOW CVEs are kept; KEV CVEs (CISA known exploited, from NVD's `cisaExploitAdd` field) are flagged and listed first
 - **Env file loading**: `_load_env_file()` reads `api.env` (then `.env`) only from the tool's own folder (`_env_search_dirs()`: the script's folder, or the `.exe`'s folder when frozen) — never the CWD — and only accepts keys in `_ENV_FILE_ALLOWED_KEYS` (`NVD_API_KEY`). Other keys are ignored and logged by name, never by value. Does not overwrite existing env vars. The `api.env` file in the repo root is gitignored and is the intended place for NVD API keys during local development. Tests must patch `_env_search_dirs()` so the real `api.env` is never read
 
 ## Testing

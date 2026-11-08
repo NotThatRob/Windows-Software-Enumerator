@@ -74,7 +74,7 @@ python Software_Enumerator.py [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--source {registry,store,portable,all}` | Source to scan (default: all) |
+| `--source {registry,store,portable,all}` | Source to scan (default: all; registry for `--check-vulns`) |
 | `--search TERM` | Filter results by name, publisher, or version |
 | `--exclude PATTERNS` | Exclude software matching patterns (comma-separated) |
 | `--sort {name,version,publisher,source}` | Sort results by field (default: name) |
@@ -85,7 +85,7 @@ python Software_Enumerator.py [OPTIONS]
 | `--extensions` | List browser extensions with permission analysis |
 | `--check-vulns` | Scan for known CVEs in installed software |
 | `--nvd-api-key KEY` | NVD API key for faster vulnerability scanning |
-| `--cve-limit N` | Max software items to CVE-check (default: 20, max: 100) |
+| `--cve-limit N` | Max programs to CVE-check, 1–100 (default: 20) |
 | `--log-file FILE` | Path to audit log file (rotated at 5 MB, 3 backups) |
 | `--verbose` | Enable verbose/debug logging |
 | `--quiet` | Suppress progress output, print only results |
@@ -186,7 +186,13 @@ Shows available updates with current/available versions and winget package IDs
 Lists extensions with version, browser, and flags extensions with sensitive permissions (access to all URLs, cookies, history, storage, notifications, bookmarks, geolocation, local file access, etc.)
 
 ### Vulnerability Scan
-Reports CVEs found with severity ratings (CRITICAL/HIGH/MEDIUM), CVSS scores, and remediation recommendations
+For each installed program with a known CPE name (the product name NVD uses), asks NVD which CVEs affect that exact version, and reports:
+- **What was checked** - how many programs were checked, and how many were not (no CPE mapping, framework/update packages, no usable version, duplicates, over `--cve-limit`) or failed. A clean result reads "No known CVEs affect the N program(s) checked", never a bare all-clear
+- **Affected programs** - CVEs with severity and CVSS score: NVD's own score first, newest CVSS version first (a score from the CVE's assigner is labelled `CNA`); CVEs not scored yet are kept. CVEs in CISA's Known Exploited Vulnerabilities catalog are marked `[KEV: known exploited]` and listed first
+- **Listed for every version** - CVEs that NVD records for all versions of a product, with no version range (often old, or about the product in general). Listed separately with their dates, never counted
+- **Unconfirmed** - recent CVEs (last 119 days) that mention the program but that NVD hasn't analysed yet, so it can't say which versions they affect. Listed separately for you to check, never counted
+
+Programs come from the registry unless `--source` is given, are checked in name order (once per product and version), and `--search` / `--exclude` apply. Some installer version formats are translated to the form NVD uses (e.g. Python `3.11.4150.0` → `3.11.4`, Java `8.0.4010.10` → `1.8.0 update 401`).
 
 ## Security Considerations
 
@@ -261,7 +267,7 @@ The CVE scanner uses the NIST NVD API with a sliding-window rate limiter:
 - **With API key**: 50 requests per 30-second window
 - **HTTP 429 handling**: Automatic single retry after a cooldown period
 
-By default, the scanner checks up to 20 software items. Use `--cve-limit N` to increase this (max 100).
+By default, the scanner checks up to 20 programs. Use `--cve-limit N` to change this (1–100; other values are rejected). Each program takes about two requests (more for very outdated browsers, which can be affected by thousands of CVEs), so 20 programs take roughly 25 seconds with an API key and about 4 minutes without.
 
 Get a free API key at: https://nvd.nist.gov/developers/request-an-api-key
 
@@ -274,7 +280,7 @@ Structured exit codes for scripting and CI/CD integration:
 | 0 | Success |
 | 1 | Generic error |
 | 2 | No software found |
-| 3 | API failure (NVD unreachable) |
+| 3 | API failure: `--check-vulns` couldn't query NVD for some programs (results incomplete) |
 | 4 | Permission denied (e.g. the `--log-file` can't be written, or is owned by another account or linked) |
 
 ## Testing

@@ -1330,6 +1330,58 @@ class TestAuditCheckFilters(_MainHarness, unittest.TestCase):
         self.assertIn("None of the 2 browser extension(s) match --search / --exclude", r.out)
 
 
+class TestCombinedAudit(_MainHarness, unittest.TestCase):
+    """--check-updates, --extensions and --check-vulns together: all run, in a fixed order."""
+
+    ALL_THREE = ("--check-updates", "--extensions", "--check-vulns")
+
+    def assert_all_ran_in_order(self, r):
+        r.check_updates.assert_called_once()
+        r.get_extensions.assert_called_once()
+        self.assertTrue(r.nvd.urls, "the CVE check made no NVD request")
+        positions = [r.out.find(heading) for heading in
+                     ("AVAILABLE UPDATES (winget)", "BROWSER EXTENSIONS", "VULNERABILITY SCAN RESULTS")]
+        self.assertNotIn(-1, positions, r.out)
+        self.assertEqual(positions, sorted(positions))
+
+    def test_readme_combined_audit_runs_every_check(self):
+        r = self.run_main(*self.ALL_THREE, "--quiet")
+        self.assertEqual(r.code, se.EXIT_SUCCESS)
+        self.assert_all_ran_in_order(r)
+        self.assertIn("Google.Chrome", r.out)
+        self.assertIn("uBlock Origin", r.out)
+
+    def test_order_on_the_command_line_does_not_matter(self):
+        r = self.run_main(*reversed(self.ALL_THREE), "--quiet")
+        self.assert_all_ran_in_order(r)
+
+    def test_an_incomplete_cve_check_gives_exit_3_after_the_other_checks(self):
+        import urllib.error
+        r = self.run_main(*self.ALL_THREE, "--quiet", nvd_pages=[urllib.error.URLError("down")])
+        self.assertEqual(r.code, se.EXIT_API_FAILURE)
+        self.assert_all_ran_in_order(r)
+
+    def test_a_failed_update_check_does_not_stop_the_others(self):
+        with patch.object(se, "_winget_path", return_value=None):
+            r = self.run_main(*self.ALL_THREE, "--quiet", real_update_check=True)
+        self.assertEqual(r.code, se.EXIT_API_FAILURE)
+        self.assertIn("Could not check for updates", r.out)
+        self.assertIn("uBlock Origin", r.out)
+        self.assertIn("VULNERABILITY SCAN RESULTS", r.out)
+
+    def test_two_checks(self):
+        r = self.run_main("--extensions", "--check-updates", "--quiet")
+        self.assertEqual(r.code, se.EXIT_SUCCESS)
+        self.assertLess(r.out.find("AVAILABLE UPDATES"), r.out.find("BROWSER EXTENSIONS"))
+        r.scan_all.assert_not_called()
+
+    def test_a_single_check_has_no_extra_heading(self):
+        r = self.run_main("--check-updates", "--quiet")
+        self.assertNotIn("AVAILABLE UPDATES (winget)", r.out)
+        r = self.run_main("--extensions", "--quiet")
+        self.assertNotIn("BROWSER EXTENSIONS", r.out)
+
+
 class TestDiffExitCode(_MainHarness, unittest.TestCase):
     """--diff exits 5 when anything changed, 0 when nothing did, in every output format."""
 

@@ -148,7 +148,8 @@ python Software_Enumerator.py --check-vulns --cve-limit 50
 # Enable audit logging (log files rotate at 5 MB, keeping 3 backups)
 python Software_Enumerator.py --log-file audit.log --verbose
 
-# Combined security audit
+# Combined security audit: updates, then extensions, then CVEs (in that order, whatever
+# the order on the command line); exit code 3 if any of them couldn't complete
 python Software_Enumerator.py --check-updates --extensions --check-vulns --log-file audit.log
 
 # Quiet mode for scripting (results only, no progress output)

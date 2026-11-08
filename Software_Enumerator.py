@@ -3299,6 +3299,127 @@ def _apply_filters(items: list, search_term: Optional[str], exclude_terms: Optio
     return items
 
 
+def _run_update_check(args: argparse.Namespace) -> bool:
+    """--check-updates: list available updates via winget. Returns False if winget didn't answer."""
+    log_audit_event("SCAN_START", "Update check via winget", mode="check-updates")
+    if not args.quiet:
+        spinner = Spinner("Checking for updates via winget")
+        spinner.spin()
+
+    update_checker = WingetUpdateChecker()
+    all_updates = update_checker.check_for_updates()
+    updates = _apply_filters(all_updates, args.search, _parse_exclude_terms(args.exclude))
+
+    if not args.quiet:
+        spinner.finish("Update check failed" if update_checker.error
+                       else f"Found {len(updates)} available updates")
+    log_audit_event("SCAN_END", "Update check completed", updates_found=len(updates),
+                    failed=bool(update_checker.error))
+    if not args.quiet:
+        print(file=sys.stderr)
+    if update_checker.error:
+        # Never "All software is up to date" when winget didn't answer
+        print(f"Could not check for updates: {update_checker.error}.")
+        if updates:
+            print("Updates winget listed before the error (the list may be incomplete):")
+            update_checker.display_updates_table(updates)
+        return False
+    if all_updates and not updates:
+        # Not "up to date": the filters hid the updates there are
+        print(f"None of the {len(all_updates)} available update(s) match --search / --exclude.")
+    else:
+        update_checker.display_updates_table(updates)
+    return True
+
+
+def _run_extension_scan(args: argparse.Namespace) -> bool:
+    """--extensions: list browser extensions and flag sensitive permissions. Always completes."""
+    log_audit_event("SCAN_START", "Browser extension scan", mode="extensions")
+    if not args.quiet:
+        spinner = Spinner("Scanning browser extensions")
+        spinner.spin("Chrome, Edge, Firefox...")
+
+    extension_scanner = BrowserExtensionScanner()
+    all_extensions = extension_scanner.get_all_extensions()
+    extensions = _apply_filters(all_extensions, args.search, _parse_exclude_terms(args.exclude))
+
+    if not args.quiet:
+        spinner.finish(f"Found {len(extensions)} extensions")
+    sensitive_count = sum(1 for e in extensions if e.has_sensitive_permissions())
+    log_audit_event(
+        "SCAN_END",
+        "Browser extension scan completed",
+        extensions_found=len(extensions),
+        sensitive_permissions=sensitive_count,
+    )
+    if not args.quiet:
+        print(file=sys.stderr)
+    if all_extensions and not extensions:
+        print(f"None of the {len(all_extensions)} browser extension(s) match --search / --exclude.")
+    else:
+        extension_scanner.display_extensions_table(extensions)
+    return True
+
+
+def _run_cve_check(args: argparse.Namespace) -> bool:
+    """--check-vulns: ask NVD about installed programs. Returns False if some couldn't be checked."""
+    log_audit_event("SCAN_START", "Vulnerability scan via NVD", mode="check-vulns")
+    if not args.quiet:
+        print("Scanning for known vulnerabilities (CVEs)...", file=sys.stderr)
+        print("This may take a while due to API rate limits.\n", file=sys.stderr)
+
+    # Registry by default (the most reliable versions); --source chooses others
+    vuln_sources = (["registry", "store", "portable"] if args.source == "all"
+                    else [args.source or "registry"])
+    enumerator = SoftwareEnumerator()
+    software_list = enumerator.scan_all(vuln_sources, show_progress=not args.quiet)
+    software_list = enumerator.filter_results(software_list, args.search, _parse_exclude_terms(args.exclude))
+    if not args.quiet:
+        print(file=sys.stderr)
+
+    vuln_scanner = VulnerabilityScanner(api_key=args.nvd_api_key)
+    plan = vuln_scanner.plan_scan(software_list, limit=args.cve_limit)
+
+    progress_callback = None
+    if not args.quiet:
+        progress = ProgressBar(total=len(plan.targets), prefix="CVE Check")
+
+        def progress_callback(current, total, name):
+            progress.update(current, name)
+            logger.debug(f"Scanning for CVEs: {name}")
+
+    results = vuln_scanner.scan_plan(plan, progress_callback=progress_callback)
+    if not args.quiet:
+        progress.finish("Complete")
+
+    total_cves = sum(r.total_count for r in results)
+    critical_count = sum(r.critical_count for r in results)
+    log_audit_event(
+        "SCAN_END",
+        "Vulnerability scan completed",
+        software_scanned=len(plan.targets),
+        not_checked=len(plan.unmapped) + plan.no_version + plan.over_limit,
+        cves_found=total_cves,
+        critical_cves=critical_count,
+        failed=sum(1 for r in results if r.error),
+    )
+
+    if not args.quiet:
+        print(file=sys.stderr)
+    vuln_scanner.display_results(results, plan)
+    # Incomplete results: scripts must not read them as "no CVEs"
+    return not any(r.error for r in results)
+
+
+# The audit checks, in the order they run: (option attribute, section heading when more
+# than one runs, runner). The CVE report prints its own heading.
+_AUDIT_CHECKS = [
+    ("check_updates", "AVAILABLE UPDATES (winget)", _run_update_check),
+    ("extensions", "BROWSER EXTENSIONS", _run_extension_scan),
+    ("check_vulns", None, _run_cve_check),
+]
+
+
 def _check_option_combinations(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Refuse option combinations that would be ignored or give misleading results.
 
@@ -3337,6 +3458,7 @@ Examples:
   %(prog)s --check-updates          Check for available updates via winget
   %(prog)s --extensions             List browser extensions (Chrome, Edge, Firefox)
   %(prog)s --check-vulns            Check for known CVEs in installed software
+  %(prog)s --check-updates --extensions --check-vulns  Run all three checks, in this order
         """,
     )
 
@@ -3471,114 +3593,21 @@ Examples:
         hostname=os.environ.get("COMPUTERNAME", "unknown"),
     )
 
-    # Handle update checking mode
-    if args.check_updates:
-        log_audit_event("SCAN_START", "Update check via winget", mode="check-updates")
-        if not args.quiet:
-            spinner = Spinner("Checking for updates via winget")
-            spinner.spin()
-
-        update_checker = WingetUpdateChecker()
-        all_updates = update_checker.check_for_updates()
-        updates = _apply_filters(all_updates, args.search, _parse_exclude_terms(args.exclude))
-
-        if not args.quiet:
-            spinner.finish("Update check failed" if update_checker.error
-                           else f"Found {len(updates)} available updates")
-        log_audit_event("SCAN_END", "Update check completed", updates_found=len(updates),
-                        failed=bool(update_checker.error))
-        if not args.quiet:
-            print(file=sys.stderr)
-        if update_checker.error:
-            # Never "All software is up to date" when winget didn't answer
-            print(f"Could not check for updates: {update_checker.error}.")
-            if updates:
-                print("Updates winget listed before the error (the list may be incomplete):")
-                update_checker.display_updates_table(updates)
-            sys.exit(EXIT_API_FAILURE)
-        if all_updates and not updates:
-            # Not "up to date": the filters hid the updates there are
-            print(f"None of the {len(all_updates)} available update(s) match --search / --exclude.")
-        else:
-            update_checker.display_updates_table(updates)
-        return
-
-    # Handle browser extensions mode
-    if args.extensions:
-        log_audit_event("SCAN_START", "Browser extension scan", mode="extensions")
-        if not args.quiet:
-            spinner = Spinner("Scanning browser extensions")
-            spinner.spin("Chrome, Edge, Firefox...")
-
-        extension_scanner = BrowserExtensionScanner()
-        all_extensions = extension_scanner.get_all_extensions()
-        extensions = _apply_filters(all_extensions, args.search, _parse_exclude_terms(args.exclude))
-
-        if not args.quiet:
-            spinner.finish(f"Found {len(extensions)} extensions")
-        sensitive_count = sum(1 for e in extensions if e.has_sensitive_permissions())
-        log_audit_event(
-            "SCAN_END",
-            "Browser extension scan completed",
-            extensions_found=len(extensions),
-            sensitive_permissions=sensitive_count,
-        )
-        if not args.quiet:
-            print(file=sys.stderr)
-        if all_extensions and not extensions:
-            print(f"None of the {len(all_extensions)} browser extension(s) match --search / --exclude.")
-        else:
-            extension_scanner.display_extensions_table(extensions)
-        return
-
-    # Handle vulnerability scanning mode
-    if args.check_vulns:
-        log_audit_event("SCAN_START", "Vulnerability scan via NVD", mode="check-vulns")
-        if not args.quiet:
-            print("Scanning for known vulnerabilities (CVEs)...", file=sys.stderr)
-            print("This may take a while due to API rate limits.\n", file=sys.stderr)
-
-        # Registry by default (the most reliable versions); --source chooses others
-        vuln_sources = (["registry", "store", "portable"] if args.source == "all"
-                        else [args.source or "registry"])
-        enumerator = SoftwareEnumerator()
-        software_list = enumerator.scan_all(vuln_sources, show_progress=not args.quiet)
-        software_list = enumerator.filter_results(software_list, args.search, _parse_exclude_terms(args.exclude))
-        if not args.quiet:
-            print(file=sys.stderr)
-
-        vuln_scanner = VulnerabilityScanner(api_key=args.nvd_api_key)
-        plan = vuln_scanner.plan_scan(software_list, limit=args.cve_limit)
-
-        progress_callback = None
-        if not args.quiet:
-            progress = ProgressBar(total=len(plan.targets), prefix="CVE Check")
-
-            def progress_callback(current, total, name):
-                progress.update(current, name)
-                logger.debug(f"Scanning for CVEs: {name}")
-
-        results = vuln_scanner.scan_plan(plan, progress_callback=progress_callback)
-        if not args.quiet:
-            progress.finish("Complete")
-
-        total_cves = sum(r.total_count for r in results)
-        critical_count = sum(r.critical_count for r in results)
-        log_audit_event(
-            "SCAN_END",
-            "Vulnerability scan completed",
-            software_scanned=len(plan.targets),
-            not_checked=len(plan.unmapped) + plan.no_version + plan.over_limit,
-            cves_found=total_cves,
-            critical_cves=critical_count,
-            failed=sum(1 for r in results if r.error),
-        )
-
-        if not args.quiet:
-            print(file=sys.stderr)
-        vuln_scanner.display_results(results, plan)
-        if any(r.error for r in results):
-            # Results are incomplete; scripts must not read this as "no CVEs"
+    # Audit checks: run every one that was asked for, in a fixed order (the quick ones first,
+    # the slow NVD check last). If any couldn't complete, exit 3: results are incomplete.
+    requested = [check for check in _AUDIT_CHECKS if getattr(args, check[0])]
+    if requested:
+        complete = True
+        for index, (_, heading, run_check) in enumerate(requested):
+            if len(requested) > 1:
+                if index:
+                    print()
+                if heading:
+                    print("=" * 80)
+                    print(heading)
+                    print("=" * 80)
+            complete = run_check(args) and complete
+        if not complete:
             sys.exit(EXIT_API_FAILURE)
         return
 

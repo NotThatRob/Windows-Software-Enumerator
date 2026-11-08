@@ -26,8 +26,7 @@ python Software_Enumerator.py --source registry --output json
 python Software_Enumerator.py --check-updates --log-file audit.log
 python Software_Enumerator.py --extensions
 python Software_Enumerator.py --check-vulns
-# Note: --check-updates, --extensions and --check-vulns can't be combined yet: main() runs
-# the first one given and returns (README's "Combined security audit" example is wrong).
+python Software_Enumerator.py --check-updates --extensions --check-vulns   # all three, always in this order
 python Software_Enumerator.py --save-baseline baseline.json
 python Software_Enumerator.py --diff baseline.json
 python Software_Enumerator.py --quiet --output json    # suppress progress output, print only results

@@ -27,7 +27,7 @@ Software-Enumerator discovers and catalogs installed software from multiple sour
 ### Software Discovery
 - **Windows Registry** - Traditional Win32 programs from standard uninstall registry keys (HKLM 64-bit, HKLM 32-bit WOW6432Node, HKCU)
 - **Microsoft Store** - UWP/MSIX apps installed via the Microsoft Store
-- **Portable Applications** - Executables in common portable app locations (`C:\PortableApps`, `C:\Tools`, `%LOCALAPPDATA%\Programs`)
+- **Portable Applications** - Executables in common portable app locations (`C:\PortableApps`, `C:\Tools`, `%LOCALAPPDATA%\Programs`, `%APPDATA%`)
 
 ### Security Auditing
 - **Update Checking** - Queries winget for available software updates
@@ -53,8 +53,8 @@ Software-Enumerator discovers and catalogs installed software from multiple sour
 
 1. Clone or download this repository:
    ```bash
-   git clone https://github.com/yourusername/Software-Enumerator.git
-   cd Software-Enumerator
+   git clone https://github.com/NotThatRob/Windows-Software-Enumerator.git
+   cd Windows-Software-Enumerator
    ```
 
 2. No additional dependencies required - uses Python standard library only.

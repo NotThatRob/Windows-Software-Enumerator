@@ -584,6 +584,20 @@ class TestSoftwareMappings(unittest.TestCase):
         for display_name, expected in cases.items():
             self.assertEqual(scanner._find_mapping(display_name), expected, display_name)
 
+    def test_real_install_names_map_to_the_right_product(self):
+        """Names seen on a real machine that mapped to the wrong product (or version scheme)."""
+        scanner = se.VulnerabilityScanner()
+        cases = {
+            "Visual Studio Community 2026": ("microsoft", "visual_studio_2026"),
+            "Visual Studio Professional 2022": ("microsoft", "visual_studio_2022"),
+            "Microsoft Visual Studio Installer": None,             # its own version scheme
+            "OpenVPN Connect": ("openvpn", "connect"),             # not OpenVPN (community)
+        }
+        for display_name, expected in cases.items():
+            self.assertEqual(scanner._find_mapping(display_name), expected, display_name)
+        self.assertTrue(scanner._should_skip_software("Python Launcher"))  # not a CPython version
+        self.assertEqual(se.VulnerabilityScanner._cpe_version("postgresql", "postgresql", "17.11-5"), "17.11")
+
     def test_longest_matching_key_wins(self):
         """When two keys match, the more specific (longer) one is used, whatever the table order."""
         scanner = se.VulnerabilityScanner()

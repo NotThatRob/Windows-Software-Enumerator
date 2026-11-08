@@ -1967,7 +1967,17 @@ class VulnerabilityScanner:
         "notepad++": ("notepad-plus-plus", "notepad\\+\\+"),
         "vscode": ("microsoft", "visual_studio_code"),
         "visual studio code": ("microsoft", "visual_studio_code"),
-        "visual studio": ("microsoft", "visual_studio"),
+        # NVD names each Visual Studio release separately; a bare "visual studio" key would
+        # also catch the Visual Studio Installer and Office tools runtimes (other versions).
+        "visual studio community 2019": ("microsoft", "visual_studio_2019"),
+        "visual studio professional 2019": ("microsoft", "visual_studio_2019"),
+        "visual studio enterprise 2019": ("microsoft", "visual_studio_2019"),
+        "visual studio community 2022": ("microsoft", "visual_studio_2022"),
+        "visual studio professional 2022": ("microsoft", "visual_studio_2022"),
+        "visual studio enterprise 2022": ("microsoft", "visual_studio_2022"),
+        "visual studio community 2026": ("microsoft", "visual_studio_2026"),
+        "visual studio professional 2026": ("microsoft", "visual_studio_2026"),
+        "visual studio enterprise 2026": ("microsoft", "visual_studio_2026"),
         "intellij idea": ("jetbrains", "intellij_idea"),
         "pycharm": ("jetbrains", "pycharm"),
         "webstorm": ("jetbrains", "webstorm"),
@@ -2017,6 +2027,7 @@ class VulnerabilityScanner:
         "nmap": ("nmap", "nmap"),
         "burp suite": ("portswigger", "burp_suite"),
         "openvpn": ("openvpn", "openvpn"),
+        "openvpn connect": ("openvpn", "connect"),    # a different client from OpenVPN (community)
         "putty": ("putty", "putty"),
         "wireshark": ("wireshark", "wireshark"),
         # Compression & Utilities
@@ -2104,6 +2115,7 @@ class VulnerabilityScanner:
         r"hotfix",
         r"security update",
         r"service pack",
+        r"python launcher",    # the py launcher's version is not a CPython version
     ]
 
     def __init__(self, api_key: str = None):
@@ -2195,10 +2207,17 @@ class VulnerabilityScanner:
             return m.group(1)
         return version
 
+    @staticmethod
+    def _without_package_build(version: str) -> str:
+        """Drop an installer package build suffix: PostgreSQL's installer reports 17.11 as "17.11-5"."""
+        m = re.fullmatch(r"(\d+(?:\.\d+)*)-\d+", version)
+        return m.group(1) if m else version
+
     # Products whose installers report versions in a form NVD reads differently
     VERSION_TRANSLATORS = {
         ("python", "python"): "_python_installer_version",
         ("oracle", "jre"): "_java_installer_version",
+        ("postgresql", "postgresql"): "_without_package_build",
     }
 
     @classmethod

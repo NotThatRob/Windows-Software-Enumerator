@@ -74,7 +74,7 @@ Everything lives in `Software_Enumerator.py` (~3,260 lines). Key classes:
 
 Tests are in `test_security.py` using `unittest`. Import the main module as `import Software_Enumerator as se`. Tests use `unittest.mock.patch` extensively to mock Windows APIs and network calls. Run with `python test_security.py` — no test framework installation needed.
 
-Test classes are organized by feature area (e.g., `TestOutputSanitization`, `TestSlidingWindowRateLimit`, `TestBaselineManagerRoundtrip`, `TestParallelScanning`, `TestQuietMode`). The `SecurityTestSuite` class at the bottom defines the canonical test ordering. **Add every new test class to it**: `python test_security.py` runs only the listed classes, so an unlisted class runs under `python -m unittest` but is silently skipped by the main command.
+Test classes are organized by feature area (e.g., `TestOutputSanitization`, `TestSlidingWindowRateLimit`, `TestBaselineManagerRoundtrip`, `TestParallelScanning`, `TestQuietMode`). `run_security_tests()` collects every `TestCase` class in the module automatically (`loadTestsFromModule`, alphabetical order), so a new class needs no registration. Tests must not depend on running in a particular order.
 
 ## Important Constraints
 

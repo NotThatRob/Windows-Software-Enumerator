@@ -2196,57 +2196,20 @@ class TestExitCodes(unittest.TestCase):
         self.assertEqual(len(codes), len(set(codes)))
 
 
-class SecurityTestSuite(unittest.TestSuite):
-    """Aggregate all security tests."""
-
-    def __init__(self):
-        super().__init__()
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestOutputSanitization))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestApiKeyEnvironmentVariable))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestUserAgent))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestSymlinkProtection))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestErrorMessageSanitization))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestAuditLogging))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestTOCTOUFixes))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestDataclassSecurity))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestVersionMatching))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCsvParsing))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestSoftwareMappings))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestLogRotation))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCveLimitArg))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestPortableAppFileLimit))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestSlidingWindowRateLimit))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestEnhancedPermissions))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestBaselineLimits))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestSoftwareExporter))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestBaselineManagerRoundtrip))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestParallelScanning))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestQuietMode))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCsvSanitizationConsistency))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestDiffExportSanitization))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCsvFormulaInjection))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestRegistryMalformedValues))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestBrowserMalformedInput))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestExecutableResolution))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestLogFilePermissions))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCompiledSkipPatterns))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestLoadEnvFile))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestWingetUpdateChecker))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestStoreAppScanner))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestExcludeFilter))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestExitCodes))
-
-
 def run_security_tests():
-    """Run all security tests and print results."""
+    """Run every test class in this module and print results."""
     print("=" * 70)
     print("SOFTWARE ENUMERATOR - SECURITY TEST SUITE")
     print("=" * 70)
     print()
 
+    # Collect test classes automatically, so a new class can't be left out by
+    # forgetting to add it to a hand-maintained list.
+    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+
     # Run with verbosity
     runner = unittest.TextTestRunner(verbosity=2)
-    result = runner.run(SecurityTestSuite())
+    result = runner.run(suite)
 
     print()
     print("=" * 70)

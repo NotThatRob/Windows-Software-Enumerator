@@ -819,8 +819,10 @@ class TestUnconfirmedCves(unittest.TestCase):
         self.assertLessEqual((end - start).days, 120)                              # NVD's maximum range
 
     def test_products_without_a_safe_phrase_get_no_unconfirmed_search(self):
-        _, fake = self._scan(se.SoftwareInfo(name="Git", version="2.40.0"))
-        self.assertEqual(len(fake.urls), 1)
+        """Generic names (Git) and platforms other CVEs name (Node.js: npm packages) aren't searched."""
+        for name, version in [("Git", "2.40.0"), ("Node.js", "26.13.0")]:
+            _, fake = self._scan(se.SoftwareInfo(name=name, version=version))
+            self.assertEqual(len(fake.urls), 1, name)
 
     def test_unconfirmed_search_failure_keeps_the_confirmed_results(self):
         import urllib.error

@@ -2073,8 +2073,9 @@ class VulnerabilityScanner:
     }
 
     # Phrases that name a product in CVE descriptions, used only to find recent CVEs NVD hasn't
-    # analysed yet (they have no product data, so the CPE query can't see them). Products whose
-    # names are too generic to search for (Git, Everything, Steam, ...) are left out on purpose.
+    # analysed yet (they have no product data, so the CPE query can't see them). Left out on
+    # purpose: names too generic to search for (Git, Everything, Steam, ...) and platforms that
+    # other products' CVEs name, e.g. Node.js ("... package for Node.js": hundreds of npm CVEs).
     SEARCH_PHRASES = {
         ("google", "chrome"): "Google Chrome",
         ("mozilla", "firefox"): "Firefox",
@@ -2083,7 +2084,6 @@ class VulnerabilityScanner:
         ("microsoft", "visual_studio_code"): "Visual Studio Code",
         ("notepad-plus-plus", "notepad\\+\\+"): "Notepad++",
         ("python", "python"): "CPython",
-        ("nodejs", "node.js"): "Node.js",
         ("libreoffice", "libreoffice"): "LibreOffice",
         ("videolan", "vlc_media_player"): "VLC",
         ("audacityteam", "audacity"): "Audacity",

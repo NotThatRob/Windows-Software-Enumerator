@@ -1298,6 +1298,24 @@ class TestCsvLineEndings(unittest.TestCase):
                 data = f.read()
         self._assert_one_crlf_per_line(data, expected_lines=3)
 
+    def _export_to_stdout(self, fmt):
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="utf-8", newline="\r\n")
+        with patch("sys.stdout", stream):
+            se.SoftwareExporter.export(self.ITEMS, fmt)
+        stream.flush()
+        return raw.getvalue()
+
+    def test_csv_on_stdout_ends_after_last_record(self):
+        """No extra empty line after the last record (the CSV text already ends with one)."""
+        data = self._export_to_stdout("csv")
+        self.assertFalse(data.endswith(b"\r\n\r\n"), f"ends with {data[-8:]!r}")
+        self._assert_one_crlf_per_line(data, expected_lines=3)
+
+    def test_json_on_stdout_still_ends_with_newline(self):
+        data = self._export_to_stdout("json")
+        self.assertTrue(data.endswith(b"}\r\n"), f"ends with {data[-8:]!r}")
+
 
 class _FakeRegistry:
     """Minimal winreg stand-in: {subkey_name: {value_name: value}} under a single path.

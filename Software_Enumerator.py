@@ -2621,7 +2621,8 @@ class SoftwareExporter:
                 f.write(content)
             log_audit_event("EXPORT", f"Exported to {format}", file=output_file, count=len(software_list))
         else:
-            print(content)
+            # CSV text already ends with a line ending; JSON doesn't, so print() adds one.
+            print(content, end="" if format == "csv" else "\n")
 
 
 @dataclass
@@ -3211,7 +3212,7 @@ Examples:
             if args.output == "json":
                 print(BaselineManager.diff_to_json(diff, baseline_metadata, args.diff))
             elif args.output == "csv":
-                print(BaselineManager.diff_to_csv(diff))
+                print(BaselineManager.diff_to_csv(diff), end="")   # CSV text ends with its own line ending
             else:
                 BaselineManager.display_diff(diff, baseline_metadata)
 

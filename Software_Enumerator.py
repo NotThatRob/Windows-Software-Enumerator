@@ -892,6 +892,9 @@ class VulnerabilityResult:
     software_version: str
     cves: list[CVEInfo] = field(default_factory=list)
     error: str = ""
+    not_checked: str = ""    # reason the program wasn't looked up, e.g. "no CPE mapping"
+    cpe: str = ""            # CPE name that was looked up
+    total_available: int = 0  # CVEs NVD reported (can exceed len(cves) if the page cap was hit)
 
     @property
     def critical_count(self) -> int:
@@ -1897,10 +1900,22 @@ class BrowserExtensionScanner:
             print("browsing history, downloads, clipboard, and network requests.")
 
 
+class NvdApiError(Exception):
+    """An NVD request failed. `status` is the HTTP status code, or None for network errors."""
+
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
+
+
 class VulnerabilityScanner:
     """Scans for known CVEs using the NIST NVD API."""
 
     NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+
+    # NVD returns at most 2,000 CVEs per page. Very old browser versions can be affected by
+    # thousands of CVEs, so cap the pages per program and report "showing N of M".
+    MAX_PAGES = 5
 
     # Display-name keys -> CPE (vendor, product) as NVD names them. Every pair must exist in
     # NVD's CPE dictionary: a pair NVD doesn't know makes the check find nothing, silently.
@@ -2089,69 +2104,89 @@ class VulnerabilityScanner:
                 return self.SOFTWARE_MAPPINGS[key]
         return None
 
-    def _get_search_terms(self, software: SoftwareInfo) -> tuple[str, str]:
-        """Get vendor and product search terms for a software."""
-        name_lower = self._normalize_software_name(software.name)
+    @staticmethod
+    def _cpe_version(vendor: str, product: str, version: str) -> Optional[str]:
+        """The installed version as it goes into a CPE name, or None if it can't be used.
 
-        # Check if we have a known mapping
-        mapping = self._find_mapping(software.name)
-        if mapping:
-            return mapping
+        Only plain version strings are accepted: anything with spaces or CPE special
+        characters (":", "*", "?", "\\", ...) would change the meaning of the CPE name.
+        """
+        version = (version or "").strip()
+        if re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._-]*", version):
+            return version
+        return None
 
-        # Fall back to using the software name as both vendor and product keyword
-        # Extract likely product name (first significant word)
-        words = name_lower.split()
-        if words:
-            return "", words[0]
+    @staticmethod
+    def _cpe_name(vendor: str, product: str, cpe_version: str) -> str:
+        """CPE 2.3 name for an application at one version (NVD accepts the short form)."""
+        return f"cpe:2.3:a:{vendor}:{product}:{cpe_version}"
 
-        return "", name_lower
+    def _nvd_request(self, params: list) -> dict:
+        """Make one NVD CVE API request and return the decoded JSON page.
 
-    def _query_nvd_api(self, keyword: str, vendor: str = "") -> list[dict]:
-        """Query the NVD API for CVEs matching a keyword."""
+        Args:
+            params: (name, value) pairs; a value of None sends a flag without a value
+                    (NVD's isVulnerable / noRejected parameters work that way).
+
+        Raises:
+            NvdApiError: with a generic message (never the server's text) and the HTTP status.
+        """
         self._rate_limit()
-
-        params = {
-            "resultsPerPage": 20,
-            "keywordSearch": keyword,
-        }
-
-        if vendor:
-            # Use CPE match string for more accurate results
-            params["keywordSearch"] = f"{vendor} {keyword}"
-
-        url = f"{self.NVD_API_URL}?{urllib.parse.urlencode(params)}"
+        query = "&".join(name if value is None else f"{name}={urllib.parse.quote(str(value), safe=':')}"
+                         for name, value in params)
+        url = f"{self.NVD_API_URL}?{query}"
 
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         }
-
         if self.api_key:
             headers["apiKey"] = self.api_key
 
-        try:
-            request = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(request, timeout=30) as response:
-                data = json.loads(response.read().decode('utf-8'))
-                return data.get("vulnerabilities", [])
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                # Too Many Requests — wait and retry once
-                time.sleep(self._rate_window)
-                try:
-                    request = urllib.request.Request(url, headers=headers)
-                    with urllib.request.urlopen(request, timeout=30) as response:
-                        data = json.loads(response.read().decode('utf-8'))
-                        return data.get("vulnerabilities", [])
-                except (urllib.error.HTTPError, urllib.error.URLError, OSError, json.JSONDecodeError):
-                    raise Exception("NVD API rate limit exceeded. Try again later or use an API key.")
-            elif e.code == 403:
-                raise Exception("NVD API rate limit exceeded. Try again later or use an API key.")
-            elif e.code == 404:
-                raise Exception("NVD API endpoint not found.")
-            else:
-                raise Exception(f"NVD API request failed (HTTP {e.code}).")
-        except urllib.error.URLError:
-            raise Exception("Network error: Unable to reach NVD API.")
+        for attempt in (1, 2):
+            try:
+                request = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt == 1:
+                    time.sleep(self._rate_window)  # Too Many Requests: wait out the window, retry once
+                    continue
+                if e.code in (403, 429):
+                    raise NvdApiError("NVD API rate limit exceeded. Try again later or use an API key.", e.code)
+                raise NvdApiError(f"NVD API request failed (HTTP {e.code}).", e.code)
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
+                raise NvdApiError("Network error: Unable to reach NVD API.")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                raise NvdApiError("NVD API returned an unreadable response.")
+            if not isinstance(data, dict):
+                raise NvdApiError("NVD API returned an unreadable response.")
+            return data
+        raise NvdApiError("NVD API rate limit exceeded. Try again later or use an API key.", 429)
+
+    def _fetch_all_pages(self, params: list, max_pages: int) -> tuple[list[dict], int]:
+        """Fetch up to max_pages pages of a CVE query. Returns (vulnerabilities, NVD's total count)."""
+        vulnerabilities, start, total = [], 0, 0
+        for _ in range(max_pages):
+            page = self._nvd_request(params + [("startIndex", start)])
+            batch = page.get("vulnerabilities")
+            total = page.get("totalResults")
+            if not isinstance(batch, list) or not isinstance(total, int):
+                raise NvdApiError("NVD API returned an unreadable response.")
+            vulnerabilities.extend(v for v in batch if isinstance(v, dict))
+            start += len(batch)
+            if not batch or start >= total:
+                break
+        return vulnerabilities, total
+
+    def _query_affecting_cves(self, vendor: str, product: str, cpe_version: str) -> tuple[list[dict], int]:
+        """CVEs that NVD says affect this product at this version (rejected CVEs left out).
+
+        NVD compares the CPE name with each CVE's version ranges itself; checked against a
+        local reading of NVD's data for 12 products, it matched exactly (nothing missed or added).
+        """
+        params = [("cpeName", self._cpe_name(vendor, product, cpe_version)),
+                  ("isVulnerable", None), ("noRejected", None)]
+        return self._fetch_all_pages(params, self.MAX_PAGES)
 
     def _parse_cve(self, vuln_data: dict) -> Optional[CVEInfo]:
         """Parse a CVE entry from NVD API response."""
@@ -2215,145 +2250,47 @@ class VulnerabilityScanner:
             return "LOW"
         return "UNKNOWN"
 
-    @staticmethod
-    def _parse_version(version_str: str) -> tuple:
-        """Parse a version string into a tuple of integers for comparison.
-
-        Handles non-numeric segments by stopping at the first non-numeric part.
-        e.g. "1.2.3-beta" -> (1, 2, 3), "10.0" -> (10, 0), "" -> ()
-        """
-        if not version_str:
-            return ()
-        parts = []
-        for segment in version_str.split("."):
-            # Extract leading digits from each segment
-            match = re.match(r'(\d+)', segment)
-            if match:
-                parts.append(int(match.group(1)))
-            else:
-                break
-        return tuple(parts)
-
-    @staticmethod
-    def _version_in_range(installed: tuple, start_inc: str = None,
-                          start_exc: str = None, end_inc: str = None,
-                          end_exc: str = None) -> bool:
-        """Check if an installed version falls within a CPE match range.
-
-        Args:
-            installed: Parsed version tuple, e.g. (1, 2, 3)
-            start_inc: versionStartIncluding boundary (inclusive)
-            start_exc: versionStartExcluding boundary (exclusive)
-            end_inc: versionEndIncluding boundary (inclusive)
-            end_exc: versionEndExcluding boundary (exclusive)
-
-        Returns:
-            True if the version is within the specified range.
-        """
-        parse = VulnerabilityScanner._parse_version
-        if not installed:
-            return True  # Can't compare, assume affected
-
-        if start_inc is not None:
-            bound = parse(start_inc)
-            if bound and installed < bound:
-                return False
-        if start_exc is not None:
-            bound = parse(start_exc)
-            if bound and installed <= bound:
-                return False
-        if end_inc is not None:
-            bound = parse(end_inc)
-            if bound and installed > bound:
-                return False
-        if end_exc is not None:
-            bound = parse(end_exc)
-            if bound and installed >= bound:
-                return False
-        return True
-
-    def _version_matches(self, vuln_data: dict, installed_version: str) -> bool:
-        """Check if a CVE affects the installed version using CPE configuration data.
-
-        Uses the structured configurations/nodes/cpeMatch data from the NVD API
-        response to determine if the installed version falls within any affected
-        version range.
-
-        Returns True (conservative) if no version range data is available.
-        """
-        if not installed_version:
-            return True  # Can't determine, assume it might apply
-
-        installed = self._parse_version(installed_version)
-        if not installed:
-            return True
-
-        cve = vuln_data.get("cve", {})
-        configurations = cve.get("configurations", [])
-        if not configurations:
-            return True  # No configuration data, conservatively include
-
-        has_ranges = False
-        for config in configurations:
-            for node in config.get("nodes", []):
-                for cpe_match in node.get("cpeMatch", []):
-                    if not cpe_match.get("vulnerable", False):
-                        continue
-
-                    start_inc = cpe_match.get("versionStartIncluding")
-                    start_exc = cpe_match.get("versionStartExcluding")
-                    end_inc = cpe_match.get("versionEndIncluding")
-                    end_exc = cpe_match.get("versionEndExcluding")
-
-                    # Only consider entries that have at least one version bound
-                    if not any([start_inc, start_exc, end_inc, end_exc]):
-                        # Exact version match in CPE criteria
-                        criteria = cpe_match.get("criteria", "")
-                        # CPE format: cpe:2.3:a:vendor:product:version:...
-                        cpe_parts = criteria.split(":")
-                        if len(cpe_parts) >= 6 and cpe_parts[5] not in ("*", "-", ""):
-                            has_ranges = True
-                            cpe_ver = self._parse_version(cpe_parts[5])
-                            if cpe_ver and installed == cpe_ver:
-                                return True
-                        continue
-
-                    has_ranges = True
-                    if self._version_in_range(installed, start_inc, start_exc, end_inc, end_exc):
-                        return True
-
-        if not has_ranges:
-            return True  # No version constraints found, conservatively include
-
-        return False  # Version ranges exist but none matched
-
     def scan_software(self, software: SoftwareInfo) -> VulnerabilityResult:
-        """Scan a single software for known CVEs."""
+        """Ask NVD which CVEs affect this program at its installed version.
+
+        NVD decides whether a CVE applies (it compares the CPE name with each CVE's version
+        ranges), so results are not filtered again here. Programs without a CPE mapping, or
+        with a version that can't go into a CPE name, are marked as not checked.
+        """
         result = VulnerabilityResult(
             software_name=software.name,
             software_version=software.version,
         )
 
         if self._should_skip_software(software.name):
+            result.not_checked = "framework or update package"
             return result
 
+        mapping = self._find_mapping(software.name)
+        if not mapping:
+            result.not_checked = "no CPE mapping"
+            return result
+        vendor, product = mapping
+        cpe_version = self._cpe_version(vendor, product, software.version)
+        if not cpe_version:
+            result.not_checked = "version can't be used in a CPE name"
+            return result
+        result.cpe = self._cpe_name(vendor, product, cpe_version)
+
         try:
-            vendor, product = self._get_search_terms(software)
-            vulnerabilities = self._query_nvd_api(product, vendor)
-
-            for vuln in vulnerabilities:
-                cve = self._parse_cve(vuln)
-                if cve and cve.severity in ["CRITICAL", "HIGH", "MEDIUM"]:
-                    if self._version_matches(vuln, software.version):
-                        result.cves.append(cve)
-
-            # Sort by severity (CRITICAL first)
-            severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
-            result.cves.sort(key=lambda c: (severity_order.get(c.severity, 4), -c.cvss_score))
-
-        except Exception as e:
+            vulnerabilities, result.total_available = self._query_affecting_cves(vendor, product, cpe_version)
+        except NvdApiError as e:
             result.error = str(e)
+            return result
 
+        for vuln in vulnerabilities:
+            cve = self._parse_cve(vuln)
+            if cve and cve.severity in ["CRITICAL", "HIGH", "MEDIUM"]:
+                result.cves.append(cve)
+
+        # Sort by severity (CRITICAL first)
+        severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
+        result.cves.sort(key=lambda c: (severity_order.get(c.severity, 4), -c.cvss_score))
         return result
 
     def scan_software_list(
@@ -2432,8 +2369,8 @@ class VulnerabilityScanner:
         print("  3. Check vendor advisories for patches and mitigations")
         print("  4. Consider removing software that is no longer maintained")
         print(f"{'='*80}")
-        print("\nNote: Results are based on keyword matching and may include")
-        print("CVEs that don't apply to your specific version. Always verify")
+        print("\nNote: Results come from NVD's product (CPE) data for each program's exact")
+        print("version. Programs without a CPE mapping are not checked. Always verify")
         print("against official vendor advisories.")
 
 

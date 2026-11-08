@@ -2066,8 +2066,8 @@ class VulnerabilityScanner:
         "postman": ("postman", "postman"),
         "curl": ("haxx", "curl"),
         "wget": ("gnu", "wget"),
-        # Gaming
-        "steam": ("valvesoftware", "steam_client"),
+        # Gaming (not Steam: NVD versions the Steam client by date, e.g. "2021-04-10", while
+        # Windows reports "2.10.91.91", so NVD can't compare them and matches every install)
         "epic games launcher": ("epicgames", "launcher"),
         "gog galaxy": ("gog", "galaxy"),
     }

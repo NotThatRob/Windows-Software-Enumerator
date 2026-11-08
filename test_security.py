@@ -596,6 +596,8 @@ class TestSoftwareMappings(unittest.TestCase):
         for display_name, expected in cases.items():
             self.assertEqual(scanner._find_mapping(display_name), expected, display_name)
         self.assertTrue(scanner._should_skip_software("Python Launcher"))  # not a CPython version
+        # NVD versions the Steam client by date ("2021-04-10"); "2.10.91.91" can't be compared
+        self.assertIsNone(scanner._find_mapping("Steam"))
         self.assertEqual(se.VulnerabilityScanner._cpe_version("postgresql", "postgresql", "17.11-5"), "17.11")
 
     def test_longest_matching_key_wins(self):

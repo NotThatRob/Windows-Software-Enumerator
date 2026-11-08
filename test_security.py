@@ -970,6 +970,16 @@ class TestCheckVulnsMain(unittest.TestCase):
         self.assertEqual(self.exit_code, se.EXIT_API_FAILURE)
         self.assertIn("Failed: 1 program(s)", out)
 
+    def test_out_of_range_cve_limit_is_rejected_not_clamped(self):
+        for value in ["0", "-5", "500", "many"]:
+            with patch("sys.stderr", io.StringIO()) as err:
+                fake, scan_all, _ = self._run("--cve-limit", value)
+            self.assertEqual(self.exit_code, 2, value)               # argparse usage error
+            self.assertIn("--cve-limit", err.getvalue(), value)
+            scan_all.assert_not_called()
+        self.assertEqual(se._cve_limit_arg("1"), 1)
+        self.assertEqual(se._cve_limit_arg("100"), 100)
+
     def test_clean_scan_exits_normally(self):
         self._run("--search", "chrome")
         self.assertIsNone(self.exit_code)

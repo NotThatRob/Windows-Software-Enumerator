@@ -3128,6 +3128,17 @@ class BaselineManager:
             print("\nNOTE: Software has been removed since baseline was created.")
 
 
+def _cve_limit_arg(value: str) -> int:
+    """argparse type for --cve-limit: a whole number from 1 to 100 (NVD rate limits)."""
+    try:
+        limit = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a whole number from 1 to 100")
+    if not 1 <= limit <= 100:
+        raise argparse.ArgumentTypeError(f"must be from 1 to 100, not {limit}")
+    return limit
+
+
 def _parse_exclude_terms(value: Optional[str]) -> Optional[list[str]]:
     """Split a comma-separated --exclude value into terms, ignoring empty ones.
 
@@ -3242,10 +3253,10 @@ Examples:
 
     parser.add_argument(
         "--cve-limit",
-        type=int,
+        type=_cve_limit_arg,
         default=20,
         metavar="N",
-        help="Maximum number of software items to check for CVEs (default: 20)",
+        help="Maximum number of programs to check for CVEs, 1-100 (default: 20)",
     )
 
     parser.add_argument(
@@ -3267,9 +3278,6 @@ Examples:
     )
 
     args = parser.parse_args()
-
-    # Validate --cve-limit
-    args.cve_limit = max(1, min(args.cve_limit, 100))
 
     # Setup logging before any operations
     try:

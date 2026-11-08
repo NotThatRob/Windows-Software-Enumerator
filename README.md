@@ -27,7 +27,7 @@ Software-Enumerator discovers and catalogs installed software from multiple sour
 ### Software Discovery
 - **Windows Registry** - Traditional Win32 programs from standard uninstall registry keys (HKLM 64-bit, HKLM 32-bit WOW6432Node, HKCU)
 - **Microsoft Store** - UWP/MSIX apps installed via the Microsoft Store
-- **Portable Applications** - Executables in common portable app locations (`C:\PortableApps`, `C:\Tools`, `%LOCALAPPDATA%\Programs`)
+- **Portable Applications** - Executables in common portable app locations (`C:\PortableApps`, `C:\Tools`, `%LOCALAPPDATA%\Programs`, `%APPDATA%`)
 
 ### Security Auditing
 - **Update Checking** - Queries winget for available software updates
@@ -53,8 +53,8 @@ Software-Enumerator discovers and catalogs installed software from multiple sour
 
 1. Clone or download this repository:
    ```bash
-   git clone https://github.com/yourusername/Software-Enumerator.git
-   cd Software-Enumerator
+   git clone https://github.com/NotThatRob/Windows-Software-Enumerator.git
+   cd Windows-Software-Enumerator
    ```
 
 2. No additional dependencies required - uses Python standard library only.
@@ -75,11 +75,12 @@ python Software_Enumerator.py [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--source {registry,store,portable,all}` | Source to scan (default: all; registry for `--check-vulns`) |
-| `--search TERM` | Filter results by name, publisher, or version |
-| `--exclude PATTERNS` | Exclude software matching patterns (comma-separated) |
+| `--search TERM` | Filter results by name, publisher, or version (updates: name or winget ID; extensions: name or extension ID) |
+| `--exclude PATTERNS` | Exclude software matching patterns (comma-separated; name or publisher; updates and extensions: as `--search`) |
 | `--sort {name,version,publisher,source}` | Sort results by field (default: name) |
 | `--output {table,json,csv}` | Output format (default: table) |
-| `--save-baseline FILE` | Save current state as baseline JSON file |
+| `--save-baseline FILE` | Save current state as baseline JSON file (an existing file is kept unless `--overwrite` is given) |
+| `--overwrite` | Let `--save-baseline` replace an existing file |
 | `--diff FILE` | Compare current state against a baseline file |
 | `--check-updates` | Check for available updates via winget |
 | `--extensions` | List browser extensions with permission analysis |
@@ -89,6 +90,8 @@ python Software_Enumerator.py [OPTIONS]
 | `--log-file FILE` | Path to audit log file (rotated at 5 MB, 3 backups) |
 | `--verbose` | Enable verbose/debug logging |
 | `--quiet` | Suppress progress output, print only results |
+
+The three checks (`--check-updates`, `--extensions`, `--check-vulns`) can be combined; they always run in that order. The software list, `--save-baseline` and `--diff` each run on their own. Combining them with each other or with a check is refused with a usage error (exit code 2) before anything is scanned, and so is `--output json`/`csv` with a check (the checks print tables only, for now).
 
 ### Examples
 
@@ -117,8 +120,14 @@ python Software_Enumerator.py --output csv > software.csv
 # Save a baseline snapshot
 python Software_Enumerator.py --save-baseline baseline.json
 
+# Replace an existing baseline (e.g. in a scheduled job)
+python Software_Enumerator.py --save-baseline baseline.json --overwrite
+
 # Compare against baseline (detect changes)
 python Software_Enumerator.py --diff baseline.json
+
+# Compare, leaving out noisy runtime entries (in the baseline and the current scan)
+python Software_Enumerator.py --diff baseline.json --exclude "redistributable,.NET Runtime"
 
 # Diff output as JSON (for automation)
 python Software_Enumerator.py --diff baseline.json --output json
@@ -141,7 +150,8 @@ python Software_Enumerator.py --check-vulns --cve-limit 50
 # Enable audit logging (log files rotate at 5 MB, keeping 3 backups)
 python Software_Enumerator.py --log-file audit.log --verbose
 
-# Combined security audit
+# Combined security audit: updates, then extensions, then CVEs (in that order, whatever
+# the order on the command line); exit code 3 if any of them couldn't complete
 python Software_Enumerator.py --check-updates --extensions --check-vulns --log-file audit.log
 
 # Quiet mode for scripting (results only, no progress output)
@@ -179,8 +189,10 @@ Shows added, removed, and version-changed software since baseline was created:
 - `[-] REMOVED` - Software that was uninstalled
 - `[~] CHANGED` - Version changes (upgrades/downgrades)
 
+A baseline is always a full snapshot, so `--save-baseline` can't be combined with `--search` or `--exclude`. Use them with `--diff` instead: they then choose which programs are compared, in the baseline and in the current scan alike. (A baseline saved with `--search` or `--exclude` by an older version of the tool makes `--diff` report everything outside that filter as added; save it again.)
+
 ### Update Check
-Shows available updates with current/available versions and winget package IDs
+Shows available updates with current/available versions and winget package IDs. If winget isn't installed, times out or reports an error, the output says the update check couldn't be done (never "up to date") and the exit code is 3
 
 ### Browser Extensions
 Lists extensions with version, browser, and flags extensions with sensitive permissions (access to all URLs, cookies, history, storage, notifications, bookmarks, geolocation, local file access, etc.)
@@ -280,8 +292,9 @@ Structured exit codes for scripting and CI/CD integration:
 | 0 | Success |
 | 1 | Generic error |
 | 2 | No software found |
-| 3 | API failure: `--check-vulns` couldn't query NVD for some programs (results incomplete) |
+| 3 | Check incomplete: `--check-vulns` couldn't query NVD for some programs, or `--check-updates` couldn't run winget (results incomplete) |
 | 4 | Permission denied (e.g. the `--log-file` can't be written, or is owned by another account or linked) |
+| 5 | Changes found: `--diff` found programs added, removed or changed since the baseline |
 
 ## Testing
 

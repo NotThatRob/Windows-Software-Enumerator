@@ -995,6 +995,513 @@ class TestCheckVulnsMain(unittest.TestCase):
         self.assertEqual(scan_all.call_args[0][0], ["registry", "store", "portable"])
 
 
+class _MainHarness:
+    """Runs main() with every scanner, winget and NVD mocked.
+
+    A mixin rather than a TestCase, so the runner doesn't collect it on its own.
+    """
+
+    SOFTWARE = [
+        se.SoftwareInfo(name="Google Chrome", version="142.0.7444.60", publisher="Google LLC", source="registry"),
+        se.SoftwareInfo(name="Microsoft Visual C++ 2015 Redistributable (x64)", version="14.0.24215",
+                        publisher="Microsoft Corporation", source="registry"),
+        se.SoftwareInfo(name="7-Zip 25.01 (x64)", version="25.01", publisher="Igor Pavlov", source="registry"),
+    ]
+    UPDATES = [se.UpdateInfo(name="Google Chrome", current_version="142.0.7444.60",
+                             available_version="143.0.7499.40", winget_id="Google.Chrome"),
+               se.UpdateInfo(name="7-Zip", current_version="25.01", available_version="26.00", winget_id="7zip.7zip")]
+    EXTENSIONS = [se.BrowserExtensionInfo(name="uBlock Origin", version="1.60.0", browser="Chrome",
+                                          extension_id="cjpalhdlnbpafiamejdnhcphjbkeiagm", permissions=["storage"]),
+                  se.BrowserExtensionInfo(name="Dark Reader", version="4.9.96", browser="Firefox",
+                                          extension_id="addon@darkreader.org")]
+
+    def setUp(self):
+        saved_handlers = list(se.logger.handlers)
+        self.addCleanup(setattr, se.logger, "handlers", saved_handlers)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def run_main(self, *argv, software=None, updates=None, extensions=None, nvd_pages=(),
+                 real_update_check=False):
+        """Run main(argv). Returns exit code, stdout, stderr and the mocks (to see what ran).
+
+        real_update_check=True keeps the real check_for_updates(), for tests that fake
+        winget itself (its path, exit code and output).
+        """
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        scan_all = MagicMock(return_value=list(self.SOFTWARE if software is None else software))
+        check_updates = MagicMock(return_value=list(self.UPDATES if updates is None else updates))
+        get_extensions = MagicMock(return_value=list(self.EXTENSIONS if extensions is None else extensions))
+        nvd = _FakeNvd(*nvd_pages)
+        code = 0
+        update_patch = (nullcontext() if real_update_check
+                        else patch.object(se.WingetUpdateChecker, "check_for_updates", check_updates))
+        with patch.object(sys, "argv", ["Software_Enumerator.py", *argv]), \
+                patch.object(se, "_load_env_file"), \
+                patch.dict(os.environ, {}, clear=False), \
+                patch.object(se.SoftwareEnumerator, "scan_all", scan_all), \
+                update_patch, \
+                patch.object(se.BrowserExtensionScanner, "get_all_extensions", get_extensions), \
+                patch("urllib.request.urlopen", side_effect=nvd), \
+                patch("sys.stdout", io.StringIO()) as out, \
+                patch("sys.stderr", io.StringIO()) as err:
+            os.environ.pop("NVD_API_KEY", None)
+            try:
+                se.main()
+            except SystemExit as e:
+                code = 0 if e.code is None else e.code
+        return SimpleNamespace(code=code, out=out.getvalue(), err=err.getvalue(), scan_all=scan_all,
+                               check_updates=check_updates, get_extensions=get_extensions, nvd=nvd)
+
+    def save_baseline(self, software, name="baseline.json"):
+        path = self.tmp / name
+        se.BaselineManager.save_baseline(software, str(path), sources=["registry", "store", "portable"])
+        return path
+
+
+class TestMainModes(_MainHarness, unittest.TestCase):
+    """main() for each mode: listing, baselines, --diff, --check-updates, --extensions (mocked scanners)."""
+
+    def test_plain_run_lists_every_source_as_a_table(self):
+        r = self.run_main("--quiet")
+        self.assertEqual(r.code, se.EXIT_SUCCESS)
+        self.assertEqual(r.scan_all.call_args[0][0], ["registry", "store", "portable"])
+        for software in self.SOFTWARE:
+            self.assertIn(software.name, r.out)
+
+    def test_json_output_lists_every_program(self):
+        r = self.run_main("--output", "json")
+        data = json.loads(r.out)
+        self.assertEqual(sorted(s["name"] for s in data["software"]), sorted(s.name for s in self.SOFTWARE))
+
+    def test_csv_output_has_a_row_per_program(self):
+        r = self.run_main("--output", "csv")
+        rows = list(csv.reader(io.StringIO(r.out)))
+        self.assertEqual(len(rows), 1 + len(self.SOFTWARE))
+
+    def test_search_and_exclude_filter_the_list(self):
+        r = self.run_main("--output", "json", "--search", "google")
+        self.assertEqual([s["name"] for s in json.loads(r.out)["software"]], ["Google Chrome"])
+        r = self.run_main("--output", "json", "--exclude", "redistributable,7-zip")
+        self.assertEqual([s["name"] for s in json.loads(r.out)["software"]], ["Google Chrome"])
+
+    def test_no_software_found_exits_with_no_software_code(self):
+        r = self.run_main("--quiet", software=[])
+        self.assertEqual(r.code, se.EXIT_NO_SOFTWARE)
+
+    def test_save_baseline_writes_a_loadable_file(self):
+        path = self.tmp / "new.json"
+        r = self.run_main("--save-baseline", str(path), "--quiet")
+        self.assertEqual(r.code, se.EXIT_SUCCESS)
+        software, metadata = se.BaselineManager.load_baseline(str(path))
+        self.assertEqual(len(software), len(self.SOFTWARE))
+        self.assertEqual(metadata["sources"], ["registry", "store", "portable"])
+
+    def test_empty_baseline_is_not_saved(self):
+        path = self.tmp / "empty.json"
+        r = self.run_main("--save-baseline", str(path), software=[])
+        self.assertEqual(r.code, se.EXIT_NO_SOFTWARE)
+        self.assertFalse(path.exists())
+
+    def test_diff_against_an_unchanged_baseline(self):
+        r = self.run_main("--diff", str(self.save_baseline(self.SOFTWARE)))
+        self.assertEqual(r.code, se.EXIT_SUCCESS)
+        self.assertIn("No changes detected", r.out)
+
+    def test_diff_reports_added_removed_and_changed(self):
+        chrome, redist, seven_zip = self.SOFTWARE
+        old_chrome = se.SoftwareInfo(name=chrome.name, version="141.0", publisher=chrome.publisher)
+        old_tool = se.SoftwareInfo(name="Old Tool", version="1.0")
+        r = self.run_main("--diff", str(self.save_baseline([old_chrome, redist, old_tool])), "--output", "json")
+        data = json.loads(r.out)
+        self.assertEqual([s["name"] for s in data["added"]], [seven_zip.name])
+        self.assertEqual([s["name"] for s in data["removed"]], ["Old Tool"])
+        self.assertEqual([c["current"]["version"] for c in data["changed"]], [chrome.version])
+
+    def test_diff_with_a_missing_baseline_is_an_error(self):
+        r = self.run_main("--diff", str(self.tmp / "missing.json"))
+        self.assertEqual(r.code, se.EXIT_ERROR)
+        self.assertIn("Baseline file not found", r.err)
+
+    def test_check_updates_lists_updates_without_scanning_software(self):
+        r = self.run_main("--check-updates", "--quiet")
+        self.assertEqual(r.code, se.EXIT_SUCCESS)
+        self.assertIn("Google.Chrome", r.out)
+        self.assertIn("7zip.7zip", r.out)
+        r.scan_all.assert_not_called()
+
+    def test_check_updates_with_nothing_to_update(self):
+        r = self.run_main("--check-updates", "--quiet", updates=[])
+        self.assertEqual(r.code, se.EXIT_SUCCESS)
+        self.assertIn("up to date", r.out)
+
+    def test_extensions_lists_extensions_without_scanning_software(self):
+        r = self.run_main("--extensions", "--quiet")
+        self.assertEqual(r.code, se.EXIT_SUCCESS)
+        self.assertIn("uBlock Origin", r.out)
+        self.assertIn("Dark Reader", r.out)
+        r.scan_all.assert_not_called()
+
+
+class TestBaselineFileChecks(_MainHarness, unittest.TestCase):
+    """--diff reads and checks the baseline before scanning; bad files give a message, not a traceback."""
+
+    def test_missing_baseline_fails_before_scanning(self):
+        r = self.run_main("--diff", str(self.tmp / "missing.json"))
+        self.assertEqual(r.code, se.EXIT_ERROR)
+        self.assertIn("Baseline file not found", r.err)
+        r.scan_all.assert_not_called()
+
+    def test_invalid_baseline_fails_before_scanning(self):
+        path = self.tmp / "bad.json"
+        path.write_text("{not json", encoding="utf-8")
+        r = self.run_main("--diff", str(path))
+        self.assertEqual(r.code, se.EXIT_ERROR)
+        self.assertIn("Invalid baseline file", r.err)
+        r.scan_all.assert_not_called()
+
+    MALFORMED = {
+        "JSON is a number": "5",
+        "JSON is a list": '["version", "software"]',
+        "version is a number": '{"version": 1.0, "software": []}',
+        "software is an object": '{"version": "1.0", "software": {"a": 1}}',
+        "an entry is text": '{"version": "1.0", "software": ["Chrome"]}',
+        "a name is a list": '{"version": "1.0", "software": [{"name": ["Chrome"]}]}',
+        "a version is true": '{"version": "1.0", "software": [{"name": "Chrome", "version": true}]}',
+        "sources is a number": '{"version": "1.0", "sources": 5, "software": []}',
+        "nested too deeply": "[" * 100_000 + "]" * 100_000,
+        "not UTF-8": b"\xff\xfe{}",
+    }
+
+    def test_malformed_baselines_are_rejected_with_a_message(self):
+        for label, content in self.MALFORMED.items():
+            with self.subTest(label):
+                path = self.tmp / "malformed.json"
+                if isinstance(content, bytes):
+                    path.write_bytes(content)
+                else:
+                    path.write_text(content, encoding="utf-8")
+                r = self.run_main("--diff", str(path), "--quiet")
+                self.assertEqual(r.code, se.EXIT_ERROR)
+                self.assertIn("Invalid baseline file", r.err)
+                self.assertNotIn("Traceback", r.err)
+                r.scan_all.assert_not_called()
+
+    def test_numbers_in_text_fields_are_read_as_text(self):
+        # Baselines from older versions could hold registry DWORD values as numbers
+        path = self.tmp / "old.json"
+        path.write_text(json.dumps({"version": "1.0", "software": [
+            {"name": "Tool", "version": 5, "install_date": 20240101, "publisher": None}]}), encoding="utf-8")
+        software, _ = se.BaselineManager.load_baseline(str(path))
+        self.assertEqual((software[0].version, software[0].install_date, software[0].publisher),
+                         ("5", "20240101", ""))
+        r = self.run_main("--diff", str(path), "--output", "json")
+        self.assertEqual(json.loads(r.out)["summary"]["removed_count"], 1)
+
+    def test_baseline_path_that_is_a_folder(self):
+        r = self.run_main("--diff", str(self.tmp))
+        self.assertEqual(r.code, se.EXIT_ERROR)
+        self.assertIn("is a folder", r.err)
+
+    def test_unreadable_baseline_exits_permission_denied(self):
+        with patch.object(se.BaselineManager, "load_baseline", side_effect=PermissionError(13, "denied")):
+            r = self.run_main("--diff", str(self.tmp / "locked.json"))
+        self.assertEqual(r.code, se.EXIT_PERMISSION_DENIED)
+        self.assertIn("access denied", r.err)
+        r.scan_all.assert_not_called()
+
+    def test_save_into_a_missing_folder(self):
+        r = self.run_main("--save-baseline", str(self.tmp / "no_such_folder" / "b.json"))
+        self.assertEqual(r.code, se.EXIT_ERROR)
+        self.assertIn("folder doesn't exist", r.err)
+
+    def test_save_onto_a_folder(self):
+        r = self.run_main("--save-baseline", str(self.tmp))
+        self.assertEqual(r.code, se.EXIT_ERROR)
+        self.assertIn("is a folder", r.err)
+
+    def test_save_without_access_exits_permission_denied(self):
+        with patch.object(se.BaselineManager, "save_baseline", side_effect=PermissionError(13, "denied")):
+            r = self.run_main("--save-baseline", str(self.tmp / "b.json"))
+        self.assertEqual(r.code, se.EXIT_PERMISSION_DENIED)
+        self.assertIn("access denied", r.err)
+
+    def test_source_names_from_the_baseline_are_sanitized_in_the_mismatch_warning(self):
+        path = self.tmp / "crafted.json"
+        path.write_text(json.dumps({"version": "1.0", "sources": ["store\x1b]0;owned\x07\x1b[2J", "portable"],
+                                    "software": []}), encoding="utf-8")
+        r = self.run_main("--diff", str(path), "--source", "registry", "--quiet")
+        self.assertIn("Source mismatch", r.err)
+        self.assertNotIn("\x1b", r.err)
+        self.assertNotIn("\x07", r.err)
+
+
+class TestUpdateCheckFailures(_MainHarness, unittest.TestCase):
+    """--check-updates never reports "up to date" when winget couldn't answer (exit 3 instead)."""
+
+    WINGET = Path("C:/Users/test/AppData/Local/Microsoft/WindowsApps/winget.exe")
+    TABLE = ("Name           Id             Version  Available  Source\n"
+             "--------------------------------------------------------\n"
+             "Google Chrome  Google.Chrome  142.0    143.0      winget\n"
+             "1 upgrades available.\n")
+
+    def check(self, returncode=0, stdout="", side_effect=None, winget=WINGET):
+        result = __import__("subprocess").CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+        with patch.object(se, "_winget_path", return_value=winget), \
+                patch("subprocess.run", return_value=result, side_effect=side_effect):
+            return self.run_main("--check-updates", "--quiet", real_update_check=True)
+
+    def assert_could_not_check(self, r, reason):
+        self.assertEqual(r.code, se.EXIT_API_FAILURE)
+        self.assertNotIn("up to date", r.out)
+        self.assertIn(f"Could not check for updates: {reason}", r.out)
+
+    def test_winget_not_installed(self):
+        self.assert_could_not_check(self.check(winget=None), "winget was not found")
+
+    def test_winget_times_out(self):
+        import subprocess
+        self.assert_could_not_check(self.check(side_effect=subprocess.TimeoutExpired("winget", 120)),
+                                    "winget timed out")
+
+    def test_winget_cannot_be_started(self):
+        self.assert_could_not_check(self.check(side_effect=OSError("bad image")), "winget could not be run")
+
+    def test_winget_error_exit_code(self):
+        # Windows reports HRESULT exit codes unsigned; accept a signed value too
+        for code in (0x8A15000F, 0x8A15000F - 2**32):
+            with self.subTest(code=code):
+                self.assert_could_not_check(self.check(returncode=code), "winget exited with error code 0x8A15000F")
+
+    def test_nothing_to_upgrade_is_still_up_to_date(self):
+        for code in (0, se.WingetUpdateChecker.WINGET_NO_PACKAGES_FOUND):
+            with self.subTest(code=hex(code)):
+                r = self.check(returncode=code, stdout="No installed package found matching input criteria.\n")
+                self.assertEqual(r.code, se.EXIT_SUCCESS)
+                self.assertIn("up to date", r.out)
+
+    def test_updates_are_listed(self):
+        r = self.check(stdout=self.TABLE)
+        self.assertEqual(r.code, se.EXIT_SUCCESS)
+        self.assertIn("Google.Chrome", r.out)
+
+
+class TestAuditCheckFilters(_MainHarness, unittest.TestCase):
+    """--search / --exclude also filter --check-updates (name, winget ID) and --extensions (name, ID)."""
+
+    def test_search_filters_updates_by_name_or_winget_id(self):
+        for term in ("7-zip", "7ZIP.7zip"):
+            with self.subTest(term):
+                r = self.run_main("--check-updates", "--quiet", "--search", term)
+                self.assertIn("7zip.7zip", r.out)
+                self.assertNotIn("Google.Chrome", r.out)
+
+    def test_exclude_filters_updates(self):
+        r = self.run_main("--check-updates", "--quiet", "--exclude", "google,")
+        self.assertIn("7zip.7zip", r.out)
+        self.assertNotIn("Google.Chrome", r.out)
+
+    def test_search_filters_extensions_by_name_or_id(self):
+        for term in ("dark", "addon@darkreader"):
+            with self.subTest(term):
+                r = self.run_main("--extensions", "--quiet", "--search", term)
+                self.assertIn("Dark Reader", r.out)
+                self.assertNotIn("uBlock Origin", r.out)
+
+    def test_exclude_filters_extensions(self):
+        r = self.run_main("--extensions", "--quiet", "--exclude", "cjpalhdlnbpafiamejdnhcphjbkeiagm")
+        self.assertIn("Dark Reader", r.out)
+        self.assertNotIn("uBlock Origin", r.out)
+
+    def test_filters_are_literal_not_regex(self):
+        r = self.run_main("--check-updates", "--quiet", "--search", ".*")   # nothing contains ".*"
+        self.assertIn("None of the 2 available update(s) match", r.out)
+
+    def test_updates_hidden_by_a_filter_are_not_called_up_to_date(self):
+        r = self.run_main("--check-updates", "--quiet", "--exclude", "google,7-zip")
+        self.assertNotIn("up to date", r.out)
+        self.assertIn("None of the 2 available update(s) match --search / --exclude", r.out)
+
+    def test_extensions_hidden_by_a_filter_are_reported_as_such(self):
+        r = self.run_main("--extensions", "--quiet", "--search", "no-such-extension")
+        self.assertNotIn("No browser extensions found", r.out)
+        self.assertIn("None of the 2 browser extension(s) match --search / --exclude", r.out)
+
+
+class TestCombinedAudit(_MainHarness, unittest.TestCase):
+    """--check-updates, --extensions and --check-vulns together: all run, in a fixed order."""
+
+    ALL_THREE = ("--check-updates", "--extensions", "--check-vulns")
+
+    def assert_all_ran_in_order(self, r):
+        r.check_updates.assert_called_once()
+        r.get_extensions.assert_called_once()
+        self.assertTrue(r.nvd.urls, "the CVE check made no NVD request")
+        positions = [r.out.find(heading) for heading in
+                     ("AVAILABLE UPDATES (winget)", "BROWSER EXTENSIONS", "VULNERABILITY SCAN RESULTS")]
+        self.assertNotIn(-1, positions, r.out)
+        self.assertEqual(positions, sorted(positions))
+
+    def test_readme_combined_audit_runs_every_check(self):
+        r = self.run_main(*self.ALL_THREE, "--quiet")
+        self.assertEqual(r.code, se.EXIT_SUCCESS)
+        self.assert_all_ran_in_order(r)
+        self.assertIn("Google.Chrome", r.out)
+        self.assertIn("uBlock Origin", r.out)
+
+    def test_order_on_the_command_line_does_not_matter(self):
+        r = self.run_main(*reversed(self.ALL_THREE), "--quiet")
+        self.assert_all_ran_in_order(r)
+
+    def test_an_incomplete_cve_check_gives_exit_3_after_the_other_checks(self):
+        import urllib.error
+        r = self.run_main(*self.ALL_THREE, "--quiet", nvd_pages=[urllib.error.URLError("down")])
+        self.assertEqual(r.code, se.EXIT_API_FAILURE)
+        self.assert_all_ran_in_order(r)
+
+    def test_a_failed_update_check_does_not_stop_the_others(self):
+        with patch.object(se, "_winget_path", return_value=None):
+            r = self.run_main(*self.ALL_THREE, "--quiet", real_update_check=True)
+        self.assertEqual(r.code, se.EXIT_API_FAILURE)
+        self.assertIn("Could not check for updates", r.out)
+        self.assertIn("uBlock Origin", r.out)
+        self.assertIn("VULNERABILITY SCAN RESULTS", r.out)
+
+    def test_two_checks(self):
+        r = self.run_main("--extensions", "--check-updates", "--quiet")
+        self.assertEqual(r.code, se.EXIT_SUCCESS)
+        self.assertLess(r.out.find("AVAILABLE UPDATES"), r.out.find("BROWSER EXTENSIONS"))
+        r.scan_all.assert_not_called()
+
+    def test_a_single_check_has_no_extra_heading(self):
+        r = self.run_main("--check-updates", "--quiet")
+        self.assertNotIn("AVAILABLE UPDATES (winget)", r.out)
+        r = self.run_main("--extensions", "--quiet")
+        self.assertNotIn("BROWSER EXTENSIONS", r.out)
+
+
+class TestRefusedCombinations(_MainHarness, unittest.TestCase):
+    """Options that would be ignored are refused before anything is scanned (usage error, exit 2)."""
+
+    def assert_refused(self, *argv, message):
+        r = self.run_main(*argv)
+        self.assertEqual(r.code, 2, r.err)            # argparse usage error
+        self.assertIn(message, r.err)
+        r.scan_all.assert_not_called()
+        r.check_updates.assert_not_called()
+        r.get_extensions.assert_not_called()
+        self.assertEqual(r.nvd.urls, [])
+        return r
+
+    def test_an_audit_check_with_save_baseline(self):
+        path = self.tmp / "b.json"
+        for check in ("--check-updates", "--extensions", "--check-vulns"):
+            with self.subTest(check):
+                self.assert_refused(check, "--save-baseline", str(path),
+                                    message=f"{check} can't be combined with --save-baseline")
+                self.assertFalse(path.exists())
+
+    def test_an_audit_check_with_diff(self):
+        baseline = self.save_baseline(self.SOFTWARE)
+        self.assert_refused("--check-updates", "--extensions", "--diff", str(baseline),
+                            message="--check-updates --extensions can't be combined with --diff")
+
+    def test_diff_with_save_baseline(self):
+        path = self.tmp / "new.json"
+        self.assert_refused("--diff", str(self.save_baseline(self.SOFTWARE)), "--save-baseline", str(path),
+                            message="--diff and --save-baseline can't be combined")
+        self.assertFalse(path.exists())
+
+    def test_json_or_csv_output_with_an_audit_check(self):
+        for output in ("json", "csv"):
+            with self.subTest(output):
+                self.assert_refused("--check-updates", "--output", output,
+                                    message=f"--output {output} isn't available for --check-updates yet")
+
+    def test_table_output_with_an_audit_check_is_fine(self):
+        r = self.run_main("--check-updates", "--output", "table", "--quiet")
+        self.assertEqual(r.code, se.EXIT_SUCCESS)
+
+
+class TestDiffExitCode(_MainHarness, unittest.TestCase):
+    """--diff exits 5 when anything changed, 0 when nothing did, in every output format."""
+
+    def test_changes_found_exit_code(self):
+        path = self.save_baseline(self.SOFTWARE[:2])           # 7-Zip installed since
+        for output in ("table", "json", "csv"):
+            with self.subTest(output):
+                r = self.run_main("--diff", str(path), "--output", output, "--quiet")
+                self.assertEqual(r.code, se.EXIT_CHANGES_FOUND)
+
+    def test_no_changes_exit_code(self):
+        path = self.save_baseline(self.SOFTWARE)
+        for output in ("table", "json", "csv"):
+            with self.subTest(output):
+                r = self.run_main("--diff", str(path), "--output", output, "--quiet")
+                self.assertEqual(r.code, se.EXIT_SUCCESS)
+
+
+class TestBaselineFilters(_MainHarness, unittest.TestCase):
+    """--search / --exclude with baselines: --diff filters both sides alike."""
+
+    def diff_summary(self, *argv, baseline=None):
+        path = self.save_baseline(self.SOFTWARE if baseline is None else baseline)
+        r = self.run_main("--diff", str(path), "--output", "json", *argv)
+        return json.loads(r.out)["summary"]
+
+    def test_excluded_programs_are_not_reported_as_removed(self):
+        summary = self.diff_summary("--exclude", "redistributable")
+        self.assertEqual(summary["total_changes"], 0, summary)
+
+    def test_programs_outside_the_search_are_not_reported_as_removed(self):
+        summary = self.diff_summary("--search", "chrome")
+        self.assertEqual(summary["total_changes"], 0, summary)
+
+    def test_changes_inside_the_filter_are_still_found(self):
+        chrome, redist, seven_zip = self.SOFTWARE
+        old_chrome = se.SoftwareInfo(name=chrome.name, version="141.0", publisher=chrome.publisher)
+        summary = self.diff_summary("--search", "chrome", baseline=[old_chrome, redist])
+        self.assertEqual((summary["changed_count"], summary["total_changes"]), (1, 1), summary)
+
+    def test_saving_a_filtered_baseline_is_refused(self):
+        for option in (["--search", "chrome"], ["--exclude", "redistributable"]):
+            with self.subTest(option[0]):
+                path = self.tmp / "filtered.json"
+                r = self.run_main("--save-baseline", str(path), *option)
+                self.assertEqual(r.code, 2)   # argparse usage error
+                self.assertIn("use them with --diff instead", r.err)
+                self.assertFalse(path.exists())
+                r.scan_all.assert_not_called()
+
+    def test_existing_file_is_not_replaced(self):
+        path = self.tmp / "notes.txt"
+        path.write_text("keep me\n", encoding="utf-8")
+        r = self.run_main("--save-baseline", str(path), "--quiet")
+        self.assertEqual(r.code, se.EXIT_ERROR)
+        self.assertIn("already exists; use --overwrite", r.err)
+        self.assertEqual(path.read_text(encoding="utf-8"), "keep me\n")
+
+    def test_overwrite_replaces_an_existing_file(self):
+        path = self.save_baseline(self.SOFTWARE[:1])
+        r = self.run_main("--save-baseline", str(path), "--overwrite", "--quiet")
+        self.assertEqual(r.code, se.EXIT_SUCCESS)
+        self.assertEqual(len(se.BaselineManager.load_baseline(str(path))[0]), len(self.SOFTWARE))
+
+    def test_overwrite_without_save_baseline_is_refused(self):
+        r = self.run_main("--overwrite", "--quiet")
+        self.assertEqual(r.code, 2)
+        self.assertIn("--overwrite only applies to --save-baseline", r.err)
+        r.scan_all.assert_not_called()
+
+    def test_empty_exclude_terms_are_not_a_filter(self):
+        path = self.tmp / "full.json"
+        r = self.run_main("--save-baseline", str(path), "--exclude", " , ", "--quiet")
+        self.assertEqual(r.code, se.EXIT_SUCCESS)
+        self.assertEqual(len(se.BaselineManager.load_baseline(str(path))[0]), len(self.SOFTWARE))
+
+
 class TestAllVersionsCves(unittest.TestCase):
     """CVEs NVD records for every version of a product (no version info) are listed apart, not counted."""
 
@@ -1426,8 +1933,9 @@ class TestBaselineManagerRoundtrip(unittest.TestCase):
         """Saved baseline should load back with identical software data."""
         original = [self._make_software("App1", "1.0"),
                     self._make_software("App2", "2.0")]
+        # setUp already created the (empty) file, so replace it
         se.BaselineManager.save_baseline(original, self.temp_file.name,
-                                         sources=["registry"])
+                                         sources=["registry"], overwrite=True)
         loaded, metadata = se.BaselineManager.load_baseline(self.temp_file.name)
         self.assertEqual(len(loaded), 2)
         self.assertEqual(loaded[0].name, "App1")
@@ -2048,6 +2556,7 @@ class TestExecutableResolution(unittest.TestCase):
              patch.object(sys, "argv", ["Software_Enumerator.py", "--check-updates", "--quiet"]), \
              patch.object(se, "setup_logging"), patch.object(se, "_load_env_file"):
             checker.return_value.check_for_updates.return_value = []
+            checker.return_value.error = None          # the check completed
             se.main()
         harden.assert_called_once()
 
@@ -2719,10 +3228,12 @@ class TestExitCodes(unittest.TestCase):
         self.assertEqual(se.EXIT_NO_SOFTWARE, 2)
         self.assertEqual(se.EXIT_API_FAILURE, 3)
         self.assertEqual(se.EXIT_PERMISSION_DENIED, 4)
+        self.assertEqual(se.EXIT_CHANGES_FOUND, 5)
 
     def test_exit_codes_are_distinct(self):
         """All exit codes should be unique values."""
-        codes = [se.EXIT_SUCCESS, se.EXIT_ERROR, se.EXIT_NO_SOFTWARE, se.EXIT_API_FAILURE, se.EXIT_PERMISSION_DENIED]
+        codes = [se.EXIT_SUCCESS, se.EXIT_ERROR, se.EXIT_NO_SOFTWARE, se.EXIT_API_FAILURE, se.EXIT_PERMISSION_DENIED,
+                 se.EXIT_CHANGES_FOUND]
         self.assertEqual(len(codes), len(set(codes)))
 
 

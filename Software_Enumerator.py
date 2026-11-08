@@ -44,8 +44,9 @@ logger = logging.getLogger("software_enumerator")
 EXIT_SUCCESS = 0
 EXIT_ERROR = 1
 EXIT_NO_SOFTWARE = 2
-EXIT_API_FAILURE = 3
+EXIT_API_FAILURE = 3        # an online check (NVD, winget) couldn't complete: results incomplete
 EXIT_PERMISSION_DENIED = 4
+EXIT_CHANGES_FOUND = 5      # --diff: programs were added, removed or changed since the baseline
 
 
 def setup_console_encoding():
@@ -801,6 +802,15 @@ class UpdateInfo:
     available_version: str
     winget_id: str = ""
 
+    def matches_search(self, search_term: str) -> bool:
+        """--search: literal, case-insensitive match on name or winget ID."""
+        term = search_term.lower()
+        return term in self.name.lower() or term in self.winget_id.lower()
+
+    def matches_exclude(self, exclude_term: str) -> bool:
+        """--exclude: same fields as --search."""
+        return self.matches_search(exclude_term)
+
 
 @dataclass
 class BrowserExtensionInfo:
@@ -843,6 +853,15 @@ class BrowserExtensionInfo:
         "geolocation",
         "contentSettings",
     ]
+
+    def matches_search(self, search_term: str) -> bool:
+        """--search: literal, case-insensitive match on name or extension ID."""
+        term = search_term.lower()
+        return term in self.name.lower() or term in self.extension_id.lower()
+
+    def matches_exclude(self, exclude_term: str) -> bool:
+        """--exclude: same fields as --search."""
+        return self.matches_search(exclude_term)
 
     def has_sensitive_permissions(self) -> bool:
         """Check if extension has potentially dangerous permissions."""
@@ -1414,13 +1433,25 @@ class PortableAppScanner:
 class WingetUpdateChecker:
     """Checks for available software updates using winget."""
 
+    # winget's APPINSTALLER_CLI_ERROR_NO_APPLICATIONS_FOUND: in list mode it means winget
+    # matched no installed package at all, so there is nothing to upgrade. winget's list
+    # mode otherwise exits 0, with or without upgrades (failed sources are only warnings).
+    WINGET_NO_PACKAGES_FOUND = 0x8A150014
+
+    def __init__(self):
+        # Why the last check couldn't be completed, or None. An empty update list on its
+        # own doesn't say whether everything is up to date or winget never answered.
+        self.error: Optional[str] = None
+
     def check_for_updates(self) -> list[UpdateInfo]:
-        """Query winget for available updates."""
+        """Query winget for available updates. On failure, self.error says why."""
         updates = []
+        self.error = None
 
         winget = _winget_path()
         if winget is None:
             print("Warning: winget not found. Please ensure Windows Package Manager is installed.", file=sys.stderr)
+            self.error = "winget was not found"
             return updates
 
         try:
@@ -1445,13 +1476,21 @@ class WingetUpdateChecker:
             # Parse the output (winget outputs a table format)
             updates = self._parse_winget_output(result.stdout)
 
+            exit_code = result.returncode & 0xFFFFFFFF   # winget's codes are HRESULTs
+            if exit_code not in (0, self.WINGET_NO_PACKAGES_FOUND):
+                print(f"Warning: winget reported an error (exit code 0x{exit_code:08X}).", file=sys.stderr)
+                self.error = f"winget exited with error code 0x{exit_code:08X}"
+
         except subprocess.TimeoutExpired:
             print("Warning: winget command timed out.", file=sys.stderr)
+            self.error = "winget timed out"
         except FileNotFoundError:
             print("Warning: winget not found. Please ensure Windows Package Manager is installed.", file=sys.stderr)
+            self.error = "winget was not found"
         except OSError as e:
             logger.debug(f"Failed to check for updates: {e}")
             print("Warning: Failed to check for updates.", file=sys.stderr)
+            self.error = "winget could not be run"
 
         return updates
 
@@ -2743,14 +2782,7 @@ class SoftwareEnumerator:
         exclude_terms: list[str] = None
     ) -> list[SoftwareInfo]:
         """Filter software list by search term and exclusion patterns."""
-        if search_term:
-            software_list = [s for s in software_list if s.matches_search(search_term)]
-        if exclude_terms:
-            software_list = [
-                s for s in software_list
-                if not any(s.matches_exclude(term) for term in exclude_terms)
-            ]
-        return software_list
+        return _apply_filters(software_list, search_term, exclude_terms)
 
     def sort_results(
         self, software_list: list[SoftwareInfo], sort_by: str = "name"
@@ -2920,14 +2952,24 @@ class BaselineManager:
     BASELINE_VERSION = "1.0"
 
     @staticmethod
-    def save_baseline(software_list: list[SoftwareInfo], filepath: str, sources: list[str] = None) -> None:
+    def save_baseline(software_list: list[SoftwareInfo], filepath: str, sources: list[str] = None,
+                      overwrite: bool = False) -> None:
         """Save current software state as a baseline.
 
         Args:
             software_list: Current list of installed software
             filepath: Path to save baseline file
             sources: List of sources used (e.g., ["registry", "store", "portable"])
+            overwrite: Replace the file if it exists (otherwise an existing file is kept)
+
+        Raises:
+            FileExistsError: If the file exists and overwrite is False
+            IsADirectoryError: If the path is a folder
+            OSError: If the file can't be written (PermissionError when access is denied)
         """
+        if os.path.isdir(filepath):
+            raise IsADirectoryError(filepath)
+
         baseline = {
             "version": BaselineManager.BASELINE_VERSION,
             "created_at": datetime.now().isoformat(),
@@ -2938,7 +2980,9 @@ class BaselineManager:
             "software": [asdict(s) for s in software_list]
         }
 
-        with open(filepath, "w", encoding="utf-8") as f:
+        # "x" creates the file only if it doesn't exist yet, in one step, so nothing can
+        # appear between a check and the write
+        with open(filepath, "w" if overwrite else "x", encoding="utf-8") as f:
             json.dump(baseline, f, indent=2, ensure_ascii=False)
 
         log_audit_event("BASELINE_SAVE", f"Baseline saved", file=filepath, count=len(software_list))
@@ -2955,8 +2999,13 @@ class BaselineManager:
 
         Raises:
             FileNotFoundError: If baseline file doesn't exist
+            IsADirectoryError: If the path is a folder
+            OSError: If the file can't be read (PermissionError when access is denied)
             ValueError: If baseline format is invalid or incompatible version
         """
+        if os.path.isdir(filepath):
+            raise IsADirectoryError(filepath)
+
         # Guard against excessively large baseline files (max 50 MB)
         file_size = os.path.getsize(filepath)
         max_baseline_size = 50 * 1024 * 1024
@@ -2967,13 +3016,20 @@ class BaselineManager:
             )
 
         with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            try:
+                data = json.load(f)
+            except RecursionError:
+                raise ValueError("Invalid baseline format: nested too deeply") from None
 
-        if "version" not in data or "software" not in data:
+        # The file is untrusted input: check its shape before using it, so a malformed
+        # file gives a clear error instead of a crash
+        if not isinstance(data, dict) or "version" not in data or "software" not in data:
             raise ValueError("Invalid baseline format: missing required fields")
 
         # Validate baseline version compatibility
-        baseline_version = data.get("version", "")
+        baseline_version = data["version"]
+        if not isinstance(baseline_version, str):
+            raise ValueError("Invalid baseline format: the version must be text")
         if not baseline_version.startswith("1."):
             raise ValueError(
                 f"Incompatible baseline version: {baseline_version}. "
@@ -2981,36 +3037,59 @@ class BaselineManager:
                 f"Please create a new baseline with the current tool version."
             )
 
+        entries = data["software"]
+        if not isinstance(entries, list):
+            raise ValueError("Invalid baseline format: 'software' must be a list")
+
         # Guard against excessively large baselines
         max_baseline_entries = 50_000
-        entry_count = len(data.get("software", []))
+        entry_count = len(entries)
         if entry_count > max_baseline_entries:
             raise ValueError(
                 f"Baseline contains {entry_count} entries, exceeding the "
                 f"maximum of {max_baseline_entries}."
             )
 
+        sources = data.get("sources", [])
+        if not isinstance(sources, list) or not all(isinstance(s, str) for s in sources):
+            raise ValueError("Invalid baseline format: 'sources' must be a list of text")
+
+        # A malformed entry rejects the whole file: skipping it would make that program
+        # show up as added or removed, which is worse than no comparison
         software_list = []
-        for item in data["software"]:
-            software_list.append(SoftwareInfo(
-                name=item.get("name", ""),
-                version=item.get("version", ""),
-                publisher=item.get("publisher", ""),
-                install_date=item.get("install_date", ""),
-                source=item.get("source", ""),
-                install_location=item.get("install_location", ""),
-            ))
+        for number, item in enumerate(entries, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"Invalid baseline format: entry {number} is not an object")
+            software_list.append(SoftwareInfo(**{
+                key: BaselineManager._entry_text(item.get(key), number, key)
+                for key in ("name", "version", "publisher", "install_date", "source", "install_location")
+            }))
 
         metadata = {
             "version": data.get("version"),
             "created_at": data.get("created_at"),
             "hostname": data.get("hostname"),
             "user": data.get("user"),
-            "sources": data.get("sources", []),
+            "sources": sources,
             "software_count": data.get("software_count"),
         }
 
         return software_list, metadata
+
+    @staticmethod
+    def _entry_text(value, number: int, key: str) -> str:
+        """A text field of a baseline entry: text as is, numbers as text, missing or null empty.
+
+        Numbers are accepted because baselines saved by older versions can hold them (registry
+        DWORD values used to be stored unconverted). Anything else rejects the file.
+        """
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)
+        raise ValueError(f"Invalid baseline format: entry {number} has a {key} that isn't text")
 
     @staticmethod
     def _normalize_name(name: str) -> str:
@@ -3207,6 +3286,168 @@ def _parse_exclude_terms(value: Optional[str]) -> Optional[list[str]]:
     return terms or None
 
 
+def _apply_filters(items: list, search_term: Optional[str], exclude_terms: Optional[list[str]]) -> list:
+    """Keep the items that match --search and none of the --exclude terms.
+
+    Works for any item with matches_search() / matches_exclude() (programs, updates,
+    extensions); the matching itself is literal and case-insensitive, never a regex.
+    """
+    if search_term:
+        items = [i for i in items if i.matches_search(search_term)]
+    if exclude_terms:
+        items = [i for i in items if not any(i.matches_exclude(term) for term in exclude_terms)]
+    return items
+
+
+def _run_update_check(args: argparse.Namespace) -> bool:
+    """--check-updates: list available updates via winget. Returns False if winget didn't answer."""
+    log_audit_event("SCAN_START", "Update check via winget", mode="check-updates")
+    if not args.quiet:
+        spinner = Spinner("Checking for updates via winget")
+        spinner.spin()
+
+    update_checker = WingetUpdateChecker()
+    all_updates = update_checker.check_for_updates()
+    updates = _apply_filters(all_updates, args.search, _parse_exclude_terms(args.exclude))
+
+    if not args.quiet:
+        spinner.finish("Update check failed" if update_checker.error
+                       else f"Found {len(updates)} available updates")
+    log_audit_event("SCAN_END", "Update check completed", updates_found=len(updates),
+                    failed=bool(update_checker.error))
+    if not args.quiet:
+        print(file=sys.stderr)
+    if update_checker.error:
+        # Never "All software is up to date" when winget didn't answer
+        print(f"Could not check for updates: {update_checker.error}.")
+        if updates:
+            print("Updates winget listed before the error (the list may be incomplete):")
+            update_checker.display_updates_table(updates)
+        return False
+    if all_updates and not updates:
+        # Not "up to date": the filters hid the updates there are
+        print(f"None of the {len(all_updates)} available update(s) match --search / --exclude.")
+    else:
+        update_checker.display_updates_table(updates)
+    return True
+
+
+def _run_extension_scan(args: argparse.Namespace) -> bool:
+    """--extensions: list browser extensions and flag sensitive permissions. Always completes."""
+    log_audit_event("SCAN_START", "Browser extension scan", mode="extensions")
+    if not args.quiet:
+        spinner = Spinner("Scanning browser extensions")
+        spinner.spin("Chrome, Edge, Firefox...")
+
+    extension_scanner = BrowserExtensionScanner()
+    all_extensions = extension_scanner.get_all_extensions()
+    extensions = _apply_filters(all_extensions, args.search, _parse_exclude_terms(args.exclude))
+
+    if not args.quiet:
+        spinner.finish(f"Found {len(extensions)} extensions")
+    sensitive_count = sum(1 for e in extensions if e.has_sensitive_permissions())
+    log_audit_event(
+        "SCAN_END",
+        "Browser extension scan completed",
+        extensions_found=len(extensions),
+        sensitive_permissions=sensitive_count,
+    )
+    if not args.quiet:
+        print(file=sys.stderr)
+    if all_extensions and not extensions:
+        print(f"None of the {len(all_extensions)} browser extension(s) match --search / --exclude.")
+    else:
+        extension_scanner.display_extensions_table(extensions)
+    return True
+
+
+def _run_cve_check(args: argparse.Namespace) -> bool:
+    """--check-vulns: ask NVD about installed programs. Returns False if some couldn't be checked."""
+    log_audit_event("SCAN_START", "Vulnerability scan via NVD", mode="check-vulns")
+    if not args.quiet:
+        print("Scanning for known vulnerabilities (CVEs)...", file=sys.stderr)
+        print("This may take a while due to API rate limits.\n", file=sys.stderr)
+
+    # Registry by default (the most reliable versions); --source chooses others
+    vuln_sources = (["registry", "store", "portable"] if args.source == "all"
+                    else [args.source or "registry"])
+    enumerator = SoftwareEnumerator()
+    software_list = enumerator.scan_all(vuln_sources, show_progress=not args.quiet)
+    software_list = enumerator.filter_results(software_list, args.search, _parse_exclude_terms(args.exclude))
+    if not args.quiet:
+        print(file=sys.stderr)
+
+    vuln_scanner = VulnerabilityScanner(api_key=args.nvd_api_key)
+    plan = vuln_scanner.plan_scan(software_list, limit=args.cve_limit)
+
+    progress_callback = None
+    if not args.quiet:
+        progress = ProgressBar(total=len(plan.targets), prefix="CVE Check")
+
+        def progress_callback(current, total, name):
+            progress.update(current, name)
+            logger.debug(f"Scanning for CVEs: {name}")
+
+    results = vuln_scanner.scan_plan(plan, progress_callback=progress_callback)
+    if not args.quiet:
+        progress.finish("Complete")
+
+    total_cves = sum(r.total_count for r in results)
+    critical_count = sum(r.critical_count for r in results)
+    log_audit_event(
+        "SCAN_END",
+        "Vulnerability scan completed",
+        software_scanned=len(plan.targets),
+        not_checked=len(plan.unmapped) + plan.no_version + plan.over_limit,
+        cves_found=total_cves,
+        critical_cves=critical_count,
+        failed=sum(1 for r in results if r.error),
+    )
+
+    if not args.quiet:
+        print(file=sys.stderr)
+    vuln_scanner.display_results(results, plan)
+    # Incomplete results: scripts must not read them as "no CVEs"
+    return not any(r.error for r in results)
+
+
+# The audit checks, in the order they run: (option attribute, section heading when more
+# than one runs, runner). The CVE report prints its own heading.
+_AUDIT_CHECKS = [
+    ("check_updates", "AVAILABLE UPDATES (winget)", _run_update_check),
+    ("extensions", "BROWSER EXTENSIONS", _run_extension_scan),
+    ("check_vulns", None, _run_cve_check),
+]
+
+
+def _check_option_combinations(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Refuse option combinations that would be ignored or give misleading results.
+
+    Runs before anything is scanned. parser.error() prints the message and exits with
+    argparse's usage-error code. (Refusing now leaves room to support a combination
+    later; silently ignoring an option is harder to take back.)
+    """
+    if args.save_baseline and (args.search or _parse_exclude_terms(args.exclude)):
+        parser.error("--save-baseline saves a full snapshot, so it can't be combined with "
+                     "--search or --exclude; use them with --diff instead")
+    if args.overwrite and not args.save_baseline:
+        parser.error("--overwrite only applies to --save-baseline")
+
+    # The audit checks combine with each other; the software list, --save-baseline and
+    # --diff each run on their own (main() would otherwise skip all but one of them)
+    checks = [option for option, given in (("--check-updates", args.check_updates),
+                                           ("--extensions", args.extensions),
+                                           ("--check-vulns", args.check_vulns)) if given]
+    if checks and (args.diff or args.save_baseline):
+        parser.error(f"{' '.join(checks)} can't be combined with "
+                     f"{'--diff' if args.diff else '--save-baseline'}; run them separately")
+    if args.diff and args.save_baseline:
+        parser.error("--diff and --save-baseline can't be combined; run them separately")
+    if checks and args.output != "table":
+        parser.error(f"--output {args.output} isn't available for {' '.join(checks)} yet; "
+                     "they print tables only")
+
+
 def main():
     """Main entry point for the CLI."""
     _harden_process_environment()
@@ -3231,6 +3472,7 @@ Examples:
   %(prog)s --check-updates          Check for available updates via winget
   %(prog)s --extensions             List browser extensions (Chrome, Edge, Firefox)
   %(prog)s --check-vulns            Check for known CVEs in installed software
+  %(prog)s --check-updates --extensions --check-vulns  Run all three checks, in this order
         """,
     )
 
@@ -3244,13 +3486,15 @@ Examples:
     parser.add_argument(
         "--search",
         type=str,
-        help="Search/filter results by name, publisher, or version",
+        help="Search/filter results by name, publisher, or version "
+             "(updates: name or winget ID; extensions: name or extension ID)",
     )
 
     parser.add_argument(
         "--exclude",
         type=str,
-        help="Exclude software matching patterns (comma-separated, e.g. 'redistributable,.NET Runtime')",
+        help="Exclude software matching patterns (comma-separated, e.g. 'redistributable,.NET Runtime'); "
+             "matches name or publisher (updates: name or winget ID; extensions: name or extension ID)",
     )
 
     parser.add_argument(
@@ -3272,6 +3516,12 @@ Examples:
         type=str,
         metavar="FILE",
         help="Save current software state as a baseline JSON file",
+    )
+
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Let --save-baseline replace an existing file",
     )
 
     parser.add_argument(
@@ -3334,6 +3584,7 @@ Examples:
     )
 
     args = parser.parse_args()
+    _check_option_combinations(parser, args)
 
     # Setup logging before any operations
     try:
@@ -3356,96 +3607,21 @@ Examples:
         hostname=os.environ.get("COMPUTERNAME", "unknown"),
     )
 
-    # Handle update checking mode
-    if args.check_updates:
-        log_audit_event("SCAN_START", "Update check via winget", mode="check-updates")
-        if not args.quiet:
-            spinner = Spinner("Checking for updates via winget")
-            spinner.spin()
-
-        update_checker = WingetUpdateChecker()
-        updates = update_checker.check_for_updates()
-
-        if not args.quiet:
-            spinner.finish(f"Found {len(updates)} available updates")
-        log_audit_event("SCAN_END", "Update check completed", updates_found=len(updates))
-        if not args.quiet:
-            print(file=sys.stderr)
-        update_checker.display_updates_table(updates)
-        return
-
-    # Handle browser extensions mode
-    if args.extensions:
-        log_audit_event("SCAN_START", "Browser extension scan", mode="extensions")
-        if not args.quiet:
-            spinner = Spinner("Scanning browser extensions")
-            spinner.spin("Chrome, Edge, Firefox...")
-
-        extension_scanner = BrowserExtensionScanner()
-        extensions = extension_scanner.get_all_extensions()
-
-        if not args.quiet:
-            spinner.finish(f"Found {len(extensions)} extensions")
-        sensitive_count = sum(1 for e in extensions if e.has_sensitive_permissions())
-        log_audit_event(
-            "SCAN_END",
-            "Browser extension scan completed",
-            extensions_found=len(extensions),
-            sensitive_permissions=sensitive_count,
-        )
-        if not args.quiet:
-            print(file=sys.stderr)
-        extension_scanner.display_extensions_table(extensions)
-        return
-
-    # Handle vulnerability scanning mode
-    if args.check_vulns:
-        log_audit_event("SCAN_START", "Vulnerability scan via NVD", mode="check-vulns")
-        if not args.quiet:
-            print("Scanning for known vulnerabilities (CVEs)...", file=sys.stderr)
-            print("This may take a while due to API rate limits.\n", file=sys.stderr)
-
-        # Registry by default (the most reliable versions); --source chooses others
-        vuln_sources = (["registry", "store", "portable"] if args.source == "all"
-                        else [args.source or "registry"])
-        enumerator = SoftwareEnumerator()
-        software_list = enumerator.scan_all(vuln_sources, show_progress=not args.quiet)
-        software_list = enumerator.filter_results(software_list, args.search, _parse_exclude_terms(args.exclude))
-        if not args.quiet:
-            print(file=sys.stderr)
-
-        vuln_scanner = VulnerabilityScanner(api_key=args.nvd_api_key)
-        plan = vuln_scanner.plan_scan(software_list, limit=args.cve_limit)
-
-        progress_callback = None
-        if not args.quiet:
-            progress = ProgressBar(total=len(plan.targets), prefix="CVE Check")
-
-            def progress_callback(current, total, name):
-                progress.update(current, name)
-                logger.debug(f"Scanning for CVEs: {name}")
-
-        results = vuln_scanner.scan_plan(plan, progress_callback=progress_callback)
-        if not args.quiet:
-            progress.finish("Complete")
-
-        total_cves = sum(r.total_count for r in results)
-        critical_count = sum(r.critical_count for r in results)
-        log_audit_event(
-            "SCAN_END",
-            "Vulnerability scan completed",
-            software_scanned=len(plan.targets),
-            not_checked=len(plan.unmapped) + plan.no_version + plan.over_limit,
-            cves_found=total_cves,
-            critical_cves=critical_count,
-            failed=sum(1 for r in results if r.error),
-        )
-
-        if not args.quiet:
-            print(file=sys.stderr)
-        vuln_scanner.display_results(results, plan)
-        if any(r.error for r in results):
-            # Results are incomplete; scripts must not read this as "no CVEs"
+    # Audit checks: run every one that was asked for, in a fixed order (the quick ones first,
+    # the slow NVD check last). If any couldn't complete, exit 3: results are incomplete.
+    requested = [check for check in _AUDIT_CHECKS if getattr(args, check[0])]
+    if requested:
+        complete = True
+        for index, (_, heading, run_check) in enumerate(requested):
+            if len(requested) > 1:
+                if index:
+                    print()
+                if heading:
+                    print("=" * 80)
+                    print(heading)
+                    print("=" * 80)
+            complete = run_check(args) and complete
+        if not complete:
             sys.exit(EXIT_API_FAILURE)
         return
 
@@ -3454,6 +3630,28 @@ Examples:
         sources = ["registry", "store", "portable"]
     else:
         sources = [args.source]
+
+    # Read the baseline before scanning, so a wrong path or a bad file fails at once
+    # instead of after a full scan
+    if args.diff:
+        shown_path = sanitize_output(args.diff)
+        try:
+            baseline_list, baseline_metadata = BaselineManager.load_baseline(args.diff)
+        except FileNotFoundError:
+            print(f"Error: Baseline file not found: {shown_path}", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
+        except IsADirectoryError:
+            print(f"Error: {shown_path} is a folder, not a baseline file", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
+        except PermissionError:
+            print(f"Error: cannot read the baseline file (access denied): {shown_path}", file=sys.stderr)
+            sys.exit(EXIT_PERMISSION_DENIED)
+        except OSError:
+            print(f"Error: cannot read the baseline file: {shown_path}", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
+        except ValueError as e:   # also invalid JSON and invalid UTF-8
+            print(f"Error: Invalid baseline file: {sanitize_output(str(e))}", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
 
     # Run enumeration
     log_audit_event(
@@ -3480,45 +3678,43 @@ Examples:
 
     # Handle baseline diff mode
     if args.diff:
-        try:
-            baseline_list, baseline_metadata = BaselineManager.load_baseline(args.diff)
+        # Warn if sources don't match
+        baseline_sources = set(baseline_metadata.get("sources", []))
+        current_sources = set(sources)
+        if baseline_sources and baseline_sources != current_sources:
+            print("WARNING: Source mismatch detected!", file=sys.stderr)
+            # The names come from the baseline file (untrusted), so sanitize them
+            print(f"  Baseline sources: {sanitize_output(', '.join(sorted(baseline_sources))) or 'unknown'}",
+                  file=sys.stderr)
+            print(f"  Current sources:  {', '.join(sorted(current_sources))}", file=sys.stderr)
+            print("  Results may include false positives. Consider using matching --source options.", file=sys.stderr)
+            print(file=sys.stderr)
 
-            # Warn if sources don't match
-            baseline_sources = set(baseline_metadata.get("sources", []))
-            current_sources = set(sources)
-            if baseline_sources and baseline_sources != current_sources:
-                print("WARNING: Source mismatch detected!", file=sys.stderr)
-                print(f"  Baseline sources: {', '.join(sorted(baseline_sources)) or 'unknown'}", file=sys.stderr)
-                print(f"  Current sources:  {', '.join(sorted(current_sources))}", file=sys.stderr)
-                print("  Results may include false positives. Consider using matching --source options.", file=sys.stderr)
-                print(file=sys.stderr)
+        # --search / --exclude choose what is compared, so apply them to the baseline too;
+        # otherwise every program they leave out of the current scan would look removed
+        baseline_list = enumerator.filter_results(baseline_list, args.search, exclude_terms)
+        diff = BaselineManager.compare(baseline_list, software_list)
 
-            diff = BaselineManager.compare(baseline_list, software_list)
+        log_audit_event(
+            "BASELINE_DIFF",
+            "Baseline comparison completed",
+            baseline_file=args.diff,
+            added=len(diff.added),
+            removed=len(diff.removed),
+            changed=len(diff.changed),
+        )
 
-            log_audit_event(
-                "BASELINE_DIFF",
-                "Baseline comparison completed",
-                baseline_file=args.diff,
-                added=len(diff.added),
-                removed=len(diff.removed),
-                changed=len(diff.changed),
-            )
+        # Output diff in requested format
+        if args.output == "json":
+            print(BaselineManager.diff_to_json(diff, baseline_metadata, args.diff))
+        elif args.output == "csv":
+            print(BaselineManager.diff_to_csv(diff), end="")   # CSV text ends with its own line ending
+        else:
+            BaselineManager.display_diff(diff, baseline_metadata)
 
-            # Output diff in requested format
-            if args.output == "json":
-                print(BaselineManager.diff_to_json(diff, baseline_metadata, args.diff))
-            elif args.output == "csv":
-                print(BaselineManager.diff_to_csv(diff), end="")   # CSV text ends with its own line ending
-            else:
-                BaselineManager.display_diff(diff, baseline_metadata)
-
-        except FileNotFoundError:
-            print(f"Error: Baseline file not found: {args.diff}", file=sys.stderr)
-            sys.exit(EXIT_ERROR)
-        except (json.JSONDecodeError, ValueError) as e:
-            print(f"Error: Invalid baseline file: {e}", file=sys.stderr)
-            sys.exit(EXIT_ERROR)
-
+        if diff.has_changes:
+            # Lets a scheduled job or script notice changes without reading the output
+            sys.exit(EXIT_CHANGES_FOUND)
         return
 
     # Handle save baseline
@@ -3528,7 +3724,25 @@ Examples:
             print("The baseline would be empty. Check your --source, --search, and --exclude options.", file=sys.stderr)
             sys.exit(EXIT_NO_SOFTWARE)
 
-        BaselineManager.save_baseline(software_list, args.save_baseline, sources=sources)
+        shown_path = sanitize_output(args.save_baseline)
+        try:
+            BaselineManager.save_baseline(software_list, args.save_baseline, sources=sources,
+                                          overwrite=args.overwrite)
+        except IsADirectoryError:
+            print(f"Error: {shown_path} is a folder; give a file name for the baseline", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
+        except FileExistsError:
+            print(f"Error: {shown_path} already exists; use --overwrite to replace it", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
+        except FileNotFoundError:
+            print(f"Error: cannot write the baseline file (its folder doesn't exist): {shown_path}", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
+        except PermissionError:
+            print(f"Error: cannot write the baseline file (access denied): {shown_path}", file=sys.stderr)
+            sys.exit(EXIT_PERMISSION_DENIED)
+        except OSError:
+            print(f"Error: cannot write the baseline file: {shown_path}", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
         if not args.quiet:
             print(f"Baseline saved to: {args.save_baseline}")
             print(f"Software count: {len(software_list)}")

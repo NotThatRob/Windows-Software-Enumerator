@@ -1691,6 +1691,26 @@ class TestLogFilePermissions(unittest.TestCase):
         self._assert_owner_only(log)
         self.assertIn("hello", log.read_text(encoding="utf-8"))   # owner can still write and read
 
+    def test_setting_up_logging_again_closes_the_previous_log_file(self):
+        """A second setup_logging() call must close the first log file, not just drop its handler.
+
+        The log file is opened without FILE_SHARE_DELETE, so while it is still open Windows
+        refuses to delete it: deleting it is a direct check that the handle was released.
+        """
+        first, second = self.dir / "first.log", self.dir / "second.log"
+        se.setup_logging(log_file=str(first))
+        first_handlers = list(se.logger.handlers)
+        try:
+            se.setup_logging(log_file=str(second))
+            try:
+                first.unlink()
+            except PermissionError:
+                self.fail("first log file is still open after setup_logging() was called again")
+        finally:
+            for h in first_handlers:     # don't leave the file open if the check failed
+                h.close()
+        self.assertTrue(second.exists())
+
     def test_existing_explicit_grant_is_removed(self):
         import subprocess
         log = self.dir / "audit.log"
@@ -1842,9 +1862,6 @@ class TestLogFilePermissions(unittest.TestCase):
             with patch.object(se, "_handle_owner_sid", return_value=sid):
                 se.setup_logging(log_file=str(log))                          # must not raise
             self._assert_owner_only(log)
-            for h in list(se.logger.handlers):   # setup_logging() drops old handlers without closing them
-                h.close()
-            se.logger.handlers.clear()
 
     def test_own_existing_file_is_accepted(self):
         """Owner of a file this process creates is one of our own SIDs (real check, no mocks)."""

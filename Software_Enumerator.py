@@ -511,8 +511,12 @@ def setup_logging(log_file: str = None, verbose: bool = False) -> None:
     log_format = "%(asctime)s | %(levelname)-8s | %(message)s"
     date_format = "%Y-%m-%d %H:%M:%S"
 
-    # Clear any existing handlers to prevent accumulation on repeated calls
-    logger.handlers.clear()
+    # Remove handlers from an earlier call so they don't accumulate, and close them so an
+    # earlier log file isn't left open (and locked against deletion) until the process exits.
+    # Closing a StreamHandler doesn't close the stream itself, so stderr stays usable.
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
 
     # Set base logging level
     level = logging.DEBUG if verbose else logging.INFO

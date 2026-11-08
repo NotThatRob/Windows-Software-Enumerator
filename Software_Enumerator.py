@@ -2587,7 +2587,11 @@ class SoftwareExporter:
         """
         output = io.StringIO()
         fieldnames = ["name", "version", "publisher", "install_date", "source", "install_location"]
-        writer = csv.DictWriter(output, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+        # "\n", not csv's default "\r\n": the text is written through a text-mode stream
+        # (stdout or a file), which already turns "\n" into "\r\n" on Windows. With "\r\n"
+        # here every line would end "\r\r\n" and Excel shows a blank row between records.
+        writer = csv.DictWriter(output, fieldnames=fieldnames, quoting=csv.QUOTE_ALL,
+                                lineterminator="\n")
         writer.writeheader()
 
         for software in software_list:
@@ -2820,7 +2824,8 @@ class BaselineManager:
         Columns: change_type, name, baseline_version, current_version, publisher, source
         """
         output = io.StringIO()
-        writer = csv.writer(output, quoting=csv.QUOTE_ALL)
+        # "\n" for the same reason as SoftwareExporter.to_csv: the text-mode stream adds the "\r".
+        writer = csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator="\n")
         writer.writerow(["change_type", "name", "baseline_version", "current_version", "publisher", "source"])
 
         def row(change_type, name, baseline_version, current_version, publisher, source):

@@ -1254,6 +1254,51 @@ class TestCsvFormulaInjection(unittest.TestCase):
                     self.assertTrue(cell.startswith("'"), f"not neutralised: {cell!r}")
 
 
+class TestCsvLineEndings(unittest.TestCase):
+    """CSV written to a Windows text-mode stream must end each line with exactly one CRLF.
+
+    Text-mode stdout and files on Windows turn "\\n" into "\\r\\n". If the CSV text already
+    used "\\r\\n", every line came out as "\\r\\r\\n", which Excel shows as a blank row.
+    """
+
+    ITEMS = [se.SoftwareInfo(name="App1", version="1.0", publisher="P1", source="Registry"),
+             se.SoftwareInfo(name="App2", version="2.0", publisher="P2", source="Registry")]
+
+    @staticmethod
+    def _through_windows_text_stream(text):
+        """Bytes produced by writing text the way Windows text-mode stdout does."""
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="utf-8", newline="\r\n")
+        stream.write(text)
+        stream.flush()
+        return raw.getvalue()
+
+    def _assert_one_crlf_per_line(self, data, expected_lines):
+        self.assertNotIn(b"\r\r\n", data)
+        self.assertEqual(data.count(b"\r\n"), expected_lines)
+        self.assertEqual(data.count(b"\n"), expected_lines)       # no bare LF either
+
+    def test_to_csv_lines_end_with_single_crlf(self):
+        data = self._through_windows_text_stream(se.SoftwareExporter.to_csv(self.ITEMS))
+        self._assert_one_crlf_per_line(data, expected_lines=3)    # header + 2 rows
+
+    def test_diff_csv_lines_end_with_single_crlf(self):
+        old, new = self.ITEMS[0], se.SoftwareInfo(name="App1", version="1.1", publisher="P1",
+                                                  source="Registry")
+        diff = se.BaselineDiff(added=[self.ITEMS[1]], changed=[(old, new)])
+        data = self._through_windows_text_stream(se.BaselineManager.diff_to_csv(diff))
+        self._assert_one_crlf_per_line(data, expected_lines=3)    # header + added + changed
+
+    def test_export_to_file_lines_end_with_single_crlf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.csv")
+            with patch.object(se, "log_audit_event"):
+                se.SoftwareExporter.export(self.ITEMS, "csv", output_file=path)
+            with open(path, "rb") as f:
+                data = f.read()
+        self._assert_one_crlf_per_line(data, expected_lines=3)
+
+
 class _FakeRegistry:
     """Minimal winreg stand-in: {subkey_name: {value_name: value}} under a single path.
 

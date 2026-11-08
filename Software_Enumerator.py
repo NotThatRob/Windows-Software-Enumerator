@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.error
 import winreg
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -871,6 +871,18 @@ class CVEInfo:
     cvss_score: float
     published_date: str
     references: list = field(default_factory=list)
+    cvss_version: str = ""   # "4.0", "3.1", "3.0", "2.0"; "" if not scored yet
+    score_source: str = ""   # "NVD" (NVD's own assessment) or "CNA" (assigner / other provider)
+    known_exploited: bool = False  # in CISA's Known Exploited Vulnerabilities (KEV) catalog
+    kev_added: str = ""            # date CISA added it to KEV
+    status: str = ""               # NVD's vulnStatus, e.g. "Analyzed", "Awaiting Analysis", "Deferred"
+
+    @property
+    def score_label(self) -> str:
+        """e.g. "CVSS 9.8, NVD v3.1", or "not scored yet"."""
+        if not self.cvss_version:
+            return "not scored yet"
+        return f"CVSS {self.cvss_score}, {self.score_source} v{self.cvss_version}"
 
     @property
     def severity_color(self) -> str:
@@ -892,6 +904,20 @@ class VulnerabilityResult:
     software_version: str
     cves: list[CVEInfo] = field(default_factory=list)
     error: str = ""
+    not_checked: str = ""    # reason the program wasn't looked up, e.g. "no CPE mapping"
+    cpe: str = ""            # CPE name that was looked up
+    total_available: int = 0  # CVEs NVD reported (can exceed len(cves) if the page cap was hit)
+    # Recent CVEs that mention the product but that NVD hasn't analysed yet (no product data),
+    # so NVD can't say whether this version is affected. Never counted in the totals above.
+    unconfirmed: list[CVEInfo] = field(default_factory=list)
+    # CVEs NVD lists for every version of the product (no version range or version given),
+    # e.g. a 2012 CVE recorded as "all Chrome versions". Matched, but not version-specific,
+    # so kept apart from `cves` and never counted in the totals above.
+    all_versions: list[CVEInfo] = field(default_factory=list)
+
+    @property
+    def kev_count(self) -> int:
+        return sum(1 for c in self.cves if c.known_exploited)
 
     @property
     def critical_count(self) -> int:
@@ -1897,28 +1923,65 @@ class BrowserExtensionScanner:
             print("browsing history, downloads, clipboard, and network requests.")
 
 
+@dataclass
+class VulnScanPlan:
+    """Which programs the CVE check looks up, and what it leaves out (reported in the summary)."""
+    targets: list[SoftwareInfo] = field(default_factory=list)
+    unmapped: list[SoftwareInfo] = field(default_factory=list)  # no CPE mapping: not checked
+    skipped: int = 0       # frameworks, runtimes, update packages (SKIP_PATTERNS)
+    no_version: int = 0    # version missing or not usable in a CPE name
+    duplicates: int = 0    # same product and version as a program already in targets
+    over_limit: int = 0    # mapped programs left out by --cve-limit
+    limit: int = 20
+
+
+class NvdApiError(Exception):
+    """An NVD request failed. `status` is the HTTP status code, or None for network errors."""
+
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
+
+
 class VulnerabilityScanner:
     """Scans for known CVEs using the NIST NVD API."""
 
     NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
-    # Software name mappings to improve CVE search accuracy
-    # Maps common software names to their CPE vendor/product names
+    # NVD returns at most 2,000 CVEs per page. Very old browser versions can be affected by
+    # thousands of CVEs, so cap the pages per program and report "showing N of M".
+    MAX_PAGES = 5
+
+    # Display-name keys -> CPE (vendor, product) as NVD names them. Every pair must exist in
+    # NVD's CPE dictionary: a pair NVD doesn't know makes the check find nothing, silently.
+    # Deliberately absent because NVD has no CPE product for them (checked 2026-11):
+    # OBS Studio, HandBrake, ShareX, Atom, AdoptOpenJDK, Slack desktop, Vivaldi (installer only),
+    # Sublime Text 4 (only sublime_text_3 exists). They are reported as "not checked".
     SOFTWARE_MAPPINGS = {
         # Browsers
         "google chrome": ("google", "chrome"),
         "mozilla firefox": ("mozilla", "firefox"),
         "firefox": ("mozilla", "firefox"),
-        "microsoft edge": ("microsoft", "edge"),
+        "microsoft edge": ("microsoft", "edge_chromium"),  # "edge" is the retired EdgeHTML browser
+        "microsoft edge update": ("microsoft", "edge_update"),
         "opera": ("opera", "opera_browser"),
         "brave": ("brave", "brave"),
-        "vivaldi": ("vivaldi", "vivaldi"),
         "tor browser": ("torproject", "tor"),
         # Dev tools - Editors & IDEs
         "notepad++": ("notepad-plus-plus", "notepad\\+\\+"),
         "vscode": ("microsoft", "visual_studio_code"),
         "visual studio code": ("microsoft", "visual_studio_code"),
-        "visual studio": ("microsoft", "visual_studio"),
+        # NVD names each Visual Studio release separately; a bare "visual studio" key would
+        # also catch the Visual Studio Installer and Office tools runtimes (other versions).
+        "visual studio community 2019": ("microsoft", "visual_studio_2019"),
+        "visual studio professional 2019": ("microsoft", "visual_studio_2019"),
+        "visual studio enterprise 2019": ("microsoft", "visual_studio_2019"),
+        "visual studio community 2022": ("microsoft", "visual_studio_2022"),
+        "visual studio professional 2022": ("microsoft", "visual_studio_2022"),
+        "visual studio enterprise 2022": ("microsoft", "visual_studio_2022"),
+        "visual studio community 2026": ("microsoft", "visual_studio_2026"),
+        "visual studio professional 2026": ("microsoft", "visual_studio_2026"),
+        "visual studio enterprise 2026": ("microsoft", "visual_studio_2026"),
         "intellij idea": ("jetbrains", "intellij_idea"),
         "pycharm": ("jetbrains", "pycharm"),
         "webstorm": ("jetbrains", "webstorm"),
@@ -1928,15 +1991,12 @@ class VulnerabilityScanner:
         "phpstorm": ("jetbrains", "phpstorm"),
         "datagrip": ("jetbrains", "datagrip"),
         "eclipse": ("eclipse", "eclipse_ide"),
-        "sublime text": ("sublimetext", "sublime_text"),
-        "atom": ("atom", "atom"),
         # Dev tools - Languages & Runtimes
         "python": ("python", "python"),
         "nodejs": ("nodejs", "node.js"),
         "node.js": ("nodejs", "node.js"),
         "java": ("oracle", "jre"),
         "openjdk": ("oracle", "openjdk"),
-        "adoptopenjdk": ("adoptopenjdk", "openjdk"),
         "go programming language": ("golang", "go"),
         "rust": ("rust-lang", "rust"),
         "ruby": ("ruby-lang", "ruby"),
@@ -1950,7 +2010,6 @@ class VulnerabilityScanner:
         # Productivity
         "libreoffice": ("libreoffice", "libreoffice"),
         "thunderbird": ("mozilla", "thunderbird"),
-        "slack": ("slack", "slack"),
         "microsoft teams": ("microsoft", "teams"),
         "notion": ("notion", "notion"),
         # Media
@@ -1960,11 +2019,9 @@ class VulnerabilityScanner:
         "gimp": ("gimp", "gimp"),
         "inkscape": ("inkscape", "inkscape"),
         "blender": ("blender", "blender"),
-        "handbrake": ("handbrake", "handbrake"),
         "ffmpeg": ("ffmpeg", "ffmpeg"),
         "kodi": ("kodi", "kodi"),
         "itunes": ("apple", "itunes"),
-        "obs studio": ("obsproject", "obs_studio"),
         "spotify": ("spotify", "spotify"),
         # Security
         "keepass": ("keepass", "keepass"),
@@ -1974,6 +2031,7 @@ class VulnerabilityScanner:
         "nmap": ("nmap", "nmap"),
         "burp suite": ("portswigger", "burp_suite"),
         "openvpn": ("openvpn", "openvpn"),
+        "openvpn connect": ("openvpn", "connect"),    # a different client from OpenVPN (community)
         "putty": ("putty", "putty"),
         "wireshark": ("wireshark", "wireshark"),
         # Compression & Utilities
@@ -1981,13 +2039,13 @@ class VulnerabilityScanner:
         "winrar": ("rarlab", "winrar"),
         "peazip": ("peazip", "peazip"),
         "everything": ("voidtools", "everything"),
-        "sharex": ("sharex", "sharex"),
         "autohotkey": ("autohotkey", "autohotkey"),
         "ccleaner": ("piriform", "ccleaner"),
         "powershell": ("microsoft", "powershell"),
         # Communication & Collaboration
         "discord": ("discord", "discord"),
         "zoom": ("zoom", "zoom"),
+        "zoom workplace": ("zoom", "workplace_desktop"),
         "filezilla": ("filezilla-project", "filezilla_client"),
         # System & Virtualization
         "vmware workstation": ("vmware", "workstation"),
@@ -2004,15 +2062,50 @@ class VulnerabilityScanner:
         "sqlite": ("sqlite", "sqlite"),
         # Network & Web
         "nginx": ("f5", "nginx"),
-        "apache": ("apache", "http_server"),
+        "apache http server": ("apache", "http_server"),  # not bare "apache": OpenOffice, NetBeans, ...
         "postman": ("postman", "postman"),
         "curl": ("haxx", "curl"),
         "wget": ("gnu", "wget"),
-        # Gaming
-        "steam": ("valvesoftware", "steam_client"),
-        "epic games launcher": ("epicgames", "epic_games_launcher"),
+        # Gaming (not Steam: NVD versions the Steam client by date, e.g. "2021-04-10", while
+        # Windows reports "2.10.91.91", so NVD can't compare them and matches every install)
+        "epic games launcher": ("epicgames", "launcher"),
         "gog galaxy": ("gog", "galaxy"),
     }
+
+    # Phrases that name a product in CVE descriptions, used only to find recent CVEs NVD hasn't
+    # analysed yet (they have no product data, so the CPE query can't see them). Left out on
+    # purpose: names too generic to search for (Git, Everything, Steam, ...) and platforms that
+    # other products' CVEs name, e.g. Node.js ("... package for Node.js": hundreds of npm CVEs).
+    SEARCH_PHRASES = {
+        ("google", "chrome"): "Google Chrome",
+        ("mozilla", "firefox"): "Firefox",
+        ("mozilla", "thunderbird"): "Thunderbird",
+        ("microsoft", "edge_chromium"): "Microsoft Edge",
+        ("microsoft", "visual_studio_code"): "Visual Studio Code",
+        ("notepad-plus-plus", "notepad\\+\\+"): "Notepad++",
+        ("python", "python"): "CPython",
+        ("libreoffice", "libreoffice"): "LibreOffice",
+        ("videolan", "vlc_media_player"): "VLC",
+        ("audacityteam", "audacity"): "Audacity",
+        ("gimp", "gimp"): "GIMP",
+        ("inkscape", "inkscape"): "Inkscape",
+        ("keepass", "keepass"): "KeePass",
+        ("bitwarden", "bitwarden"): "Bitwarden",
+        ("winscp", "winscp"): "WinSCP",
+        ("openvpn", "openvpn"): "OpenVPN",
+        ("putty", "putty"): "PuTTY",
+        ("wireshark", "wireshark"): "Wireshark",
+        ("7-zip", "7-zip"): "7-Zip",
+        ("rarlab", "winrar"): "WinRAR",
+        ("zoom", "workplace_desktop"): "Zoom Workplace",
+        ("filezilla-project", "filezilla_client"): "FileZilla",
+        ("oracle", "virtualbox"): "VirtualBox",
+        ("vmware", "workstation"): "VMware Workstation",
+        ("teamviewer", "teamviewer"): "TeamViewer",
+        ("anydesk", "anydesk"): "AnyDesk",
+    }
+    UNCONFIRMED_DAYS = 119        # NVD allows date ranges of at most 120 days
+    UNCONFIRMED_MAX_PAGES = 2
 
     # Software to skip (system components, frameworks, etc.)
     SKIP_PATTERNS = [
@@ -2026,6 +2119,7 @@ class VulnerabilityScanner:
         r"hotfix",
         r"security update",
         r"service pack",
+        r"python launcher",    # the py launcher's version is not a CPython version
     ]
 
     def __init__(self, api_key: str = None):
@@ -2059,79 +2153,212 @@ class VulnerabilityScanner:
         name_lower = name.lower()
         return any(pattern.search(name_lower) for pattern in self._compiled_skip_patterns)
 
+    # Architecture words in display names, e.g. "(x64)", "(64-bit x64)", "Wireshark 4.0.0 64-bit"
+    _ARCH_WORD = r"(?:x64|x86|arm64|64-bit|32-bit)"
+
     def _normalize_software_name(self, name: str) -> str:
-        """Normalize software name for better CVE matching."""
-        # Remove version numbers from the name
-        name = re.sub(r'\s*\d+(\.\d+)*\s*', ' ', name)
-        # Remove common suffixes
-        name = re.sub(r'\s*\((x64|x86|64-bit|32-bit)\)\s*', '', name, flags=re.IGNORECASE)
-        # Remove trailing/leading whitespace and normalize
-        name = ' '.join(name.split()).lower()
-        return name
+        """Normalize a display name for mapping lookup: lower case, no versions or architecture.
 
-    def _get_search_terms(self, software: SoftwareInfo) -> tuple[str, str]:
-        """Get vendor and product search terms for a software."""
-        name_lower = self._normalize_software_name(software.name)
+        "7-Zip 23.01 (x64)" -> "7-zip", "Python 3.12.1 (64-bit)" -> "python",
+        "Mozilla Firefox (x64 en-US)" -> "mozilla firefox". Digits that are part of a name
+        ("7-Zip", "1Password") are kept: only whole tokens that look like versions are removed.
+        """
+        name = name.lower()
+        # Parenthesised groups that mention an architecture, e.g. "(x64 en-us)", "(64-bit x64)"
+        name = re.sub(r"\([^)]*\b" + self._ARCH_WORD + r"\b[^)]*\)", " ", name)
+        # Stand-alone architecture words
+        name = re.sub(r"(?<!\S)" + self._ARCH_WORD + r"(?!\S)", " ", name)
+        # Stand-alone version tokens: "23.01", "v1.2.3", "3.11.4150.0", "2.53.1-beta"
+        name = re.sub(r"(?<!\S)v?\d+(?:\.\d+)+\S*", " ", name)
+        return " ".join(name.split())
 
-        # Check if we have a known mapping
-        for key, (vendor, product) in self.SOFTWARE_MAPPINGS.items():
-            if key in name_lower:
-                return vendor, product
+    def _find_mapping(self, name: str) -> Optional[tuple[str, str]]:
+        """CPE (vendor, product) for a display name, or None if no mapping applies.
 
-        # Fall back to using the software name as both vendor and product keyword
-        # Extract likely product name (first significant word)
-        words = name_lower.split()
-        if words:
-            return "", words[0]
+        Keys match whole words of the normalised name, so "git" matches "Git" but not
+        "Logitech G HUB" or "GitHub Desktop", and "rust" doesn't match "RustDesk". When
+        several keys match, the longest wins ("vlc media player" over "vlc").
+        """
+        normalised = self._normalize_software_name(name)
+        for key in sorted(self.SOFTWARE_MAPPINGS, key=len, reverse=True):
+            # Word boundaries that also work for keys ending in "+" (notepad++) or starting with "."
+            if re.search(r"(?<![\w+])" + re.escape(key) + r"(?![\w+])", normalised):
+                return self.SOFTWARE_MAPPINGS[key]
+        return None
 
-        return "", name_lower
+    @staticmethod
+    def _python_installer_version(version: str) -> str:
+        """Python's Windows installer reports 3.11.4 as "3.11.4150.0" (micro * 1000 + build).
 
-    def _query_nvd_api(self, keyword: str, vendor: str = "") -> list[dict]:
-        """Query the NVD API for CVEs matching a keyword."""
+        Read literally, NVD treats 3.11.4150 as newer than 3.11.5 and misses CVEs fixed since.
+        """
+        m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:\.\d+)?", version)
+        if m and int(m.group(3)) >= 100:
+            return f"{m.group(1)}.{m.group(2)}.{int(m.group(3)) // 1000}"
+        return version
+
+    @staticmethod
+    def _java_installer_version(version: str) -> str:
+        """Java 8's installer reports 8u401 as "8.0.4010.10"; NVD names it "1.8.0:update401".
+
+        Java 9 and later report e.g. "17.0.9.0", which NVD names "17.0.9".
+        """
+        m = re.fullmatch(r"8\.0\.(\d+)(?:\.\d+)?", version)
+        if m:
+            return f"1.8.0:update{int(m.group(1)) // 10}"
+        m = re.fullmatch(r"(\d+\.\d+\.\d+)\.0", version)
+        if m:
+            return m.group(1)
+        return version
+
+    @staticmethod
+    def _without_package_build(version: str) -> str:
+        """Drop an installer package build suffix: PostgreSQL's installer reports 17.11 as "17.11-5"."""
+        m = re.fullmatch(r"(\d+(?:\.\d+)*)-\d+", version)
+        return m.group(1) if m else version
+
+    # Products whose installers report versions in a form NVD reads differently
+    VERSION_TRANSLATORS = {
+        ("python", "python"): "_python_installer_version",
+        ("oracle", "jre"): "_java_installer_version",
+        ("postgresql", "postgresql"): "_without_package_build",
+    }
+
+    @classmethod
+    def _cpe_version(cls, vendor: str, product: str, version: str) -> Optional[str]:
+        """The installed version as it goes into a CPE name, or None if it can't be used.
+
+        Only plain version strings are accepted: anything with spaces or CPE special
+        characters (":", "*", "?", "\\", ...) would change the meaning of the CPE name.
+        Then products in VERSION_TRANSLATORS get their installer's format translated.
+        """
+        version = (version or "").strip()
+        if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._-]*", version):
+            return None
+        translator = cls.VERSION_TRANSLATORS.get((vendor, product))
+        if translator:
+            version = getattr(cls, translator)(version)
+        return version
+
+    @staticmethod
+    def _cpe_name(vendor: str, product: str, cpe_version: str) -> str:
+        """CPE 2.3 name for an application at one version (NVD accepts the short form)."""
+        return f"cpe:2.3:a:{vendor}:{product}:{cpe_version}"
+
+    def _nvd_request(self, params: list) -> dict:
+        """Make one NVD CVE API request and return the decoded JSON page.
+
+        Args:
+            params: (name, value) pairs; a value of None sends a flag without a value
+                    (NVD's isVulnerable / noRejected parameters work that way).
+
+        Raises:
+            NvdApiError: with a generic message (never the server's text) and the HTTP status.
+        """
         self._rate_limit()
-
-        params = {
-            "resultsPerPage": 20,
-            "keywordSearch": keyword,
-        }
-
-        if vendor:
-            # Use CPE match string for more accurate results
-            params["keywordSearch"] = f"{vendor} {keyword}"
-
-        url = f"{self.NVD_API_URL}?{urllib.parse.urlencode(params)}"
+        query = "&".join(name if value is None else f"{name}={urllib.parse.quote(str(value), safe=':')}"
+                         for name, value in params)
+        url = f"{self.NVD_API_URL}?{query}"
 
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         }
-
         if self.api_key:
             headers["apiKey"] = self.api_key
 
-        try:
-            request = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(request, timeout=30) as response:
-                data = json.loads(response.read().decode('utf-8'))
-                return data.get("vulnerabilities", [])
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                # Too Many Requests — wait and retry once
-                time.sleep(self._rate_window)
-                try:
-                    request = urllib.request.Request(url, headers=headers)
-                    with urllib.request.urlopen(request, timeout=30) as response:
-                        data = json.loads(response.read().decode('utf-8'))
-                        return data.get("vulnerabilities", [])
-                except (urllib.error.HTTPError, urllib.error.URLError, OSError, json.JSONDecodeError):
-                    raise Exception("NVD API rate limit exceeded. Try again later or use an API key.")
-            elif e.code == 403:
-                raise Exception("NVD API rate limit exceeded. Try again later or use an API key.")
-            elif e.code == 404:
-                raise Exception("NVD API endpoint not found.")
-            else:
-                raise Exception(f"NVD API request failed (HTTP {e.code}).")
-        except urllib.error.URLError:
-            raise Exception("Network error: Unable to reach NVD API.")
+        for attempt in (1, 2):
+            try:
+                request = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt == 1:
+                    time.sleep(self._rate_window)  # Too Many Requests: wait out the window, retry once
+                    continue
+                if e.code in (403, 429):
+                    raise NvdApiError("NVD API rate limit exceeded. Try again later or use an API key.", e.code)
+                raise NvdApiError(f"NVD API request failed (HTTP {e.code}).", e.code)
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
+                raise NvdApiError("Network error: Unable to reach NVD API.")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                raise NvdApiError("NVD API returned an unreadable response.")
+            if not isinstance(data, dict):
+                raise NvdApiError("NVD API returned an unreadable response.")
+            return data
+        raise NvdApiError("NVD API rate limit exceeded. Try again later or use an API key.", 429)
+
+    def _fetch_all_pages(self, params: list, max_pages: int) -> tuple[list[dict], int]:
+        """Fetch up to max_pages pages of a CVE query. Returns (vulnerabilities, NVD's total count)."""
+        vulnerabilities, start, total = [], 0, 0
+        for _ in range(max_pages):
+            page = self._nvd_request(params + [("startIndex", start)])
+            batch = page.get("vulnerabilities")
+            total = page.get("totalResults")
+            if not isinstance(batch, list) or not isinstance(total, int):
+                raise NvdApiError("NVD API returned an unreadable response.")
+            vulnerabilities.extend(v for v in batch if isinstance(v, dict))
+            start += len(batch)
+            if not batch or start >= total:
+                break
+        return vulnerabilities, total
+
+    def _query_affecting_cves(self, vendor: str, product: str, cpe_version: str) -> tuple[list[dict], int]:
+        """CVEs that NVD says affect this product at this version (rejected CVEs left out).
+
+        NVD compares the CPE name with each CVE's version ranges itself; checked against a
+        local reading of NVD's data for 12 products, it matched exactly (nothing missed or added).
+        """
+        params = [("cpeName", self._cpe_name(vendor, product, cpe_version)),
+                  ("isVulnerable", None), ("noRejected", None)]
+        return self._fetch_all_pages(params, self.MAX_PAGES)
+
+    @staticmethod
+    def _listed_for_every_version(vuln: dict, vendor: str, product: str) -> bool:
+        """True if NVD's data for this product in this CVE includes an "every version" entry.
+
+        Looks only at whether NVD gave a version range or a specific version for the product
+        (it does not re-check whether the installed version is in a range: NVD did that).
+        Criteria with version "*" or "-" and no range mean "every version". NVD records some
+        old CVEs that way, sometimes next to proper ranges (CVE-2009-2469 lists Firefox up to
+        3.0.11 *and* every Firefox version), and such an entry alone makes NVD match any
+        version, so the match says nothing about the installed one. If the product's criteria
+        can't be found, the CVE is not set aside.
+        """
+        def items(obj, key):  # obj[key] if it is a list, else [] (network data: don't trust shapes)
+            value = obj.get(key) if isinstance(obj, dict) else None
+            return value if isinstance(value, list) else []
+
+        for config in items(vuln.get("cve") if isinstance(vuln, dict) else None, "configurations"):
+            for node in items(config, "nodes"):
+                for match in items(node, "cpeMatch"):
+                    if not isinstance(match, dict) or not match.get("vulnerable"):
+                        continue
+                    parts = str(match.get("criteria", "")).split(":")
+                    if len(parts) < 6 or parts[3] != vendor or parts[4] != product:
+                        continue
+                    has_range = any(match.get(k) for k in ("versionStartIncluding", "versionStartExcluding",
+                                                           "versionEndIncluding", "versionEndExcluding"))
+                    if not has_range and parts[5] in ("*", "-", ""):
+                        return True
+        return False
+
+    def _query_unanalysed_cves(self, phrase: str) -> list[dict]:
+        """CVEs published in the last UNCONFIRMED_DAYS that mention `phrase` and have no product data.
+
+        Without product (CPE) data NVD can't say which versions a CVE affects, so these are only
+        candidates: the user has to check whether their version is affected.
+        """
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        start = now - timedelta(days=self.UNCONFIRMED_DAYS)
+        fmt = "%Y-%m-%dT%H:%M:%S.000Z"
+        params = [("keywordSearch", phrase)]
+        if " " in phrase:
+            params.append(("keywordExactMatch", None))   # the phrase, not each word anywhere
+        params += [("pubStartDate", start.strftime(fmt)), ("pubEndDate", now.strftime(fmt)),
+                   ("noRejected", None)]
+        vulnerabilities, _ = self._fetch_all_pages(params, self.UNCONFIRMED_MAX_PAGES)
+        return [v for v in vulnerabilities
+                if isinstance(v.get("cve"), dict) and not v["cve"].get("configurations")]
 
     def _parse_cve(self, vuln_data: dict) -> Optional[CVEInfo]:
         """Parse a CVE entry from NVD API response."""
@@ -2150,20 +2377,17 @@ class VulnerabilityScanner:
                 description = descriptions[0].get("value", "")
 
             # Get CVSS score and severity
-            metrics = cve.get("metrics", {})
-            cvss_score = 0.0
-            severity = "UNKNOWN"
-
-            # Try CVSS 3.1 first, then 3.0, then 2.0
-            for cvss_version in ["cvssMetricV31", "cvssMetricV30", "cvssMetricV2"]:
-                if cvss_version in metrics and metrics[cvss_version]:
-                    cvss_data = metrics[cvss_version][0].get("cvssData", {})
-                    cvss_score = cvss_data.get("baseScore", 0.0)
-                    severity = cvss_data.get("baseSeverity", "UNKNOWN")
-                    if cvss_version == "cvssMetricV2":
-                        # CVSS 2.0 uses different severity names
-                        severity = self._cvss2_to_severity(cvss_score)
-                    break
+            cvss_score, severity, cvss_version, score_source = 0.0, "UNKNOWN", "", ""
+            chosen = self._choose_metric(cve.get("metrics"))
+            if chosen:
+                cvss_version, entry = chosen
+                score = entry["cvssData"].get("baseScore")
+                cvss_score = float(score) if isinstance(score, (int, float)) else 0.0
+                if cvss_version == "2.0":
+                    severity = self._cvss2_to_severity(cvss_score)  # v2 has no CRITICAL label
+                else:
+                    severity = str(entry["cvssData"].get("baseSeverity") or "UNKNOWN")
+                score_source = "NVD" if entry.get("type") == "Primary" else "CNA"
 
             # Get published date
             published = cve.get("published", "")[:10]  # Just the date part
@@ -2179,9 +2403,40 @@ class VulnerabilityScanner:
                 cvss_score=cvss_score,
                 published_date=published,
                 references=references,
+                cvss_version=cvss_version,
+                score_source=score_source,
+                # NVD includes CISA's KEV fields on CVEs that are known to be exploited
+                known_exploited=isinstance(cve.get("cisaExploitAdd"), str),
+                kev_added=str(cve.get("cisaExploitAdd") or "")[:10],
+                status=str(cve.get("vulnStatus") or ""),
             )
-        except (KeyError, TypeError):
+        except (KeyError, TypeError, AttributeError):
             return None
+
+    # Newest CVSS version first
+    _METRIC_KEYS = [("cvssMetricV40", "4.0"), ("cvssMetricV31", "3.1"), ("cvssMetricV30", "3.0"),
+                    ("cvssMetricV2", "2.0")]
+
+    @classmethod
+    def _choose_metric(cls, metrics) -> Optional[tuple[str, dict]]:
+        """Pick the CVSS entry to show: (version label, metric entry), or None if unscored.
+
+        NVD's own assessment ("Primary") wins over scores from the CVE's assigner or other
+        providers ("Secondary"), which NVD often lists first; within each, the newest CVSS
+        version wins.
+        """
+        if not isinstance(metrics, dict):
+            return None
+        for wanted in ("Primary", None):
+            for key, label in cls._METRIC_KEYS:
+                entries = metrics.get(key)
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    if (isinstance(entry, dict) and isinstance(entry.get("cvssData"), dict)
+                            and (wanted is None or entry.get("type") == wanted)):
+                        return label, entry
+        return None
 
     def _cvss2_to_severity(self, score: float) -> str:
         """Convert CVSS 2.0 score to severity label."""
@@ -2195,207 +2450,217 @@ class VulnerabilityScanner:
             return "LOW"
         return "UNKNOWN"
 
-    @staticmethod
-    def _parse_version(version_str: str) -> tuple:
-        """Parse a version string into a tuple of integers for comparison.
-
-        Handles non-numeric segments by stopping at the first non-numeric part.
-        e.g. "1.2.3-beta" -> (1, 2, 3), "10.0" -> (10, 0), "" -> ()
-        """
-        if not version_str:
-            return ()
-        parts = []
-        for segment in version_str.split("."):
-            # Extract leading digits from each segment
-            match = re.match(r'(\d+)', segment)
-            if match:
-                parts.append(int(match.group(1)))
-            else:
-                break
-        return tuple(parts)
-
-    @staticmethod
-    def _version_in_range(installed: tuple, start_inc: str = None,
-                          start_exc: str = None, end_inc: str = None,
-                          end_exc: str = None) -> bool:
-        """Check if an installed version falls within a CPE match range.
-
-        Args:
-            installed: Parsed version tuple, e.g. (1, 2, 3)
-            start_inc: versionStartIncluding boundary (inclusive)
-            start_exc: versionStartExcluding boundary (exclusive)
-            end_inc: versionEndIncluding boundary (inclusive)
-            end_exc: versionEndExcluding boundary (exclusive)
-
-        Returns:
-            True if the version is within the specified range.
-        """
-        parse = VulnerabilityScanner._parse_version
-        if not installed:
-            return True  # Can't compare, assume affected
-
-        if start_inc is not None:
-            bound = parse(start_inc)
-            if bound and installed < bound:
-                return False
-        if start_exc is not None:
-            bound = parse(start_exc)
-            if bound and installed <= bound:
-                return False
-        if end_inc is not None:
-            bound = parse(end_inc)
-            if bound and installed > bound:
-                return False
-        if end_exc is not None:
-            bound = parse(end_exc)
-            if bound and installed >= bound:
-                return False
-        return True
-
-    def _version_matches(self, vuln_data: dict, installed_version: str) -> bool:
-        """Check if a CVE affects the installed version using CPE configuration data.
-
-        Uses the structured configurations/nodes/cpeMatch data from the NVD API
-        response to determine if the installed version falls within any affected
-        version range.
-
-        Returns True (conservative) if no version range data is available.
-        """
-        if not installed_version:
-            return True  # Can't determine, assume it might apply
-
-        installed = self._parse_version(installed_version)
-        if not installed:
-            return True
-
-        cve = vuln_data.get("cve", {})
-        configurations = cve.get("configurations", [])
-        if not configurations:
-            return True  # No configuration data, conservatively include
-
-        has_ranges = False
-        for config in configurations:
-            for node in config.get("nodes", []):
-                for cpe_match in node.get("cpeMatch", []):
-                    if not cpe_match.get("vulnerable", False):
-                        continue
-
-                    start_inc = cpe_match.get("versionStartIncluding")
-                    start_exc = cpe_match.get("versionStartExcluding")
-                    end_inc = cpe_match.get("versionEndIncluding")
-                    end_exc = cpe_match.get("versionEndExcluding")
-
-                    # Only consider entries that have at least one version bound
-                    if not any([start_inc, start_exc, end_inc, end_exc]):
-                        # Exact version match in CPE criteria
-                        criteria = cpe_match.get("criteria", "")
-                        # CPE format: cpe:2.3:a:vendor:product:version:...
-                        cpe_parts = criteria.split(":")
-                        if len(cpe_parts) >= 6 and cpe_parts[5] not in ("*", "-", ""):
-                            has_ranges = True
-                            cpe_ver = self._parse_version(cpe_parts[5])
-                            if cpe_ver and installed == cpe_ver:
-                                return True
-                        continue
-
-                    has_ranges = True
-                    if self._version_in_range(installed, start_inc, start_exc, end_inc, end_exc):
-                        return True
-
-        if not has_ranges:
-            return True  # No version constraints found, conservatively include
-
-        return False  # Version ranges exist but none matched
-
     def scan_software(self, software: SoftwareInfo) -> VulnerabilityResult:
-        """Scan a single software for known CVEs."""
+        """Ask NVD which CVEs affect this program at its installed version.
+
+        NVD decides whether a CVE applies (it compares the CPE name with each CVE's version
+        ranges), so results are not filtered again here. Programs without a CPE mapping, or
+        with a version that can't go into a CPE name, are marked as not checked.
+        """
         result = VulnerabilityResult(
             software_name=software.name,
             software_version=software.version,
         )
 
         if self._should_skip_software(software.name):
+            result.not_checked = "framework or update package"
             return result
 
+        mapping = self._find_mapping(software.name)
+        if not mapping:
+            result.not_checked = "no CPE mapping"
+            return result
+        vendor, product = mapping
+        cpe_version = self._cpe_version(vendor, product, software.version)
+        if not cpe_version:
+            result.not_checked = "version can't be used in a CPE name"
+            return result
+        result.cpe = self._cpe_name(vendor, product, cpe_version)
+
         try:
-            vendor, product = self._get_search_terms(software)
-            vulnerabilities = self._query_nvd_api(product, vendor)
-
-            for vuln in vulnerabilities:
-                cve = self._parse_cve(vuln)
-                if cve and cve.severity in ["CRITICAL", "HIGH", "MEDIUM"]:
-                    if self._version_matches(vuln, software.version):
-                        result.cves.append(cve)
-
-            # Sort by severity (CRITICAL first)
-            severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
-            result.cves.sort(key=lambda c: (severity_order.get(c.severity, 4), -c.cvss_score))
-
-        except Exception as e:
+            vulnerabilities, result.total_available = self._query_affecting_cves(vendor, product, cpe_version)
+        except NvdApiError as e:
             result.error = str(e)
+            return result
 
+        for vuln in vulnerabilities:
+            cve = self._parse_cve(vuln)
+            if not cve:
+                continue
+            # Every severity, including LOW and not yet scored. NVD decided the CVE matches;
+            # only set aside the ones where NVD gives no version information at all.
+            if self._listed_for_every_version(vuln, vendor, product):
+                result.all_versions.append(cve)
+            else:
+                result.cves.append(cve)
+
+        phrase = self.SEARCH_PHRASES.get((vendor, product))
+        if phrase:
+            try:
+                confirmed = {c.cve_id for c in result.cves + result.all_versions}
+                for vuln in self._query_unanalysed_cves(phrase):
+                    cve = self._parse_cve(vuln)
+                    if cve and cve.cve_id not in confirmed:
+                        result.unconfirmed.append(cve)
+            except NvdApiError as e:
+                result.error = str(e)   # the confirmed list above is still valid
+
+        # Known-exploited first, then by severity (CRITICAL first) and score
+        severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
+        result.cves.sort(key=lambda c: (not c.known_exploited, severity_order.get(c.severity, 4), -c.cvss_score))
         return result
+
+    def plan_scan(self, software_list: list[SoftwareInfo], limit: int = 20) -> VulnScanPlan:
+        """Choose which programs to look up: mapped ones, in name order, once per product+version.
+
+        The order doesn't depend on registry order, so --cve-limit always keeps the same
+        programs. Everything left out is counted so the summary can say what wasn't checked.
+        """
+        plan = VulnScanPlan(limit=max(1, min(limit, 100)))   # cap to prevent API abuse
+        candidates, seen = [], set()
+        for software in sorted(software_list, key=lambda s: (s.name.lower(), s.version)):
+            if self._should_skip_software(software.name):
+                plan.skipped += 1
+                continue
+            mapping = self._find_mapping(software.name)
+            if not mapping:
+                plan.unmapped.append(software)
+                continue
+            cpe_version = self._cpe_version(*mapping, software.version)
+            if not cpe_version:
+                plan.no_version += 1
+                continue
+            key = (*mapping, cpe_version)
+            if key in seen:            # e.g. Python's installer adds ~10 entries with one version
+                plan.duplicates += 1
+                continue
+            seen.add(key)
+            candidates.append(software)
+        plan.targets = candidates[:plan.limit]
+        plan.over_limit = len(candidates) - len(plan.targets)
+        return plan
+
+    def scan_plan(self, plan: VulnScanPlan, progress_callback=None) -> list[VulnerabilityResult]:
+        """Look up every program in the plan. Returns one result per program, clean ones included."""
+        results = []
+        for done, software in enumerate(plan.targets):
+            if progress_callback:
+                # How many are finished, and which one is being looked up now
+                progress_callback(done, len(plan.targets), software.name)
+            results.append(self.scan_software(software))
+        return results
 
     def scan_software_list(
         self, software_list: list[SoftwareInfo], progress_callback=None,
         limit: int = 20,
     ) -> list[VulnerabilityResult]:
-        """Scan a list of software for vulnerabilities."""
-        results = []
+        """plan_scan() then scan_plan(): one result per program checked."""
+        return self.scan_plan(self.plan_scan(software_list, limit), progress_callback)
 
-        # Cap limit to prevent API abuse
-        limit = max(1, min(limit, 100))
+    @staticmethod
+    def _print_cve_ids(cves: list[CVEInfo], label, shown: int = 9) -> None:
+        """Compact list: up to `shown` CVE IDs, three per line, each with label(cve)."""
+        labels = [f"{sanitize_output(c.cve_id)} ({sanitize_output(label(c))})" for c in cves[:shown]]
+        for i in range(0, len(labels), 3):
+            print("    " + ", ".join(labels[i:i + 3]))
+        if len(cves) > shown:
+            print(f"    ... and {len(cves) - shown} more")
 
-        # Filter to scannable software with version numbers, capped at limit
-        scannable = [s for s in software_list
-                     if not self._should_skip_software(s.name) and s.version][:limit]
+    @classmethod
+    def _print_unconfirmed(cls, result: VulnerabilityResult) -> None:
+        """List recent CVEs that mention the product but have no NVD product data yet."""
+        print(f"\n  Unconfirmed: {len(result.unconfirmed)} recent CVE(s) mention this product, but NVD hasn't")
+        print("  analysed them yet, so it can't say which versions they affect. Check whether")
+        print("  your version is affected (not counted above):")
+        cls._print_cve_ids(result.unconfirmed, lambda c: c.status or "status unknown")
 
-        for i, software in enumerate(scannable):
-            if progress_callback:
-                progress_callback(i + 1, len(scannable), software.name)
+    @classmethod
+    def _print_all_versions(cls, result: VulnerabilityResult) -> None:
+        """List CVEs NVD records for every version of the product (no version information)."""
+        print(f"\n  Listed for every version: NVD records {len(result.all_versions)} CVE(s) for all versions of")
+        print("  this product, without a version range, so they may not apply to yours")
+        print("  (often old, or about the product in general; not counted above):")
+        cls._print_cve_ids(result.all_versions, lambda c: f"published {c.published_date}" if c.published_date
+                           else "no date")
 
-            result = self.scan_software(software)
-            if result.cves or result.error:
-                results.append(result)
+    @staticmethod
+    def _print_coverage(results: list[VulnerabilityResult], plan: Optional[VulnScanPlan]) -> None:
+        """What was and wasn't checked: the summary must never read as an all-clear it can't give."""
+        checked = [r for r in results if not r.not_checked and not r.error]
+        failed = [r for r in results if r.error]
+        print(f"Checked {len(checked)} program(s) against NVD (CVEs for each program's exact version).")
+        if plan:
+            left_out = []
+            if plan.unmapped:
+                left_out.append(f"{len(plan.unmapped)} without a CPE mapping")
+            if plan.skipped:
+                left_out.append(f"{plan.skipped} framework/update package(s)")
+            if plan.no_version:
+                left_out.append(f"{plan.no_version} without a usable version")
+            if plan.duplicates:
+                left_out.append(f"{plan.duplicates} duplicate(s) of a checked program")
+            if plan.over_limit:
+                left_out.append(f"{plan.over_limit} over --cve-limit {plan.limit}")
+            if left_out:
+                print("Not checked: " + ", ".join(left_out) + ".")
+            if plan.unmapped:
+                names = sorted({sanitize_output(s.name) for s in plan.unmapped}, key=str.lower)
+                more = f", ... (+{len(names) - 8} more)" if len(names) > 8 else ""
+                print("  Without a mapping, e.g.: " + ", ".join(names[:8]) + more)
+        if failed:
+            print(f"Failed: {len(failed)} program(s): NVD could not be queried (results incomplete).")
 
-        return results
-
-    def display_results(self, results: list[VulnerabilityResult]) -> None:
-        """Display vulnerability scan results."""
-        if not results:
-            print("No vulnerabilities found in scanned software.")
-            print("\nNote: This scan checks common software against the NVD database.")
-            print("It may not cover all installed software or all vulnerabilities.")
-            return
-
+    def display_results(self, results: list[VulnerabilityResult], plan: Optional[VulnScanPlan] = None) -> None:
+        """Display vulnerability scan results, starting with what was and wasn't checked."""
+        affected = [r for r in results if r.cves]
         total_cves = sum(r.total_count for r in results)
         critical_count = sum(r.critical_count for r in results)
         high_count = sum(r.high_count for r in results)
+        kev_count = sum(r.kev_count for r in results)
+        unconfirmed_count = sum(len(r.unconfirmed) for r in results)
 
         print(f"{'='*80}")
         print(f"VULNERABILITY SCAN RESULTS")
         print(f"{'='*80}")
-        print(f"Software scanned with potential vulnerabilities: {len(results)}")
-        print(f"Total CVEs found: {total_cves}")
-        print(f"  CRITICAL: {critical_count}")
-        print(f"  HIGH: {high_count}")
+        self._print_coverage(results, plan)
+        print()
+        checked = sum(1 for r in results if not r.not_checked and not r.error)
+        if affected:
+            print(f"Affected: {len(affected)} program(s), {total_cves} CVE(s)")
+            print(f"  Known exploited (KEV): {kev_count}")
+            print(f"  CRITICAL: {critical_count}")
+            print(f"  HIGH: {high_count}")
+        elif checked:
+            print(f"No known CVEs affect the {checked} program(s) checked.")
+        else:
+            print("No programs were checked, so nothing can be said about CVEs.")
+        all_versions_count = sum(len(r.all_versions) for r in results)
+        if all_versions_count:
+            print(f"Listed by NVD for every version (no version range, not counted): {all_versions_count}")
+        if unconfirmed_count:
+            print(f"Unconfirmed (not yet analysed by NVD, not counted): {unconfirmed_count}")
         print(f"{'='*80}\n")
 
         for result in results:
+            has_lists = result.cves or result.unconfirmed or result.all_versions
             if result.error:
                 print(f"[ERROR] {sanitize_output(result.software_name)}: Query failed")
-                continue
-
-            if not result.cves:
+            if not has_lists:
                 continue
 
             print(f"\n{sanitize_output(result.software_name)} (v{sanitize_output(result.software_version)})")
-            print(f"  Found {result.total_count} potential CVE(s):")
+            fetched = len(result.cves) + len(result.all_versions)
+            if result.total_available > fetched:
+                print(f"  {result.total_available} CVE(s) affect this version "
+                      f"(first {fetched} fetched; page limit reached):")
+            elif result.cves:
+                print(f"  {result.total_count} CVE(s) affect this version:")
 
             for cve in result.cves[:5]:  # Show top 5 per software
-                print(f"\n  {cve.severity_color} {cve.cve_id} (CVSS: {cve.cvss_score})")
-                print(f"      Severity: {cve.severity}")
-                print(f"      Published: {cve.published_date}")
+                kev = " [KEV: known exploited]" if cve.known_exploited else ""
+                print(f"\n  {cve.severity_color} {sanitize_output(cve.cve_id)} ({sanitize_output(cve.score_label)}){kev}")
+                print(f"      Severity: {sanitize_output(cve.severity)}")
+                print(f"      Published: {sanitize_output(cve.published_date)}")
                 # Wrap description
                 safe_desc = sanitize_output(cve.description)
                 desc_lines = [safe_desc[i:i+60] for i in range(0, len(safe_desc), 60)]
@@ -2404,6 +2669,10 @@ class VulnerabilityScanner:
 
             if len(result.cves) > 5:
                 print(f"\n  ... and {len(result.cves) - 5} more CVE(s)")
+            if result.all_versions:
+                self._print_all_versions(result)
+            if result.unconfirmed:
+                self._print_unconfirmed(result)
 
         print(f"\n{'='*80}")
         print("RECOMMENDATIONS:")
@@ -2412,8 +2681,8 @@ class VulnerabilityScanner:
         print("  3. Check vendor advisories for patches and mitigations")
         print("  4. Consider removing software that is no longer maintained")
         print(f"{'='*80}")
-        print("\nNote: Results are based on keyword matching and may include")
-        print("CVEs that don't apply to your specific version. Always verify")
+        print("\nNote: Results come from NVD's product (CPE) data for each program's exact")
+        print("version. Programs without a CPE mapping are not checked. Always verify")
         print("against official vendor advisories.")
 
 
@@ -2915,6 +3184,29 @@ class BaselineManager:
             print("\nNOTE: Software has been removed since baseline was created.")
 
 
+def _cve_limit_arg(value: str) -> int:
+    """argparse type for --cve-limit: a whole number from 1 to 100 (NVD rate limits)."""
+    try:
+        limit = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a whole number from 1 to 100")
+    if not 1 <= limit <= 100:
+        raise argparse.ArgumentTypeError(f"must be from 1 to 100, not {limit}")
+    return limit
+
+
+def _parse_exclude_terms(value: Optional[str]) -> Optional[list[str]]:
+    """Split a comma-separated --exclude value into terms, ignoring empty ones.
+
+    An empty term would match every name ("" is in every string), so "chrome," must mean
+    just "chrome", not "everything". Returns None when no terms are left.
+    """
+    if not value:
+        return None
+    terms = [t.strip() for t in value.split(",") if t.strip()]
+    return terms or None
+
+
 def main():
     """Main entry point for the CLI."""
     _harden_process_environment()
@@ -2945,8 +3237,8 @@ Examples:
     parser.add_argument(
         "--source",
         choices=["registry", "store", "portable", "all"],
-        default="all",
-        help="Source to scan (default: all)",
+        default=None,
+        help="Source to scan (default: all; registry for --check-vulns)",
     )
 
     parser.add_argument(
@@ -3017,10 +3309,10 @@ Examples:
 
     parser.add_argument(
         "--cve-limit",
-        type=int,
+        type=_cve_limit_arg,
         default=20,
         metavar="N",
-        help="Maximum number of software items to check for CVEs (default: 20)",
+        help="Maximum number of programs to check for CVEs, 1-100 (default: 20)",
     )
 
     parser.add_argument(
@@ -3042,9 +3334,6 @@ Examples:
     )
 
     args = parser.parse_args()
-
-    # Validate --cve-limit
-    args.cve_limit = max(1, min(args.cve_limit, 100))
 
     # Setup logging before any operations
     try:
@@ -3116,29 +3405,27 @@ Examples:
             print("Scanning for known vulnerabilities (CVEs)...", file=sys.stderr)
             print("This may take a while due to API rate limits.\n", file=sys.stderr)
 
-        # First, enumerate software from registry (most reliable source)
+        # Registry by default (the most reliable versions); --source chooses others
+        vuln_sources = (["registry", "store", "portable"] if args.source == "all"
+                        else [args.source or "registry"])
         enumerator = SoftwareEnumerator()
-        software_list = enumerator.scan_all(["registry"], show_progress=not args.quiet)
+        software_list = enumerator.scan_all(vuln_sources, show_progress=not args.quiet)
+        software_list = enumerator.filter_results(software_list, args.search, _parse_exclude_terms(args.exclude))
         if not args.quiet:
-            print()
+            print(file=sys.stderr)
 
-        # Filter to scannable software for progress bar
         vuln_scanner = VulnerabilityScanner(api_key=args.nvd_api_key)
-        scannable = [s for s in software_list
-                     if not vuln_scanner._should_skip_software(s.name) and s.version][:args.cve_limit]
+        plan = vuln_scanner.plan_scan(software_list, limit=args.cve_limit)
 
         progress_callback = None
         if not args.quiet:
-            progress = ProgressBar(total=len(scannable), prefix="CVE Check")
+            progress = ProgressBar(total=len(plan.targets), prefix="CVE Check")
 
             def progress_callback(current, total, name):
                 progress.update(current, name)
                 logger.debug(f"Scanning for CVEs: {name}")
 
-        results = vuln_scanner.scan_software_list(
-            software_list, progress_callback=progress_callback,
-            limit=args.cve_limit,
-        )
+        results = vuln_scanner.scan_plan(plan, progress_callback=progress_callback)
         if not args.quiet:
             progress.finish("Complete")
 
@@ -3147,18 +3434,23 @@ Examples:
         log_audit_event(
             "SCAN_END",
             "Vulnerability scan completed",
-            software_scanned=len(scannable),
+            software_scanned=len(plan.targets),
+            not_checked=len(plan.unmapped) + plan.no_version + plan.over_limit,
             cves_found=total_cves,
             critical_cves=critical_count,
+            failed=sum(1 for r in results if r.error),
         )
 
         if not args.quiet:
             print(file=sys.stderr)
-        vuln_scanner.display_results(results)
+        vuln_scanner.display_results(results, plan)
+        if any(r.error for r in results):
+            # Results are incomplete; scripts must not read this as "no CVEs"
+            sys.exit(EXIT_API_FAILURE)
         return
 
     # Determine sources to scan
-    if args.source == "all":
+    if args.source in (None, "all"):
         sources = ["registry", "store", "portable"]
     else:
         sources = [args.source]
@@ -3176,7 +3468,7 @@ Examples:
     # Suppress progress output if outputting to JSON/CSV (for clean piping) or quiet mode
     show_progress = args.output == "table" and not args.diff and not args.quiet
     software_list = enumerator.scan_all(sources, show_progress=show_progress)
-    exclude_terms = [t.strip() for t in args.exclude.split(",")] if args.exclude else None
+    exclude_terms = _parse_exclude_terms(args.exclude)
     software_list = enumerator.filter_results(software_list, args.search, exclude_terms)
     software_list = enumerator.sort_results(software_list, args.sort)
 

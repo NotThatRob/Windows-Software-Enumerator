@@ -12,10 +12,12 @@ Tests to verify security fixes are working correctly:
 """
 
 import csv
+import datetime
 import io
 import logging
 import msvcrt
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -179,7 +181,7 @@ class TestUserAgent(unittest.TestCase):
         """User-Agent should not identify the tool as a security scanner."""
         scanner = se.VulnerabilityScanner()
 
-        # Access the _query_nvd_api method to check headers
+        # Make one request through _nvd_request to check the headers
         # We need to mock urllib to capture the request
         with patch('urllib.request.urlopen') as mock_urlopen:
             mock_response = MagicMock()
@@ -189,7 +191,7 @@ class TestUserAgent(unittest.TestCase):
             mock_urlopen.return_value = mock_response
 
             try:
-                scanner._query_nvd_api("test")
+                scanner._nvd_request([("keywordSearch", "test")])
             except:
                 pass  # We just want to capture the request
 
@@ -280,7 +282,7 @@ class TestErrorMessageSanitization(unittest.TestCase):
             mock_urlopen.side_effect = urllib.error.URLError("Connection refused to internal.server.local:8080")
 
             with self.assertRaises(Exception) as context:
-                scanner._query_nvd_api("test")
+                scanner._nvd_request([("keywordSearch", "test")])
 
             error_msg = str(context.exception)
             # Should not contain the detailed reason
@@ -306,7 +308,7 @@ class TestErrorMessageSanitization(unittest.TestCase):
             mock_urlopen.side_effect = mock_error
 
             with self.assertRaises(Exception) as context:
-                scanner._query_nvd_api("test")
+                scanner._nvd_request([("keywordSearch", "test")])
 
             error_msg = str(context.exception)
             # Should not contain sensitive details
@@ -466,107 +468,6 @@ class TestDataclassSecurity(unittest.TestCase):
                 self.fail(f"matches_search raised exception for '{search}': {e}")
 
 
-class TestVersionMatching(unittest.TestCase):
-    """Test CVE version matching logic."""
-
-    def setUp(self):
-        self.scanner = se.VulnerabilityScanner()
-
-    def test_version_parse_standard(self):
-        """Standard version string parses to integer tuple."""
-        self.assertEqual(se.VulnerabilityScanner._parse_version("1.2.3"), (1, 2, 3))
-
-    def test_version_parse_with_text(self):
-        """Version with text suffix stops at non-numeric segment."""
-        self.assertEqual(se.VulnerabilityScanner._parse_version("1.2.3-beta"), (1, 2, 3))
-
-    def test_version_parse_empty(self):
-        """Empty string returns empty tuple."""
-        self.assertEqual(se.VulnerabilityScanner._parse_version(""), ())
-
-    def test_version_in_range_basic(self):
-        """Version within range returns True."""
-        self.assertTrue(se.VulnerabilityScanner._version_in_range(
-            (1, 5, 0), start_inc="1.0", end_exc="2.0"))
-
-    def test_version_below_range(self):
-        """Version below range returns False."""
-        self.assertFalse(se.VulnerabilityScanner._version_in_range(
-            (0, 9, 0), start_inc="1.0", end_exc="2.0"))
-
-    def test_version_above_range(self):
-        """Version above range returns False."""
-        self.assertFalse(se.VulnerabilityScanner._version_in_range(
-            (2, 1, 0), start_inc="1.0", end_exc="2.0"))
-
-    def test_version_at_boundary_inclusive(self):
-        """Version at inclusive start boundary returns True."""
-        self.assertTrue(se.VulnerabilityScanner._version_in_range(
-            (1, 0), start_inc="1.0", end_exc="2.0"))
-
-    def test_version_at_boundary_exclusive(self):
-        """Version at exclusive end boundary returns False."""
-        self.assertFalse(se.VulnerabilityScanner._version_in_range(
-            (2, 0), start_inc="1.0", end_exc="2.0"))
-
-    def test_version_matches_with_cpe_data(self):
-        """Version matching with proper CPE configuration data."""
-        vuln_data = {
-            "cve": {
-                "configurations": [{
-                    "nodes": [{
-                        "cpeMatch": [{
-                            "criteria": "cpe:2.3:a:vendor:product:*:*:*:*:*:*:*:*",
-                            "versionStartIncluding": "1.0",
-                            "versionEndExcluding": "2.5.3",
-                            "vulnerable": True
-                        }]
-                    }]
-                }]
-            }
-        }
-        self.assertTrue(self.scanner._version_matches(vuln_data, "2.0.0"))
-        self.assertFalse(self.scanner._version_matches(vuln_data, "3.0.0"))
-
-    def test_version_matches_no_config(self):
-        """Missing configurations returns True (conservative)."""
-        vuln_data = {"cve": {}}
-        self.assertTrue(self.scanner._version_matches(vuln_data, "1.0.0"))
-
-    def test_version_matches_filters_out_unaffected(self):
-        """Installed version outside all ranges returns False."""
-        vuln_data = {
-            "cve": {
-                "configurations": [{
-                    "nodes": [{
-                        "cpeMatch": [{
-                            "criteria": "cpe:2.3:a:vendor:product:*:*:*:*:*:*:*:*",
-                            "versionStartIncluding": "1.0",
-                            "versionEndExcluding": "1.5",
-                            "vulnerable": True
-                        }, {
-                            "criteria": "cpe:2.3:a:vendor:product:*:*:*:*:*:*:*:*",
-                            "versionStartIncluding": "2.0",
-                            "versionEndExcluding": "2.3",
-                            "vulnerable": True
-                        }]
-                    }]
-                }]
-            }
-        }
-        self.assertFalse(self.scanner._version_matches(vuln_data, "1.8.0"))
-
-    def test_version_matches_malformed_input(self):
-        """Malformed data should not crash."""
-        # Completely wrong structure
-        self.assertTrue(self.scanner._version_matches({}, "1.0"))
-        # Configurations with empty nodes
-        vuln_data = {"cve": {"configurations": [{"nodes": []}]}}
-        self.assertTrue(self.scanner._version_matches(vuln_data, "1.0"))
-        # None-like values
-        self.assertTrue(self.scanner._version_matches({"cve": {}}, ""))
-
-
 class TestCsvParsing(unittest.TestCase):
     """Test that CSV parsing with csv module handles edge cases."""
 
@@ -634,6 +535,543 @@ class TestSoftwareMappings(unittest.TestCase):
         result = scanner._normalize_software_name("MyApp 2.0.1")
         self.assertNotIn("2.0.1", result)
 
+    def test_normalize_keeps_digits_that_belong_to_the_name(self):
+        """Leading digits are part of names like 7-Zip; only whole version tokens go."""
+        scanner = se.VulnerabilityScanner()
+        cases = {
+            "7-Zip 23.01 (x64)": "7-zip",
+            "Python 3.12.1 (64-bit)": "python",
+            "Mozilla Firefox (x64 en-US)": "mozilla firefox",
+            "Notepad++ (64-bit x64)": "notepad++",
+            "Wireshark 4.0.0 64-bit": "wireshark",
+            "PuTTY release 0.80 (64-bit)": "putty release",
+            "1Password": "1password",
+            "VLC media player": "vlc media player",
+        }
+        for display_name, expected in cases.items():
+            self.assertEqual(scanner._normalize_software_name(display_name), expected, display_name)
+
+    def test_mapping_matches_whole_words_only(self):
+        """A short key must not match inside another word ("git" in "Logitech", "rust" in "RustDesk")."""
+        scanner = se.VulnerabilityScanner()
+        for display_name in ["Logitech G HUB", "GitHub Desktop", "RustDesk", "Digital Editions 4.5"]:
+            self.assertIsNone(scanner._find_mapping(display_name), display_name)
+
+    def test_mapping_finds_known_programs(self):
+        scanner = se.VulnerabilityScanner()
+        cases = {
+            "Git": ("git-scm", "git"),
+            "7-Zip 23.01 (x64)": ("7-zip", "7-zip"),
+            "Notepad++ (64-bit x64)": ("notepad-plus-plus", "notepad\\+\\+"),
+            "VLC media player": ("videolan", "vlc_media_player"),
+            "Microsoft Visual Studio Code": ("microsoft", "visual_studio_code"),
+            "Rust 1.75 (MSVC 64-bit)": ("rust-lang", "rust"),
+        }
+        for display_name, expected in cases.items():
+            self.assertEqual(scanner._find_mapping(display_name), expected, display_name)
+
+    def test_repaired_mappings_point_at_products_nvd_knows(self):
+        """Mappings NVD doesn't know (0 dictionary entries) are fixed or removed, not left to find nothing."""
+        scanner = se.VulnerabilityScanner()
+        cases = {
+            "Microsoft Edge": ("microsoft", "edge_chromium"),        # "edge" is the retired EdgeHTML browser
+            "Microsoft Edge Update": ("microsoft", "edge_update"),
+            "Zoom Workplace (64-bit)": ("zoom", "workplace_desktop"),
+            "Epic Games Launcher": ("epicgames", "launcher"),
+            "OBS Studio": None, "HandBrake 1.7.2": None, "ShareX": None, "Slack": None, "Vivaldi": None,
+            "Apache OpenOffice 4.1.15": None,                       # not Apache HTTP Server
+        }
+        for display_name, expected in cases.items():
+            self.assertEqual(scanner._find_mapping(display_name), expected, display_name)
+
+    def test_real_install_names_map_to_the_right_product(self):
+        """Names seen on a real machine that mapped to the wrong product (or version scheme)."""
+        scanner = se.VulnerabilityScanner()
+        cases = {
+            "Visual Studio Community 2026": ("microsoft", "visual_studio_2026"),
+            "Visual Studio Professional 2022": ("microsoft", "visual_studio_2022"),
+            "Microsoft Visual Studio Installer": None,             # its own version scheme
+            "OpenVPN Connect": ("openvpn", "connect"),             # not OpenVPN (community)
+        }
+        for display_name, expected in cases.items():
+            self.assertEqual(scanner._find_mapping(display_name), expected, display_name)
+        self.assertTrue(scanner._should_skip_software("Python Launcher"))  # not a CPython version
+        # NVD versions the Steam client by date ("2021-04-10"); "2.10.91.91" can't be compared
+        self.assertIsNone(scanner._find_mapping("Steam"))
+        self.assertEqual(se.VulnerabilityScanner._cpe_version("postgresql", "postgresql", "17.11-5"), "17.11")
+
+    def test_longest_matching_key_wins(self):
+        """When two keys match, the more specific (longer) one is used, whatever the table order."""
+        scanner = se.VulnerabilityScanner()
+        mappings = {"visual studio": ("microsoft", "visual_studio"),
+                    "visual studio code": ("microsoft", "visual_studio_code")}
+        with patch.object(se.VulnerabilityScanner, "SOFTWARE_MAPPINGS", mappings):
+            self.assertEqual(scanner._find_mapping("Microsoft Visual Studio Code"),
+                             ("microsoft", "visual_studio_code"))
+
+
+def _nvd_vuln(cve_id, severity="HIGH", score=7.5, configurations=None, **cve_fields):
+    """A minimal NVD 'vulnerabilities' entry."""
+    cve = {"id": cve_id, "published": "2024-01-01T00:00:00.000",
+           "descriptions": [{"lang": "en", "value": f"{cve_id} description"}],
+           "metrics": {"cvssMetricV31": [{"type": "Primary",
+                                          "cvssData": {"baseScore": score, "baseSeverity": severity}}]},
+           "configurations": configurations or []}
+    cve.update(cve_fields)
+    return {"cve": cve}
+
+
+class _FakeNvd:
+    """Stands in for urllib.request.urlopen: returns the given pages in order and records each URL."""
+
+    def __init__(self, *pages):
+        self.pages = list(pages)
+        self.urls = []
+
+    def __call__(self, request, timeout=None):
+        self.urls.append(request.full_url)
+        page = self.pages.pop(0) if self.pages else {"totalResults": 0, "vulnerabilities": []}
+        if isinstance(page, BaseException):
+            raise page
+        response = MagicMock()
+        response.read.return_value = json.dumps(page).encode("utf-8")
+        response.__enter__ = MagicMock(return_value=response)
+        response.__exit__ = MagicMock(return_value=False)
+        return response
+
+
+class TestNvdCpeQuery(unittest.TestCase):
+    """The CVE check asks NVD which CVEs affect the installed product at its installed version."""
+
+    VLC = se.SoftwareInfo(name="VLC media player", version="3.0.18", publisher="VideoLAN")
+
+    def setUp(self):
+        self.scanner = se.VulnerabilityScanner()
+        self.scanner._rate_max = 1000          # no rate-limit sleeps in tests
+        # These tests are about the confirmed (CPE) query only; the unconfirmed search has its own tests
+        patcher = patch.object(se.VulnerabilityScanner, "SEARCH_PHRASES", {})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _scan(self, software, *pages):
+        fake = _FakeNvd(*pages)
+        with patch("urllib.request.urlopen", side_effect=fake):
+            result = self.scanner.scan_software(software)
+        return result, fake
+
+    def test_asks_nvd_for_this_product_at_this_version(self):
+        _, fake = self._scan(self.VLC, {"totalResults": 0, "vulnerabilities": []})
+        self.assertEqual(len(fake.urls), 1)
+        url = fake.urls[0]
+        self.assertIn("cpeName=cpe:2.3:a:videolan:vlc_media_player:3.0.18", url)
+        self.assertIn("&isVulnerable", url)
+        self.assertIn("&noRejected", url)
+        self.assertNotIn("keywordSearch", url)
+
+    def test_reads_every_page(self):
+        result, fake = self._scan(
+            self.VLC,
+            {"totalResults": 3, "vulnerabilities": [_nvd_vuln("CVE-2024-0001"), _nvd_vuln("CVE-2024-0002")]},
+            {"totalResults": 3, "vulnerabilities": [_nvd_vuln("CVE-2024-0003")]})
+        self.assertEqual(sorted(c.cve_id for c in result.cves), ["CVE-2024-0001", "CVE-2024-0002", "CVE-2024-0003"])
+        self.assertIn("startIndex=0", fake.urls[0])
+        self.assertIn("startIndex=2", fake.urls[1])
+        self.assertEqual(result.total_available, 3)
+
+    def test_page_cap_is_respected_and_total_kept(self):
+        page = {"totalResults": 10, "vulnerabilities": [_nvd_vuln("CVE-2024-1001"), _nvd_vuln("CVE-2024-1002")]}
+        with patch.object(se.VulnerabilityScanner, "MAX_PAGES", 2):
+            result, fake = self._scan(self.VLC, page, page, page)
+        self.assertEqual(len(fake.urls), 2)
+        self.assertEqual(result.total_available, 10)          # so the report can say "showing 4 of 10"
+        self.assertEqual(len(result.cves), 4)
+
+    def test_keeps_what_nvd_reports_without_filtering_again(self):
+        """NVD already decided the CVE affects this version; a local re-check must not drop it."""
+        other_product = [{"nodes": [{"cpeMatch": [{
+            "vulnerable": True, "criteria": "cpe:2.3:a:videolan:vlc_media_player:*:*:*:*:*:*:*:*",
+            "versionStartIncluding": "4.0", "versionEndExcluding": "4.0.2"}]}]}]
+        result, _ = self._scan(self.VLC, {"totalResults": 1, "vulnerabilities": [
+            _nvd_vuln("CVE-2024-2001", configurations=other_product)]})
+        self.assertEqual([c.cve_id for c in result.cves], ["CVE-2024-2001"])
+
+    def test_unmapped_program_is_not_checked(self):
+        result, fake = self._scan(se.SoftwareInfo(name="Some Unknown App", version="1.0"))
+        self.assertEqual(fake.urls, [])                        # no guessing by the first word
+        self.assertEqual(result.not_checked, "no CPE mapping")
+        self.assertEqual(result.cves, [])
+
+    def test_version_unusable_in_a_cpe_name_is_not_checked(self):
+        for version in ["3.0 beta", "3.0:*", "", "*"]:
+            result, fake = self._scan(se.SoftwareInfo(name="VLC media player", version=version))
+            self.assertEqual(fake.urls, [], version)
+            self.assertTrue(result.not_checked, version)
+
+    def test_installer_versions_are_translated_for_nvd(self):
+        """Python and Java installers report versions that NVD would read as different versions."""
+        cases = [
+            (("python", "python"), "3.11.4150.0", "3.11.4"),
+            (("python", "python"), "3.13.150.0", "3.13.0"),
+            (("python", "python"), "3.12.1", "3.12.1"),             # already plain
+            (("oracle", "jre"), "8.0.4010.10", "1.8.0:update401"),
+            (("oracle", "jre"), "8.0.3910.13", "1.8.0:update391"),
+            (("oracle", "jre"), "17.0.9.0", "17.0.9"),
+            (("videolan", "vlc_media_player"), "3.0.18.0", "3.0.18.0"),  # other products untouched
+        ]
+        for (vendor, product), raw, expected in cases:
+            self.assertEqual(se.VulnerabilityScanner._cpe_version(vendor, product, raw), expected, raw)
+
+    def test_translated_version_is_what_nvd_is_asked_about(self):
+        _, fake = self._scan(se.SoftwareInfo(name="Python 3.11.4 (64-bit)", version="3.11.4150.0"))
+        self.assertIn("cpeName=cpe:2.3:a:python:python:3.11.4&", fake.urls[0])
+        _, fake = self._scan(se.SoftwareInfo(name="Java 8 Update 401 (64-bit)", version="8.0.4010.10"))
+        self.assertIn("cpeName=cpe:2.3:a:oracle:jre:1.8.0:update401&", fake.urls[0])
+
+    def test_nvd_failure_is_reported_not_hidden(self):
+        import urllib.error
+        result, _ = self._scan(self.VLC, urllib.error.URLError("down"))
+        self.assertIn("Unable to reach NVD API", result.error)
+        self.assertEqual(result.cves, [])
+
+
+class TestCveScores(unittest.TestCase):
+    """Which CVSS score is shown, and that unscored or LOW CVEs are kept."""
+
+    def setUp(self):
+        self.scanner = se.VulnerabilityScanner()
+
+    @staticmethod
+    def _metric(score, severity, type_):
+        return {"type": type_, "cvssData": {"baseScore": score, "baseSeverity": severity}}
+
+    def _parse(self, metrics):
+        vuln = _nvd_vuln("CVE-2025-0001")
+        vuln["cve"]["metrics"] = metrics
+        return self.scanner._parse_cve(vuln)
+
+    def test_nvd_primary_score_wins_over_a_secondary_listed_first(self):
+        cve = self._parse({"cvssMetricV31": [self._metric(9.8, "CRITICAL", "Secondary"),
+                                             self._metric(5.3, "MEDIUM", "Primary")]})
+        self.assertEqual((cve.cvss_score, cve.severity, cve.score_source), (5.3, "MEDIUM", "NVD"))
+
+    def test_secondary_score_used_and_labelled_when_nvd_has_none(self):
+        cve = self._parse({"cvssMetricV31": [self._metric(8.1, "HIGH", "Secondary")]})
+        self.assertEqual((cve.cvss_score, cve.score_source, cve.cvss_version), (8.1, "CNA", "3.1"))
+        self.assertEqual(cve.score_label, "CVSS 8.1, CNA v3.1")
+
+    def test_newest_cvss_version_wins(self):
+        cve = self._parse({"cvssMetricV31": [self._metric(7.5, "HIGH", "Primary")],
+                           "cvssMetricV40": [self._metric(8.7, "HIGH", "Primary")]})
+        self.assertEqual((cve.cvss_score, cve.cvss_version), (8.7, "4.0"))
+
+    def test_cvss2_only(self):
+        cve = self._parse({"cvssMetricV2": [self._metric(9.3, "HIGH", "Primary")]})
+        self.assertEqual((cve.severity, cve.cvss_version), ("CRITICAL", "2.0"))
+
+    def test_unscored_and_low_cves_are_kept(self):
+        """A CVE NVD hasn't scored yet is still a CVE that affects the version; so is a LOW one."""
+        scanner = self.scanner
+        scanner._rate_max = 1000
+        unscored = _nvd_vuln("CVE-2026-0001")
+        unscored["cve"]["metrics"] = {}
+        low = _nvd_vuln("CVE-2026-0002", severity="LOW", score=2.1)
+        page = {"totalResults": 2, "vulnerabilities": [unscored, low]}
+        with patch("urllib.request.urlopen", side_effect=_FakeNvd(page)):
+            result = scanner.scan_software(se.SoftwareInfo(name="VLC media player", version="3.0.18"))
+        by_id = {c.cve_id: c for c in result.cves}
+        self.assertEqual(set(by_id), {"CVE-2026-0001", "CVE-2026-0002"})
+        self.assertEqual(by_id["CVE-2026-0001"].severity, "UNKNOWN")
+        self.assertEqual(by_id["CVE-2026-0001"].score_label, "not scored yet")
+
+
+class TestUnconfirmedCves(unittest.TestCase):
+    """Recent CVEs NVD hasn't analysed (no product data) are listed separately and never counted."""
+
+    CHROME = se.SoftwareInfo(name="Google Chrome", version="142.0.7444.60")
+    WITH_CPE = [{"nodes": [{"cpeMatch": [{"vulnerable": True, "versionEndExcluding": "150.0",
+                                          "criteria": "cpe:2.3:a:google:chrome:*:*:*:*:*:*:*:*"}]}]}]
+
+    def setUp(self):
+        self.scanner = se.VulnerabilityScanner()
+        self.scanner._rate_max = 1000
+
+    def _scan(self, software, *pages):
+        fake = _FakeNvd(*pages)
+        with patch("urllib.request.urlopen", side_effect=fake):
+            return self.scanner.scan_software(software), fake
+
+    def test_recent_unanalysed_cves_are_listed_separately(self):
+        confirmed = {"totalResults": 1, "vulnerabilities": [_nvd_vuln("CVE-2026-1000", configurations=self.WITH_CPE)]}
+        recent = {"totalResults": 3, "vulnerabilities": [
+            _nvd_vuln("CVE-2026-1000"),                                             # already confirmed
+            _nvd_vuln("CVE-2026-2000", vulnStatus="Awaiting Analysis"),            # no product data yet
+            _nvd_vuln("CVE-2026-3000", configurations=self.WITH_CPE)]}             # analysed: CPE query decides
+        result, fake = self._scan(self.CHROME, confirmed, recent)
+        self.assertEqual([c.cve_id for c in result.cves], ["CVE-2026-1000"])
+        self.assertEqual([c.cve_id for c in result.unconfirmed], ["CVE-2026-2000"])
+        self.assertEqual(result.unconfirmed[0].status, "Awaiting Analysis")
+        self.assertEqual(result.total_count, 1)                                    # not counted
+
+        url = fake.urls[1]
+        self.assertIn("keywordSearch=Google%20Chrome", url)
+        self.assertIn("&keywordExactMatch", url)
+        self.assertIn("&noRejected", url)
+        dates = re.findall(r"pub(?:Start|End)Date=(\d{4}-\d{2}-\d{2})", url)
+        start, end = (datetime.date.fromisoformat(d) for d in dates)
+        self.assertLessEqual((end - start).days, 120)                              # NVD's maximum range
+
+    def test_products_without_a_safe_phrase_get_no_unconfirmed_search(self):
+        """Generic names (Git) and platforms other CVEs name (Node.js: npm packages) aren't searched."""
+        for name, version in [("Git", "2.40.0"), ("Node.js", "26.13.0")]:
+            _, fake = self._scan(se.SoftwareInfo(name=name, version=version))
+            self.assertEqual(len(fake.urls), 1, name)
+
+    def test_unconfirmed_search_failure_keeps_the_confirmed_results(self):
+        import urllib.error
+        confirmed = {"totalResults": 1, "vulnerabilities": [_nvd_vuln("CVE-2026-1000", configurations=self.WITH_CPE)]}
+        result, _ = self._scan(self.CHROME, confirmed, urllib.error.URLError("down"))
+        self.assertEqual([c.cve_id for c in result.cves], ["CVE-2026-1000"])
+        self.assertIn("Unable to reach NVD API", result.error)
+
+
+class TestCveTargetSelection(unittest.TestCase):
+    """Which programs --check-vulns looks up: mapped ones, by name, once per product + version."""
+
+    SOFTWARE = [
+        se.SoftwareInfo(name="VLC media player", version="3.0.18"),
+        se.SoftwareInfo(name="Some Unknown App", version="1.0"),
+        se.SoftwareInfo(name="Python 3.11.4 Core Interpreter (64-bit)", version="3.11.4150.0"),
+        se.SoftwareInfo(name="Microsoft Visual C++ 2015 Redistributable (x64)", version="14.0"),
+        se.SoftwareInfo(name="Git", version=""),
+        se.SoftwareInfo(name="7-Zip 23.01 (x64)", version="23.01"),
+        se.SoftwareInfo(name="Python 3.11.4 (64-bit)", version="3.11.4150.0"),
+    ]
+
+    def test_plan_is_in_name_order_and_counts_what_is_left_out(self):
+        plan = se.VulnerabilityScanner().plan_scan(self.SOFTWARE, limit=2)
+        self.assertEqual([s.name for s in plan.targets], ["7-Zip 23.01 (x64)", "Python 3.11.4 (64-bit)"])
+        self.assertEqual([s.name for s in plan.unmapped], ["Some Unknown App"])
+        self.assertEqual((plan.skipped, plan.no_version, plan.duplicates, plan.over_limit), (1, 1, 1, 1))
+
+    def test_order_does_not_depend_on_registry_order(self):
+        scanner = se.VulnerabilityScanner()
+        forward = scanner.plan_scan(self.SOFTWARE, limit=2).targets
+        backward = scanner.plan_scan(list(reversed(self.SOFTWARE)), limit=2).targets
+        self.assertEqual([s.name for s in forward], [s.name for s in backward])
+
+    def test_progress_counts_finished_programs(self):
+        """The bar must not read N/N while the last program is still being looked up."""
+        scanner = se.VulnerabilityScanner()
+        plan = scanner.plan_scan(self.SOFTWARE, limit=10)
+        events = []
+        def fake_scan(s):
+            events.append(("scanned", s.name))
+            return se.VulnerabilityResult(software_name=s.name, software_version=s.version)
+        with patch.object(scanner, "scan_software", side_effect=fake_scan):
+            scanner.scan_plan(plan, progress_callback=lambda done, total, name: events.append((done, total)))
+        reported = [e for e in events if e[0] != "scanned"]
+        self.assertEqual(reported, [(i, len(plan.targets)) for i in range(len(plan.targets))])
+
+    def test_every_checked_program_gets_a_result_even_when_clean(self):
+        scanner = se.VulnerabilityScanner()
+        plan = scanner.plan_scan(self.SOFTWARE, limit=10)
+        clean = lambda s: se.VulnerabilityResult(software_name=s.name, software_version=s.version)  # noqa: E731
+        with patch.object(scanner, "scan_software", side_effect=clean):
+            results = scanner.scan_plan(plan)
+        self.assertEqual(len(results), len(plan.targets))
+
+
+class TestCveSummary(unittest.TestCase):
+    """The results always say what was checked; a clean result is never a bare all-clear."""
+
+    def _display(self, results, plan):
+        out = io.StringIO()
+        with patch("sys.stdout", out):
+            se.VulnerabilityScanner().display_results(results, plan)
+        return out.getvalue()
+
+    @staticmethod
+    def _result(name, cves=(), **kw):
+        return se.VulnerabilityResult(software_name=name, software_version="1.0", cves=list(cves), **kw)
+
+    @staticmethod
+    def _cve(cve_id, kev=False):
+        return se.CVEInfo(cve_id=cve_id, description="d", severity="HIGH", cvss_score=7.5,
+                          published_date="2025-01-01", cvss_version="3.1", score_source="NVD",
+                          known_exploited=kev)
+
+    def test_clean_scan_says_what_was_and_was_not_checked(self):
+        plan = se.VulnScanPlan(unmapped=[se.SoftwareInfo(name="Some Unknown App")], over_limit=1, limit=20)
+        out = self._display([self._result("VLC media player"), self._result("7-Zip")], plan)
+        self.assertIn("Checked 2 program(s) against NVD", out)
+        self.assertIn("No known CVEs affect the 2 program(s) checked.", out)
+        self.assertIn("1 without a CPE mapping", out)
+        self.assertIn("Some Unknown App", out)
+        self.assertIn("1 over --cve-limit 20", out)
+        self.assertNotIn("No vulnerabilities found", out)
+
+    def test_nothing_checked_is_not_an_all_clear(self):
+        plan = se.VulnScanPlan(unmapped=[se.SoftwareInfo(name=f"App {i}") for i in range(3)])
+        out = self._display([], plan)
+        self.assertIn("No programs were checked", out)
+        self.assertNotIn("No known CVEs affect", out)
+
+    def test_affected_summary_counts_known_exploited(self):
+        out = self._display([self._result("WinRAR", [self._cve("CVE-2023-38831", kev=True),
+                                                    self._cve("CVE-2023-0002")])], se.VulnScanPlan())
+        self.assertIn("Affected: 1 program(s), 2 CVE(s)", out)
+        self.assertIn("Known exploited (KEV): 1", out)
+        self.assertIn("[KEV: known exploited]", out)
+
+    def test_page_limit_is_stated(self):
+        result = self._result("Google Chrome", [self._cve(f"CVE-2024-{i:04d}") for i in range(3)],
+                              total_available=10000)
+        self.assertIn("10000 CVE(s) affect this version (first 3 fetched; page limit reached)",
+                      self._display([result], se.VulnScanPlan()))
+
+
+class TestCheckVulnsMain(unittest.TestCase):
+    """main() --check-vulns honours --source / --search / --exclude (NVD and the scan mocked)."""
+
+    SOFTWARE = [se.SoftwareInfo(name="Google Chrome", version="142.0.7444.60", publisher="Google LLC"),
+                se.SoftwareInfo(name="Mozilla Firefox (x64 en-US)", version="144.0", publisher="Mozilla")]
+
+    def setUp(self):
+        self._saved_handlers = list(se.logger.handlers)
+
+    def tearDown(self):
+        se.logger.handlers = self._saved_handlers
+
+    def _run(self, *argv, pages=()):
+        self.exit_code = None
+        fake, scan_all = _FakeNvd(*pages), MagicMock(return_value=list(self.SOFTWARE))
+        with patch.object(sys, "argv", ["Software_Enumerator.py", "--check-vulns", "--quiet", *argv]), \
+                patch.object(se, "_load_env_file"), \
+                patch.dict(os.environ, {}, clear=False), \
+                patch.object(se.SoftwareEnumerator, "scan_all", scan_all), \
+                patch("urllib.request.urlopen", side_effect=fake), \
+                patch("sys.stdout", io.StringIO()) as out:
+            os.environ.pop("NVD_API_KEY", None)
+            try:
+                se.main()
+            except SystemExit as e:
+                self.exit_code = e.code
+        return fake, scan_all, out.getvalue()
+
+    def test_search_filter_is_honoured(self):
+        fake, _, out = self._run("--search", "chrome")
+        self.assertTrue(any("google:chrome" in u for u in fake.urls))
+        self.assertFalse(any("firefox" in u.lower() for u in fake.urls))
+        self.assertIn("Checked 1 program(s)", out)
+
+    def test_exclude_filter_is_honoured(self):
+        fake, _, _ = self._run("--exclude", "mozilla,")
+        self.assertFalse(any("firefox" in u.lower() for u in fake.urls))
+
+    def test_nvd_failure_exits_with_api_failure_code(self):
+        import urllib.error
+        _, _, out = self._run("--search", "chrome", pages=[urllib.error.URLError("down")])
+        self.assertEqual(self.exit_code, se.EXIT_API_FAILURE)
+        self.assertIn("Failed: 1 program(s)", out)
+
+    def test_out_of_range_cve_limit_is_rejected_not_clamped(self):
+        for value in ["0", "-5", "500", "many"]:
+            with patch("sys.stderr", io.StringIO()) as err:
+                fake, scan_all, _ = self._run("--cve-limit", value)
+            self.assertEqual(self.exit_code, 2, value)               # argparse usage error
+            self.assertIn("--cve-limit", err.getvalue(), value)
+            scan_all.assert_not_called()
+        self.assertEqual(se._cve_limit_arg("1"), 1)
+        self.assertEqual(se._cve_limit_arg("100"), 100)
+
+    def test_clean_scan_exits_normally(self):
+        self._run("--search", "chrome")
+        self.assertIsNone(self.exit_code)
+
+    def test_registry_by_default_and_source_honoured(self):
+        _, scan_all, _ = self._run()
+        self.assertEqual(scan_all.call_args[0][0], ["registry"])
+        _, scan_all, _ = self._run("--source", "all")
+        self.assertEqual(scan_all.call_args[0][0], ["registry", "store", "portable"])
+
+
+class TestAllVersionsCves(unittest.TestCase):
+    """CVEs NVD records for every version of a product (no version info) are listed apart, not counted."""
+
+    CHROME = se.SoftwareInfo(name="Google Chrome", version="157.0.8103.39")
+
+    @staticmethod
+    def _config(**match):
+        return [{"nodes": [{"cpeMatch": [dict(
+            {"vulnerable": True, "criteria": "cpe:2.3:a:google:chrome:*:*:*:*:*:*:*:*"}, **match)]}]}]
+
+    def _scan(self, *vulns):
+        scanner = se.VulnerabilityScanner()
+        scanner._rate_max = 1000
+        page = {"totalResults": len(vulns), "vulnerabilities": list(vulns)}
+        with patch.object(se.VulnerabilityScanner, "SEARCH_PHRASES", {}), \
+                patch("urllib.request.urlopen", side_effect=_FakeNvd(page)):
+            return scanner.scan_software(self.CHROME)
+
+    def test_cve_without_any_version_information_is_set_aside(self):
+        result = self._scan(_nvd_vuln("CVE-2012-4929", configurations=self._config()))
+        self.assertEqual([c.cve_id for c in result.all_versions], ["CVE-2012-4929"])
+        self.assertEqual(result.cves, [])
+        self.assertEqual((result.total_count, result.critical_count, result.high_count), (0, 0, 0))
+
+    def test_every_version_entry_next_to_ranges_is_set_aside(self):
+        """CVE-2009-2469 lists Firefox up to 3.0.11 and also every Firefox version; the latter matches 159."""
+        mixed = [{"nodes": [{"cpeMatch": [
+            {"vulnerable": True, "criteria": "cpe:2.3:a:google:chrome:*:*:*:*:*:*:*:*"},
+            {"vulnerable": True, "criteria": "cpe:2.3:a:google:chrome:*:*:*:*:*:*:*:*", "versionEndIncluding": "3.0.11"},
+            {"vulnerable": True, "criteria": "cpe:2.3:a:google:chrome:2.0:*:*:*:*:*:*:*"}]}]}]
+        result = self._scan(_nvd_vuln("CVE-2009-2469", configurations=mixed))
+        self.assertEqual([c.cve_id for c in result.all_versions], ["CVE-2009-2469"])
+        self.assertEqual(result.cves, [])
+
+    def test_cve_with_a_range_or_specific_version_stays_affected(self):
+        ranged = _nvd_vuln("CVE-2026-0001", configurations=self._config(versionEndExcluding="158.0"))
+        exact = _nvd_vuln("CVE-2026-0002", configurations=[{"nodes": [{"cpeMatch": [{
+            "vulnerable": True, "criteria": "cpe:2.3:a:google:chrome:157.0.8103.39:*:*:*:*:*:*:*"}]}]}])
+        no_product_data = _nvd_vuln("CVE-2026-0003")       # nothing to judge by: not set aside
+        result = self._scan(ranged, exact, no_product_data)
+        self.assertEqual(sorted(c.cve_id for c in result.cves), ["CVE-2026-0001", "CVE-2026-0002", "CVE-2026-0003"])
+        self.assertEqual(result.all_versions, [])
+
+    def test_report_lists_them_separately(self):
+        result = self._scan(_nvd_vuln("CVE-2012-4929", configurations=self._config()))
+        out = io.StringIO()
+        with patch("sys.stdout", out):
+            se.VulnerabilityScanner().display_results([result], se.VulnScanPlan())
+        text = out.getvalue()
+        self.assertIn("No known CVEs affect the 1 program(s) checked.", text)
+        self.assertIn("Listed by NVD for every version (no version range, not counted): 1", text)
+        self.assertIn("CVE-2012-4929 (published 2024-01-01)", text)
+
+
+class TestKnownExploitedFlag(unittest.TestCase):
+    """CVEs in CISA's KEV catalog are flagged (NVD includes the KEV fields) and listed first."""
+
+    def test_kev_fields_mark_a_cve_as_known_exploited(self):
+        scanner = se.VulnerabilityScanner()
+        kev = scanner._parse_cve(_nvd_vuln("CVE-2023-38831", cisaExploitAdd="2023-08-24",
+                                           cisaActionDue="2023-09-14"))
+        plain = scanner._parse_cve(_nvd_vuln("CVE-2023-0002"))
+        self.assertTrue(kev.known_exploited)
+        self.assertEqual(kev.kev_added, "2023-08-24")
+        self.assertFalse(plain.known_exploited)
+
+    def test_known_exploited_listed_first_and_counted(self):
+        scanner = se.VulnerabilityScanner()
+        scanner._rate_max = 1000
+        page = {"totalResults": 2, "vulnerabilities": [
+            _nvd_vuln("CVE-2024-0001", severity="CRITICAL", score=9.8),
+            _nvd_vuln("CVE-2024-0002", severity="MEDIUM", score=5.0, cisaExploitAdd="2024-05-01")]}
+        with patch("urllib.request.urlopen", side_effect=_FakeNvd(page)):
+            result = scanner.scan_software(se.SoftwareInfo(name="WinRAR 6.22 (64-bit)", version="6.22"))
+        self.assertEqual([c.cve_id for c in result.cves], ["CVE-2024-0002", "CVE-2024-0001"])
+        self.assertEqual(result.kev_count, 1)
+
 
 class TestLogRotation(unittest.TestCase):
     """Test that log rotation is configured correctly."""
@@ -680,8 +1118,9 @@ class TestCveLimitArg(unittest.TestCase):
         """scan_software_list should default to 20 items."""
         scanner = se.VulnerabilityScanner()
         # Create 30 software items with versions
+        # Distinct versions of a mapped program: unmapped names are no longer checked at all
         items = [
-            se.SoftwareInfo(name=f"App{i}", version="1.0", publisher="Test")
+            se.SoftwareInfo(name="Google Chrome", version=f"1.0.{i}", publisher="Test")
             for i in range(30)
         ]
         with patch.object(scanner, 'scan_software', return_value=se.VulnerabilityResult(
@@ -693,8 +1132,9 @@ class TestCveLimitArg(unittest.TestCase):
     def test_custom_limit_respected(self):
         """Passing limit=5 should limit to 5 items."""
         scanner = se.VulnerabilityScanner()
+        # Distinct versions of a mapped program: unmapped names are no longer checked at all
         items = [
-            se.SoftwareInfo(name=f"App{i}", version="1.0", publisher="Test")
+            se.SoftwareInfo(name="Google Chrome", version=f"1.0.{i}", publisher="Test")
             for i in range(30)
         ]
         with patch.object(scanner, 'scan_software', return_value=se.VulnerabilityResult(
@@ -707,7 +1147,7 @@ class TestCveLimitArg(unittest.TestCase):
         """Values > 100 should be clamped to 100."""
         scanner = se.VulnerabilityScanner()
         items = [
-            se.SoftwareInfo(name=f"App{i}", version="1.0", publisher="Test")
+            se.SoftwareInfo(name="Google Chrome", version=f"1.0.{i}", publisher="Test")
             for i in range(150)
         ]
         with patch.object(scanner, 'scan_software', return_value=se.VulnerabilityResult(
@@ -798,8 +1238,8 @@ class TestSlidingWindowRateLimit(unittest.TestCase):
 
         with patch('urllib.request.urlopen', side_effect=[error_429, mock_success]) as mock_urlopen:
             with patch('time.sleep'):
-                result = scanner._query_nvd_api("test")
-                self.assertEqual(result, [])
+                result = scanner._nvd_request([("keywordSearch", "test")])
+                self.assertEqual(result, {"vulnerabilities": []})
                 self.assertEqual(mock_urlopen.call_count, 2)
 
 
@@ -2208,6 +2648,16 @@ class TestExcludeFilter(unittest.TestCase):
             se.SoftwareInfo(name="Firefox", version="127.0", publisher="Mozilla", source="Registry"),
         ]
         self.enumerator = se.SoftwareEnumerator()
+
+    def test_empty_terms_are_ignored(self):
+        """A stray comma used to add an empty term, and "" matches every name: everything was excluded."""
+        self.assertEqual(se._parse_exclude_terms("chrome,"), ["chrome"])
+        self.assertEqual(se._parse_exclude_terms("a,,b"), ["a", "b"])
+        self.assertEqual(se._parse_exclude_terms(" , "), None)
+        self.assertEqual(se._parse_exclude_terms(None), None)
+        kept = self.enumerator.filter_results(self.software_list, None, se._parse_exclude_terms("chrome,"))
+        self.assertEqual([s.name for s in kept],
+                         ["Microsoft .NET Runtime", "Visual C++ Redistributable", "Firefox"])
 
     def test_exclude_single_term(self):
         """Single exclude term should filter matching software."""

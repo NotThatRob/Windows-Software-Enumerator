@@ -1252,6 +1252,22 @@ class TestBaselineFilters(_MainHarness, unittest.TestCase):
         summary = self.diff_summary("--search", "chrome", baseline=[old_chrome, redist])
         self.assertEqual((summary["changed_count"], summary["total_changes"]), (1, 1), summary)
 
+    def test_saving_a_filtered_baseline_is_refused(self):
+        for option in (["--search", "chrome"], ["--exclude", "redistributable"]):
+            with self.subTest(option[0]):
+                path = self.tmp / "filtered.json"
+                r = self.run_main("--save-baseline", str(path), *option)
+                self.assertEqual(r.code, 2)   # argparse usage error
+                self.assertIn("use them with --diff instead", r.err)
+                self.assertFalse(path.exists())
+                r.scan_all.assert_not_called()
+
+    def test_empty_exclude_terms_are_not_a_filter(self):
+        path = self.tmp / "full.json"
+        r = self.run_main("--save-baseline", str(path), "--exclude", " , ", "--quiet")
+        self.assertEqual(r.code, se.EXIT_SUCCESS)
+        self.assertEqual(len(se.BaselineManager.load_baseline(str(path))[0]), len(self.SOFTWARE))
+
 
 class TestAllVersionsCves(unittest.TestCase):
     """CVEs NVD records for every version of a product (no version info) are listed apart, not counted."""

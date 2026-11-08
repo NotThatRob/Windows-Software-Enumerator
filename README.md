@@ -120,6 +120,9 @@ python Software_Enumerator.py --save-baseline baseline.json
 # Compare against baseline (detect changes)
 python Software_Enumerator.py --diff baseline.json
 
+# Compare, leaving out noisy runtime entries (in the baseline and the current scan)
+python Software_Enumerator.py --diff baseline.json --exclude "redistributable,.NET Runtime"
+
 # Diff output as JSON (for automation)
 python Software_Enumerator.py --diff baseline.json --output json
 
@@ -178,6 +181,8 @@ Shows added, removed, and version-changed software since baseline was created:
 - `[+] ADDED` - New software not in baseline
 - `[-] REMOVED` - Software that was uninstalled
 - `[~] CHANGED` - Version changes (upgrades/downgrades)
+
+A baseline is always a full snapshot, so `--save-baseline` can't be combined with `--search` or `--exclude`. Use them with `--diff` instead: they then choose which programs are compared, in the baseline and in the current scan alike. (A baseline saved with `--search` or `--exclude` by an older version of the tool makes `--diff` report everything outside that filter as added; save it again.)
 
 ### Update Check
 Shows available updates with current/available versions and winget package IDs

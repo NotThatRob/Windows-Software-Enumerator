@@ -3249,6 +3249,18 @@ def _parse_exclude_terms(value: Optional[str]) -> Optional[list[str]]:
     return terms or None
 
 
+def _check_option_combinations(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Refuse option combinations that would be ignored or give misleading results.
+
+    Runs before anything is scanned. parser.error() prints the message and exits with
+    argparse's usage-error code. (Refusing now leaves room to support a combination
+    later; silently ignoring an option is harder to take back.)
+    """
+    if args.save_baseline and (args.search or _parse_exclude_terms(args.exclude)):
+        parser.error("--save-baseline saves a full snapshot, so it can't be combined with "
+                     "--search or --exclude; use them with --diff instead")
+
+
 def main():
     """Main entry point for the CLI."""
     _harden_process_environment()
@@ -3376,6 +3388,7 @@ Examples:
     )
 
     args = parser.parse_args()
+    _check_option_combinations(parser, args)
 
     # Setup logging before any operations
     try:

@@ -2059,15 +2059,24 @@ class VulnerabilityScanner:
         name_lower = name.lower()
         return any(pattern.search(name_lower) for pattern in self._compiled_skip_patterns)
 
+    # Architecture words in display names, e.g. "(x64)", "(64-bit x64)", "Wireshark 4.0.0 64-bit"
+    _ARCH_WORD = r"(?:x64|x86|arm64|64-bit|32-bit)"
+
     def _normalize_software_name(self, name: str) -> str:
-        """Normalize software name for better CVE matching."""
-        # Remove version numbers from the name
-        name = re.sub(r'\s*\d+(\.\d+)*\s*', ' ', name)
-        # Remove common suffixes
-        name = re.sub(r'\s*\((x64|x86|64-bit|32-bit)\)\s*', '', name, flags=re.IGNORECASE)
-        # Remove trailing/leading whitespace and normalize
-        name = ' '.join(name.split()).lower()
-        return name
+        """Normalize a display name for mapping lookup: lower case, no versions or architecture.
+
+        "7-Zip 23.01 (x64)" -> "7-zip", "Python 3.12.1 (64-bit)" -> "python",
+        "Mozilla Firefox (x64 en-US)" -> "mozilla firefox". Digits that are part of a name
+        ("7-Zip", "1Password") are kept: only whole tokens that look like versions are removed.
+        """
+        name = name.lower()
+        # Parenthesised groups that mention an architecture, e.g. "(x64 en-us)", "(64-bit x64)"
+        name = re.sub(r"\([^)]*\b" + self._ARCH_WORD + r"\b[^)]*\)", " ", name)
+        # Stand-alone architecture words
+        name = re.sub(r"(?<!\S)" + self._ARCH_WORD + r"(?!\S)", " ", name)
+        # Stand-alone version tokens: "23.01", "v1.2.3", "3.11.4150.0", "2.53.1-beta"
+        name = re.sub(r"(?<!\S)v?\d+(?:\.\d+)+\S*", " ", name)
+        return " ".join(name.split())
 
     def _get_search_terms(self, software: SoftwareInfo) -> tuple[str, str]:
         """Get vendor and product search terms for a software."""

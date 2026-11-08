@@ -634,6 +634,22 @@ class TestSoftwareMappings(unittest.TestCase):
         result = scanner._normalize_software_name("MyApp 2.0.1")
         self.assertNotIn("2.0.1", result)
 
+    def test_normalize_keeps_digits_that_belong_to_the_name(self):
+        """Leading digits are part of names like 7-Zip; only whole version tokens go."""
+        scanner = se.VulnerabilityScanner()
+        cases = {
+            "7-Zip 23.01 (x64)": "7-zip",
+            "Python 3.12.1 (64-bit)": "python",
+            "Mozilla Firefox (x64 en-US)": "mozilla firefox",
+            "Notepad++ (64-bit x64)": "notepad++",
+            "Wireshark 4.0.0 64-bit": "wireshark",
+            "PuTTY release 0.80 (64-bit)": "putty release",
+            "1Password": "1password",
+            "VLC media player": "vlc media player",
+        }
+        for display_name, expected in cases.items():
+            self.assertEqual(scanner._normalize_software_name(display_name), expected, display_name)
+
 
 class TestLogRotation(unittest.TestCase):
     """Test that log rotation is configured correctly."""

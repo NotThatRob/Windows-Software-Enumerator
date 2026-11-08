@@ -816,6 +816,133 @@ class TestUnconfirmedCves(unittest.TestCase):
         self.assertIn("Unable to reach NVD API", result.error)
 
 
+class TestCveTargetSelection(unittest.TestCase):
+    """Which programs --check-vulns looks up: mapped ones, by name, once per product + version."""
+
+    SOFTWARE = [
+        se.SoftwareInfo(name="VLC media player", version="3.0.18"),
+        se.SoftwareInfo(name="Some Unknown App", version="1.0"),
+        se.SoftwareInfo(name="Python 3.11.4 Core Interpreter (64-bit)", version="3.11.4150.0"),
+        se.SoftwareInfo(name="Microsoft Visual C++ 2015 Redistributable (x64)", version="14.0"),
+        se.SoftwareInfo(name="Git", version=""),
+        se.SoftwareInfo(name="7-Zip 23.01 (x64)", version="23.01"),
+        se.SoftwareInfo(name="Python 3.11.4 (64-bit)", version="3.11.4150.0"),
+    ]
+
+    def test_plan_is_in_name_order_and_counts_what_is_left_out(self):
+        plan = se.VulnerabilityScanner().plan_scan(self.SOFTWARE, limit=2)
+        self.assertEqual([s.name for s in plan.targets], ["7-Zip 23.01 (x64)", "Python 3.11.4 (64-bit)"])
+        self.assertEqual([s.name for s in plan.unmapped], ["Some Unknown App"])
+        self.assertEqual((plan.skipped, plan.no_version, plan.duplicates, plan.over_limit), (1, 1, 1, 1))
+
+    def test_order_does_not_depend_on_registry_order(self):
+        scanner = se.VulnerabilityScanner()
+        forward = scanner.plan_scan(self.SOFTWARE, limit=2).targets
+        backward = scanner.plan_scan(list(reversed(self.SOFTWARE)), limit=2).targets
+        self.assertEqual([s.name for s in forward], [s.name for s in backward])
+
+    def test_every_checked_program_gets_a_result_even_when_clean(self):
+        scanner = se.VulnerabilityScanner()
+        plan = scanner.plan_scan(self.SOFTWARE, limit=10)
+        clean = lambda s: se.VulnerabilityResult(software_name=s.name, software_version=s.version)  # noqa: E731
+        with patch.object(scanner, "scan_software", side_effect=clean):
+            results = scanner.scan_plan(plan)
+        self.assertEqual(len(results), len(plan.targets))
+
+
+class TestCveSummary(unittest.TestCase):
+    """The results always say what was checked; a clean result is never a bare all-clear."""
+
+    def _display(self, results, plan):
+        out = io.StringIO()
+        with patch("sys.stdout", out):
+            se.VulnerabilityScanner().display_results(results, plan)
+        return out.getvalue()
+
+    @staticmethod
+    def _result(name, cves=(), **kw):
+        return se.VulnerabilityResult(software_name=name, software_version="1.0", cves=list(cves), **kw)
+
+    @staticmethod
+    def _cve(cve_id, kev=False):
+        return se.CVEInfo(cve_id=cve_id, description="d", severity="HIGH", cvss_score=7.5,
+                          published_date="2025-01-01", cvss_version="3.1", score_source="NVD",
+                          known_exploited=kev)
+
+    def test_clean_scan_says_what_was_and_was_not_checked(self):
+        plan = se.VulnScanPlan(unmapped=[se.SoftwareInfo(name="Some Unknown App")], over_limit=1, limit=20)
+        out = self._display([self._result("VLC media player"), self._result("7-Zip")], plan)
+        self.assertIn("Checked 2 program(s) against NVD", out)
+        self.assertIn("No known CVEs affect the 2 program(s) checked.", out)
+        self.assertIn("1 without a CPE mapping", out)
+        self.assertIn("Some Unknown App", out)
+        self.assertIn("1 over --cve-limit 20", out)
+        self.assertNotIn("No vulnerabilities found", out)
+
+    def test_nothing_checked_is_not_an_all_clear(self):
+        plan = se.VulnScanPlan(unmapped=[se.SoftwareInfo(name=f"App {i}") for i in range(3)])
+        out = self._display([], plan)
+        self.assertIn("No programs were checked", out)
+        self.assertNotIn("No known CVEs affect", out)
+
+    def test_affected_summary_counts_known_exploited(self):
+        out = self._display([self._result("WinRAR", [self._cve("CVE-2023-38831", kev=True),
+                                                    self._cve("CVE-2023-0002")])], se.VulnScanPlan())
+        self.assertIn("Affected: 1 program(s), 2 CVE(s)", out)
+        self.assertIn("Known exploited (KEV): 1", out)
+        self.assertIn("[KEV: known exploited]", out)
+
+    def test_page_limit_is_stated(self):
+        result = self._result("Google Chrome", [self._cve(f"CVE-2024-{i:04d}") for i in range(3)],
+                              total_available=10000)
+        self.assertIn("10000 CVE(s) affect this version (first 3 fetched; page limit reached)",
+                      self._display([result], se.VulnScanPlan()))
+
+
+class TestCheckVulnsMain(unittest.TestCase):
+    """main() --check-vulns honours --source / --search / --exclude (NVD and the scan mocked)."""
+
+    SOFTWARE = [se.SoftwareInfo(name="Google Chrome", version="142.0.7444.60", publisher="Google LLC"),
+                se.SoftwareInfo(name="Mozilla Firefox (x64 en-US)", version="144.0", publisher="Mozilla")]
+
+    def setUp(self):
+        self._saved_handlers = list(se.logger.handlers)
+
+    def tearDown(self):
+        se.logger.handlers = self._saved_handlers
+
+    def _run(self, *argv):
+        fake, scan_all = _FakeNvd(), MagicMock(return_value=list(self.SOFTWARE))
+        with patch.object(sys, "argv", ["Software_Enumerator.py", "--check-vulns", "--quiet", *argv]), \
+                patch.object(se, "_load_env_file"), \
+                patch.dict(os.environ, {}, clear=False), \
+                patch.object(se.SoftwareEnumerator, "scan_all", scan_all), \
+                patch("urllib.request.urlopen", side_effect=fake), \
+                patch("sys.stdout", io.StringIO()) as out:
+            os.environ.pop("NVD_API_KEY", None)
+            try:
+                se.main()
+            except SystemExit as e:
+                self.exit_code = e.code
+        return fake, scan_all, out.getvalue()
+
+    def test_search_filter_is_honoured(self):
+        fake, _, out = self._run("--search", "chrome")
+        self.assertTrue(any("google:chrome" in u for u in fake.urls))
+        self.assertFalse(any("firefox" in u.lower() for u in fake.urls))
+        self.assertIn("Checked 1 program(s)", out)
+
+    def test_exclude_filter_is_honoured(self):
+        fake, _, _ = self._run("--exclude", "mozilla,")
+        self.assertFalse(any("firefox" in u.lower() for u in fake.urls))
+
+    def test_registry_by_default_and_source_honoured(self):
+        _, scan_all, _ = self._run()
+        self.assertEqual(scan_all.call_args[0][0], ["registry"])
+        _, scan_all, _ = self._run("--source", "all")
+        self.assertEqual(scan_all.call_args[0][0], ["registry", "store", "portable"])
+
+
 class TestKnownExploitedFlag(unittest.TestCase):
     """CVEs in CISA's KEV catalog are flagged (NVD includes the KEV fields) and listed first."""
 
@@ -885,8 +1012,9 @@ class TestCveLimitArg(unittest.TestCase):
         """scan_software_list should default to 20 items."""
         scanner = se.VulnerabilityScanner()
         # Create 30 software items with versions
+        # Distinct versions of a mapped program: unmapped names are no longer checked at all
         items = [
-            se.SoftwareInfo(name=f"App{i}", version="1.0", publisher="Test")
+            se.SoftwareInfo(name="Google Chrome", version=f"1.0.{i}", publisher="Test")
             for i in range(30)
         ]
         with patch.object(scanner, 'scan_software', return_value=se.VulnerabilityResult(
@@ -898,8 +1026,9 @@ class TestCveLimitArg(unittest.TestCase):
     def test_custom_limit_respected(self):
         """Passing limit=5 should limit to 5 items."""
         scanner = se.VulnerabilityScanner()
+        # Distinct versions of a mapped program: unmapped names are no longer checked at all
         items = [
-            se.SoftwareInfo(name=f"App{i}", version="1.0", publisher="Test")
+            se.SoftwareInfo(name="Google Chrome", version=f"1.0.{i}", publisher="Test")
             for i in range(30)
         ]
         with patch.object(scanner, 'scan_software', return_value=se.VulnerabilityResult(
@@ -912,7 +1041,7 @@ class TestCveLimitArg(unittest.TestCase):
         """Values > 100 should be clamped to 100."""
         scanner = se.VulnerabilityScanner()
         items = [
-            se.SoftwareInfo(name=f"App{i}", version="1.0", publisher="Test")
+            se.SoftwareInfo(name="Google Chrome", version=f"1.0.{i}", publisher="Test")
             for i in range(150)
         ]
         with patch.object(scanner, 'scan_software', return_value=se.VulnerabilityResult(

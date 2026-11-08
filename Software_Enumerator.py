@@ -1919,6 +1919,18 @@ class BrowserExtensionScanner:
             print("browsing history, downloads, clipboard, and network requests.")
 
 
+@dataclass
+class VulnScanPlan:
+    """Which programs the CVE check looks up, and what it leaves out (reported in the summary)."""
+    targets: list[SoftwareInfo] = field(default_factory=list)
+    unmapped: list[SoftwareInfo] = field(default_factory=list)  # no CPE mapping: not checked
+    skipped: int = 0       # frameworks, runtimes, update packages (SKIP_PATTERNS)
+    no_version: int = 0    # version missing or not usable in a CPE name
+    duplicates: int = 0    # same product and version as a program already in targets
+    over_limit: int = 0    # mapped programs left out by --cve-limit
+    limit: int = 20
+
+
 class NvdApiError(Exception):
     """An NVD request failed. `status` is the HTTP status code, or None for network errors."""
 
@@ -2439,29 +2451,51 @@ class VulnerabilityScanner:
         result.cves.sort(key=lambda c: (not c.known_exploited, severity_order.get(c.severity, 4), -c.cvss_score))
         return result
 
+    def plan_scan(self, software_list: list[SoftwareInfo], limit: int = 20) -> VulnScanPlan:
+        """Choose which programs to look up: mapped ones, in name order, once per product+version.
+
+        The order doesn't depend on registry order, so --cve-limit always keeps the same
+        programs. Everything left out is counted so the summary can say what wasn't checked.
+        """
+        plan = VulnScanPlan(limit=max(1, min(limit, 100)))   # cap to prevent API abuse
+        candidates, seen = [], set()
+        for software in sorted(software_list, key=lambda s: (s.name.lower(), s.version)):
+            if self._should_skip_software(software.name):
+                plan.skipped += 1
+                continue
+            mapping = self._find_mapping(software.name)
+            if not mapping:
+                plan.unmapped.append(software)
+                continue
+            cpe_version = self._cpe_version(*mapping, software.version)
+            if not cpe_version:
+                plan.no_version += 1
+                continue
+            key = (*mapping, cpe_version)
+            if key in seen:            # e.g. Python's installer adds ~10 entries with one version
+                plan.duplicates += 1
+                continue
+            seen.add(key)
+            candidates.append(software)
+        plan.targets = candidates[:plan.limit]
+        plan.over_limit = len(candidates) - len(plan.targets)
+        return plan
+
+    def scan_plan(self, plan: VulnScanPlan, progress_callback=None) -> list[VulnerabilityResult]:
+        """Look up every program in the plan. Returns one result per program, clean ones included."""
+        results = []
+        for i, software in enumerate(plan.targets):
+            if progress_callback:
+                progress_callback(i + 1, len(plan.targets), software.name)
+            results.append(self.scan_software(software))
+        return results
+
     def scan_software_list(
         self, software_list: list[SoftwareInfo], progress_callback=None,
         limit: int = 20,
     ) -> list[VulnerabilityResult]:
-        """Scan a list of software for vulnerabilities."""
-        results = []
-
-        # Cap limit to prevent API abuse
-        limit = max(1, min(limit, 100))
-
-        # Filter to scannable software with version numbers, capped at limit
-        scannable = [s for s in software_list
-                     if not self._should_skip_software(s.name) and s.version][:limit]
-
-        for i, software in enumerate(scannable):
-            if progress_callback:
-                progress_callback(i + 1, len(scannable), software.name)
-
-            result = self.scan_software(software)
-            if result.cves or result.error or result.unconfirmed:
-                results.append(result)
-
-        return results
+        """plan_scan() then scan_plan(): one result per program checked."""
+        return self.scan_plan(self.plan_scan(software_list, limit), progress_callback)
 
     @staticmethod
     def _print_unconfirmed(result: VulnerabilityResult, shown: int = 9) -> None:
@@ -2476,26 +2510,57 @@ class VulnerabilityScanner:
         if len(result.unconfirmed) > shown:
             print(f"    ... and {len(result.unconfirmed) - shown} more")
 
-    def display_results(self, results: list[VulnerabilityResult]) -> None:
-        """Display vulnerability scan results."""
-        if not results:
-            print("No vulnerabilities found in scanned software.")
-            print("\nNote: This scan checks common software against the NVD database.")
-            print("It may not cover all installed software or all vulnerabilities.")
-            return
+    @staticmethod
+    def _print_coverage(results: list[VulnerabilityResult], plan: Optional[VulnScanPlan]) -> None:
+        """What was and wasn't checked: the summary must never read as an all-clear it can't give."""
+        checked = [r for r in results if not r.not_checked and not r.error]
+        failed = [r for r in results if r.error]
+        print(f"Checked {len(checked)} program(s) against NVD (CVEs for each program's exact version).")
+        if plan:
+            left_out = []
+            if plan.unmapped:
+                left_out.append(f"{len(plan.unmapped)} without a CPE mapping")
+            if plan.skipped:
+                left_out.append(f"{plan.skipped} framework/update package(s)")
+            if plan.no_version:
+                left_out.append(f"{plan.no_version} without a usable version")
+            if plan.duplicates:
+                left_out.append(f"{plan.duplicates} duplicate(s) of a checked program")
+            if plan.over_limit:
+                left_out.append(f"{plan.over_limit} over --cve-limit {plan.limit}")
+            if left_out:
+                print("Not checked: " + ", ".join(left_out) + ".")
+            if plan.unmapped:
+                names = sorted({sanitize_output(s.name) for s in plan.unmapped}, key=str.lower)
+                more = f", ... (+{len(names) - 8} more)" if len(names) > 8 else ""
+                print("  Without a mapping, e.g.: " + ", ".join(names[:8]) + more)
+        if failed:
+            print(f"Failed: {len(failed)} program(s): NVD could not be queried (results incomplete).")
 
+    def display_results(self, results: list[VulnerabilityResult], plan: Optional[VulnScanPlan] = None) -> None:
+        """Display vulnerability scan results, starting with what was and wasn't checked."""
+        affected = [r for r in results if r.cves]
         total_cves = sum(r.total_count for r in results)
         critical_count = sum(r.critical_count for r in results)
         high_count = sum(r.high_count for r in results)
+        kev_count = sum(r.kev_count for r in results)
+        unconfirmed_count = sum(len(r.unconfirmed) for r in results)
 
         print(f"{'='*80}")
         print(f"VULNERABILITY SCAN RESULTS")
         print(f"{'='*80}")
-        print(f"Software scanned with potential vulnerabilities: {len(results)}")
-        print(f"Total CVEs found: {total_cves}")
-        print(f"  CRITICAL: {critical_count}")
-        print(f"  HIGH: {high_count}")
-        unconfirmed_count = sum(len(r.unconfirmed) for r in results)
+        self._print_coverage(results, plan)
+        print()
+        checked = sum(1 for r in results if not r.not_checked and not r.error)
+        if affected:
+            print(f"Affected: {len(affected)} program(s), {total_cves} CVE(s)")
+            print(f"  Known exploited (KEV): {kev_count}")
+            print(f"  CRITICAL: {critical_count}")
+            print(f"  HIGH: {high_count}")
+        elif checked:
+            print(f"No known CVEs affect the {checked} program(s) checked.")
+        else:
+            print("No programs were checked, so nothing can be said about CVEs.")
         if unconfirmed_count:
             print(f"Unconfirmed (not yet analysed by NVD, not counted): {unconfirmed_count}")
         print(f"{'='*80}\n")
@@ -2511,13 +2576,17 @@ class VulnerabilityScanner:
 
             print(f"\n{sanitize_output(result.software_name)} (v{sanitize_output(result.software_version)})")
             if result.cves:
-                print(f"  Found {result.total_count} CVE(s) affecting this version:")
+                if result.total_available > len(result.cves):
+                    print(f"  {result.total_available} CVE(s) affect this version "
+                          f"(first {len(result.cves)} fetched; page limit reached):")
+                else:
+                    print(f"  {result.total_count} CVE(s) affect this version:")
 
             for cve in result.cves[:5]:  # Show top 5 per software
                 kev = " [KEV: known exploited]" if cve.known_exploited else ""
-                print(f"\n  {cve.severity_color} {cve.cve_id} ({cve.score_label}){kev}")
-                print(f"      Severity: {cve.severity}")
-                print(f"      Published: {cve.published_date}")
+                print(f"\n  {cve.severity_color} {sanitize_output(cve.cve_id)} ({sanitize_output(cve.score_label)}){kev}")
+                print(f"      Severity: {sanitize_output(cve.severity)}")
+                print(f"      Published: {sanitize_output(cve.published_date)}")
                 # Wrap description
                 safe_desc = sanitize_output(cve.description)
                 desc_lines = [safe_desc[i:i+60] for i in range(0, len(safe_desc), 60)]
@@ -3081,8 +3150,8 @@ Examples:
     parser.add_argument(
         "--source",
         choices=["registry", "store", "portable", "all"],
-        default="all",
-        help="Source to scan (default: all)",
+        default=None,
+        help="Source to scan (default: all; registry for --check-vulns)",
     )
 
     parser.add_argument(
@@ -3252,29 +3321,27 @@ Examples:
             print("Scanning for known vulnerabilities (CVEs)...", file=sys.stderr)
             print("This may take a while due to API rate limits.\n", file=sys.stderr)
 
-        # First, enumerate software from registry (most reliable source)
+        # Registry by default (the most reliable versions); --source chooses others
+        vuln_sources = (["registry", "store", "portable"] if args.source == "all"
+                        else [args.source or "registry"])
         enumerator = SoftwareEnumerator()
-        software_list = enumerator.scan_all(["registry"], show_progress=not args.quiet)
+        software_list = enumerator.scan_all(vuln_sources, show_progress=not args.quiet)
+        software_list = enumerator.filter_results(software_list, args.search, _parse_exclude_terms(args.exclude))
         if not args.quiet:
-            print()
+            print(file=sys.stderr)
 
-        # Filter to scannable software for progress bar
         vuln_scanner = VulnerabilityScanner(api_key=args.nvd_api_key)
-        scannable = [s for s in software_list
-                     if not vuln_scanner._should_skip_software(s.name) and s.version][:args.cve_limit]
+        plan = vuln_scanner.plan_scan(software_list, limit=args.cve_limit)
 
         progress_callback = None
         if not args.quiet:
-            progress = ProgressBar(total=len(scannable), prefix="CVE Check")
+            progress = ProgressBar(total=len(plan.targets), prefix="CVE Check")
 
             def progress_callback(current, total, name):
                 progress.update(current, name)
                 logger.debug(f"Scanning for CVEs: {name}")
 
-        results = vuln_scanner.scan_software_list(
-            software_list, progress_callback=progress_callback,
-            limit=args.cve_limit,
-        )
+        results = vuln_scanner.scan_plan(plan, progress_callback=progress_callback)
         if not args.quiet:
             progress.finish("Complete")
 
@@ -3283,18 +3350,20 @@ Examples:
         log_audit_event(
             "SCAN_END",
             "Vulnerability scan completed",
-            software_scanned=len(scannable),
+            software_scanned=len(plan.targets),
+            not_checked=len(plan.unmapped) + plan.no_version + plan.over_limit,
             cves_found=total_cves,
             critical_cves=critical_count,
+            failed=sum(1 for r in results if r.error),
         )
 
         if not args.quiet:
             print(file=sys.stderr)
-        vuln_scanner.display_results(results)
+        vuln_scanner.display_results(results, plan)
         return
 
     # Determine sources to scan
-    if args.source == "all":
+    if args.source in (None, "all"):
         sources = ["registry", "store", "portable"]
     else:
         sources = [args.source]

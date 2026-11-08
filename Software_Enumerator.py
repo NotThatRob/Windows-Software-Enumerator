@@ -871,6 +871,15 @@ class CVEInfo:
     cvss_score: float
     published_date: str
     references: list = field(default_factory=list)
+    cvss_version: str = ""   # "4.0", "3.1", "3.0", "2.0"; "" if not scored yet
+    score_source: str = ""   # "NVD" (NVD's own assessment) or "CNA" (assigner / other provider)
+
+    @property
+    def score_label(self) -> str:
+        """e.g. "CVSS 9.8, NVD v3.1", or "not scored yet"."""
+        if not self.cvss_version:
+            return "not scored yet"
+        return f"CVSS {self.cvss_score}, {self.score_source} v{self.cvss_version}"
 
     @property
     def severity_color(self) -> str:
@@ -2240,20 +2249,17 @@ class VulnerabilityScanner:
                 description = descriptions[0].get("value", "")
 
             # Get CVSS score and severity
-            metrics = cve.get("metrics", {})
-            cvss_score = 0.0
-            severity = "UNKNOWN"
-
-            # Try CVSS 3.1 first, then 3.0, then 2.0
-            for cvss_version in ["cvssMetricV31", "cvssMetricV30", "cvssMetricV2"]:
-                if cvss_version in metrics and metrics[cvss_version]:
-                    cvss_data = metrics[cvss_version][0].get("cvssData", {})
-                    cvss_score = cvss_data.get("baseScore", 0.0)
-                    severity = cvss_data.get("baseSeverity", "UNKNOWN")
-                    if cvss_version == "cvssMetricV2":
-                        # CVSS 2.0 uses different severity names
-                        severity = self._cvss2_to_severity(cvss_score)
-                    break
+            cvss_score, severity, cvss_version, score_source = 0.0, "UNKNOWN", "", ""
+            chosen = self._choose_metric(cve.get("metrics"))
+            if chosen:
+                cvss_version, entry = chosen
+                score = entry["cvssData"].get("baseScore")
+                cvss_score = float(score) if isinstance(score, (int, float)) else 0.0
+                if cvss_version == "2.0":
+                    severity = self._cvss2_to_severity(cvss_score)  # v2 has no CRITICAL label
+                else:
+                    severity = str(entry["cvssData"].get("baseSeverity") or "UNKNOWN")
+                score_source = "NVD" if entry.get("type") == "Primary" else "CNA"
 
             # Get published date
             published = cve.get("published", "")[:10]  # Just the date part
@@ -2269,9 +2275,36 @@ class VulnerabilityScanner:
                 cvss_score=cvss_score,
                 published_date=published,
                 references=references,
+                cvss_version=cvss_version,
+                score_source=score_source,
             )
-        except (KeyError, TypeError):
+        except (KeyError, TypeError, AttributeError):
             return None
+
+    # Newest CVSS version first
+    _METRIC_KEYS = [("cvssMetricV40", "4.0"), ("cvssMetricV31", "3.1"), ("cvssMetricV30", "3.0"),
+                    ("cvssMetricV2", "2.0")]
+
+    @classmethod
+    def _choose_metric(cls, metrics) -> Optional[tuple[str, dict]]:
+        """Pick the CVSS entry to show: (version label, metric entry), or None if unscored.
+
+        NVD's own assessment ("Primary") wins over scores from the CVE's assigner or other
+        providers ("Secondary"), which NVD often lists first; within each, the newest CVSS
+        version wins.
+        """
+        if not isinstance(metrics, dict):
+            return None
+        for wanted in ("Primary", None):
+            for key, label in cls._METRIC_KEYS:
+                entries = metrics.get(key)
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    if (isinstance(entry, dict) and isinstance(entry.get("cvssData"), dict)
+                            and (wanted is None or entry.get("type") == wanted)):
+                        return label, entry
+        return None
 
     def _cvss2_to_severity(self, score: float) -> str:
         """Convert CVSS 2.0 score to severity label."""
@@ -2320,7 +2353,7 @@ class VulnerabilityScanner:
 
         for vuln in vulnerabilities:
             cve = self._parse_cve(vuln)
-            if cve and cve.severity in ["CRITICAL", "HIGH", "MEDIUM"]:
+            if cve:  # every severity, including LOW and not yet scored
                 result.cves.append(cve)
 
         # Sort by severity (CRITICAL first)
@@ -2385,7 +2418,7 @@ class VulnerabilityScanner:
             print(f"  Found {result.total_count} potential CVE(s):")
 
             for cve in result.cves[:5]:  # Show top 5 per software
-                print(f"\n  {cve.severity_color} {cve.cve_id} (CVSS: {cve.cvss_score})")
+                print(f"\n  {cve.severity_color} {cve.cve_id} ({cve.score_label})")
                 print(f"      Severity: {cve.severity}")
                 print(f"      Published: {cve.published_date}")
                 # Wrap description

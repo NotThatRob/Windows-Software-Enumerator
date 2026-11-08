@@ -712,6 +712,56 @@ class TestNvdCpeQuery(unittest.TestCase):
         self.assertEqual(result.cves, [])
 
 
+class TestCveScores(unittest.TestCase):
+    """Which CVSS score is shown, and that unscored or LOW CVEs are kept."""
+
+    def setUp(self):
+        self.scanner = se.VulnerabilityScanner()
+
+    @staticmethod
+    def _metric(score, severity, type_):
+        return {"type": type_, "cvssData": {"baseScore": score, "baseSeverity": severity}}
+
+    def _parse(self, metrics):
+        vuln = _nvd_vuln("CVE-2025-0001")
+        vuln["cve"]["metrics"] = metrics
+        return self.scanner._parse_cve(vuln)
+
+    def test_nvd_primary_score_wins_over_a_secondary_listed_first(self):
+        cve = self._parse({"cvssMetricV31": [self._metric(9.8, "CRITICAL", "Secondary"),
+                                             self._metric(5.3, "MEDIUM", "Primary")]})
+        self.assertEqual((cve.cvss_score, cve.severity, cve.score_source), (5.3, "MEDIUM", "NVD"))
+
+    def test_secondary_score_used_and_labelled_when_nvd_has_none(self):
+        cve = self._parse({"cvssMetricV31": [self._metric(8.1, "HIGH", "Secondary")]})
+        self.assertEqual((cve.cvss_score, cve.score_source, cve.cvss_version), (8.1, "CNA", "3.1"))
+        self.assertEqual(cve.score_label, "CVSS 8.1, CNA v3.1")
+
+    def test_newest_cvss_version_wins(self):
+        cve = self._parse({"cvssMetricV31": [self._metric(7.5, "HIGH", "Primary")],
+                           "cvssMetricV40": [self._metric(8.7, "HIGH", "Primary")]})
+        self.assertEqual((cve.cvss_score, cve.cvss_version), (8.7, "4.0"))
+
+    def test_cvss2_only(self):
+        cve = self._parse({"cvssMetricV2": [self._metric(9.3, "HIGH", "Primary")]})
+        self.assertEqual((cve.severity, cve.cvss_version), ("CRITICAL", "2.0"))
+
+    def test_unscored_and_low_cves_are_kept(self):
+        """A CVE NVD hasn't scored yet is still a CVE that affects the version; so is a LOW one."""
+        scanner = self.scanner
+        scanner._rate_max = 1000
+        unscored = _nvd_vuln("CVE-2026-0001")
+        unscored["cve"]["metrics"] = {}
+        low = _nvd_vuln("CVE-2026-0002", severity="LOW", score=2.1)
+        page = {"totalResults": 2, "vulnerabilities": [unscored, low]}
+        with patch("urllib.request.urlopen", side_effect=_FakeNvd(page)):
+            result = scanner.scan_software(se.SoftwareInfo(name="VLC media player", version="3.0.18"))
+        by_id = {c.cve_id: c for c in result.cves}
+        self.assertEqual(set(by_id), {"CVE-2026-0001", "CVE-2026-0002"})
+        self.assertEqual(by_id["CVE-2026-0001"].severity, "UNKNOWN")
+        self.assertEqual(by_id["CVE-2026-0001"].score_label, "not scored yet")
+
+
 class TestLogRotation(unittest.TestCase):
     """Test that log rotation is configured correctly."""
 

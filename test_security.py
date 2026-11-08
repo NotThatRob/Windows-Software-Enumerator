@@ -786,7 +786,7 @@ class TestUnconfirmedCves(unittest.TestCase):
     """Recent CVEs NVD hasn't analysed (no product data) are listed separately and never counted."""
 
     CHROME = se.SoftwareInfo(name="Google Chrome", version="142.0.7444.60")
-    WITH_CPE = [{"nodes": [{"cpeMatch": [{"vulnerable": True,
+    WITH_CPE = [{"nodes": [{"cpeMatch": [{"vulnerable": True, "versionEndExcluding": "150.0",
                                           "criteria": "cpe:2.3:a:google:chrome:*:*:*:*:*:*:*:*"}]}]}]
 
     def setUp(self):
@@ -989,6 +989,60 @@ class TestCheckVulnsMain(unittest.TestCase):
         self.assertEqual(scan_all.call_args[0][0], ["registry"])
         _, scan_all, _ = self._run("--source", "all")
         self.assertEqual(scan_all.call_args[0][0], ["registry", "store", "portable"])
+
+
+class TestAllVersionsCves(unittest.TestCase):
+    """CVEs NVD records for every version of a product (no version info) are listed apart, not counted."""
+
+    CHROME = se.SoftwareInfo(name="Google Chrome", version="157.0.8103.39")
+
+    @staticmethod
+    def _config(**match):
+        return [{"nodes": [{"cpeMatch": [dict(
+            {"vulnerable": True, "criteria": "cpe:2.3:a:google:chrome:*:*:*:*:*:*:*:*"}, **match)]}]}]
+
+    def _scan(self, *vulns):
+        scanner = se.VulnerabilityScanner()
+        scanner._rate_max = 1000
+        page = {"totalResults": len(vulns), "vulnerabilities": list(vulns)}
+        with patch.object(se.VulnerabilityScanner, "SEARCH_PHRASES", {}), \
+                patch("urllib.request.urlopen", side_effect=_FakeNvd(page)):
+            return scanner.scan_software(self.CHROME)
+
+    def test_cve_without_any_version_information_is_set_aside(self):
+        result = self._scan(_nvd_vuln("CVE-2012-4929", configurations=self._config()))
+        self.assertEqual([c.cve_id for c in result.all_versions], ["CVE-2012-4929"])
+        self.assertEqual(result.cves, [])
+        self.assertEqual((result.total_count, result.critical_count, result.high_count), (0, 0, 0))
+
+    def test_every_version_entry_next_to_ranges_is_set_aside(self):
+        """CVE-2009-2469 lists Firefox up to 3.0.11 and also every Firefox version; the latter matches 159."""
+        mixed = [{"nodes": [{"cpeMatch": [
+            {"vulnerable": True, "criteria": "cpe:2.3:a:google:chrome:*:*:*:*:*:*:*:*"},
+            {"vulnerable": True, "criteria": "cpe:2.3:a:google:chrome:*:*:*:*:*:*:*:*", "versionEndIncluding": "3.0.11"},
+            {"vulnerable": True, "criteria": "cpe:2.3:a:google:chrome:2.0:*:*:*:*:*:*:*"}]}]}]
+        result = self._scan(_nvd_vuln("CVE-2009-2469", configurations=mixed))
+        self.assertEqual([c.cve_id for c in result.all_versions], ["CVE-2009-2469"])
+        self.assertEqual(result.cves, [])
+
+    def test_cve_with_a_range_or_specific_version_stays_affected(self):
+        ranged = _nvd_vuln("CVE-2026-0001", configurations=self._config(versionEndExcluding="158.0"))
+        exact = _nvd_vuln("CVE-2026-0002", configurations=[{"nodes": [{"cpeMatch": [{
+            "vulnerable": True, "criteria": "cpe:2.3:a:google:chrome:157.0.8103.39:*:*:*:*:*:*:*"}]}]}])
+        no_product_data = _nvd_vuln("CVE-2026-0003")       # nothing to judge by: not set aside
+        result = self._scan(ranged, exact, no_product_data)
+        self.assertEqual(sorted(c.cve_id for c in result.cves), ["CVE-2026-0001", "CVE-2026-0002", "CVE-2026-0003"])
+        self.assertEqual(result.all_versions, [])
+
+    def test_report_lists_them_separately(self):
+        result = self._scan(_nvd_vuln("CVE-2012-4929", configurations=self._config()))
+        out = io.StringIO()
+        with patch("sys.stdout", out):
+            se.VulnerabilityScanner().display_results([result], se.VulnScanPlan())
+        text = out.getvalue()
+        self.assertIn("No known CVEs affect the 1 program(s) checked.", text)
+        self.assertIn("Listed by NVD for every version (no version range, not counted): 1", text)
+        self.assertIn("CVE-2012-4929 (published 2024-01-01)", text)
 
 
 class TestKnownExploitedFlag(unittest.TestCase):

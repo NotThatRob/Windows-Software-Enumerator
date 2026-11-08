@@ -910,6 +910,10 @@ class VulnerabilityResult:
     # Recent CVEs that mention the product but that NVD hasn't analysed yet (no product data),
     # so NVD can't say whether this version is affected. Never counted in the totals above.
     unconfirmed: list[CVEInfo] = field(default_factory=list)
+    # CVEs NVD lists for every version of the product (no version range or version given),
+    # e.g. a 2012 CVE recorded as "all Chrome versions". Matched, but not version-specific,
+    # so kept apart from `cves` and never counted in the totals above.
+    all_versions: list[CVEInfo] = field(default_factory=list)
 
     @property
     def kev_count(self) -> int:
@@ -2308,6 +2312,36 @@ class VulnerabilityScanner:
                   ("isVulnerable", None), ("noRejected", None)]
         return self._fetch_all_pages(params, self.MAX_PAGES)
 
+    @staticmethod
+    def _listed_for_every_version(vuln: dict, vendor: str, product: str) -> bool:
+        """True if NVD's data for this product in this CVE includes an "every version" entry.
+
+        Looks only at whether NVD gave a version range or a specific version for the product
+        (it does not re-check whether the installed version is in a range: NVD did that).
+        Criteria with version "*" or "-" and no range mean "every version". NVD records some
+        old CVEs that way, sometimes next to proper ranges (CVE-2009-2469 lists Firefox up to
+        3.0.11 *and* every Firefox version), and such an entry alone makes NVD match any
+        version, so the match says nothing about the installed one. If the product's criteria
+        can't be found, the CVE is not set aside.
+        """
+        def items(obj, key):  # obj[key] if it is a list, else [] (network data: don't trust shapes)
+            value = obj.get(key) if isinstance(obj, dict) else None
+            return value if isinstance(value, list) else []
+
+        for config in items(vuln.get("cve") if isinstance(vuln, dict) else None, "configurations"):
+            for node in items(config, "nodes"):
+                for match in items(node, "cpeMatch"):
+                    if not isinstance(match, dict) or not match.get("vulnerable"):
+                        continue
+                    parts = str(match.get("criteria", "")).split(":")
+                    if len(parts) < 6 or parts[3] != vendor or parts[4] != product:
+                        continue
+                    has_range = any(match.get(k) for k in ("versionStartIncluding", "versionStartExcluding",
+                                                           "versionEndIncluding", "versionEndExcluding"))
+                    if not has_range and parts[5] in ("*", "-", ""):
+                        return True
+        return False
+
     def _query_unanalysed_cves(self, phrase: str) -> list[dict]:
         """CVEs published in the last UNCONFIRMED_DAYS that mention `phrase` and have no product data.
 
@@ -2451,13 +2485,19 @@ class VulnerabilityScanner:
 
         for vuln in vulnerabilities:
             cve = self._parse_cve(vuln)
-            if cve:  # every severity, including LOW and not yet scored
+            if not cve:
+                continue
+            # Every severity, including LOW and not yet scored. NVD decided the CVE matches;
+            # only set aside the ones where NVD gives no version information at all.
+            if self._listed_for_every_version(vuln, vendor, product):
+                result.all_versions.append(cve)
+            else:
                 result.cves.append(cve)
 
         phrase = self.SEARCH_PHRASES.get((vendor, product))
         if phrase:
             try:
-                confirmed = {c.cve_id for c in result.cves}
+                confirmed = {c.cve_id for c in result.cves + result.all_versions}
                 for vuln in self._query_unanalysed_cves(phrase):
                     cve = self._parse_cve(vuln)
                     if cve and cve.cve_id not in confirmed:
@@ -2518,17 +2558,30 @@ class VulnerabilityScanner:
         return self.scan_plan(self.plan_scan(software_list, limit), progress_callback)
 
     @staticmethod
-    def _print_unconfirmed(result: VulnerabilityResult, shown: int = 9) -> None:
+    def _print_cve_ids(cves: list[CVEInfo], label, shown: int = 9) -> None:
+        """Compact list: up to `shown` CVE IDs, three per line, each with label(cve)."""
+        labels = [f"{sanitize_output(c.cve_id)} ({sanitize_output(label(c))})" for c in cves[:shown]]
+        for i in range(0, len(labels), 3):
+            print("    " + ", ".join(labels[i:i + 3]))
+        if len(cves) > shown:
+            print(f"    ... and {len(cves) - shown} more")
+
+    @classmethod
+    def _print_unconfirmed(cls, result: VulnerabilityResult) -> None:
         """List recent CVEs that mention the product but have no NVD product data yet."""
         print(f"\n  Unconfirmed: {len(result.unconfirmed)} recent CVE(s) mention this product, but NVD hasn't")
         print("  analysed them yet, so it can't say which versions they affect. Check whether")
         print("  your version is affected (not counted above):")
-        labels = [f"{sanitize_output(c.cve_id)} ({sanitize_output(c.status) or 'status unknown'})"
-                  for c in result.unconfirmed[:shown]]
-        for i in range(0, len(labels), 3):
-            print("    " + ", ".join(labels[i:i + 3]))
-        if len(result.unconfirmed) > shown:
-            print(f"    ... and {len(result.unconfirmed) - shown} more")
+        cls._print_cve_ids(result.unconfirmed, lambda c: c.status or "status unknown")
+
+    @classmethod
+    def _print_all_versions(cls, result: VulnerabilityResult) -> None:
+        """List CVEs NVD records for every version of the product (no version information)."""
+        print(f"\n  Listed for every version: NVD records {len(result.all_versions)} CVE(s) for all versions of")
+        print("  this product, without a version range, so they may not apply to yours")
+        print("  (often old, or about the product in general; not counted above):")
+        cls._print_cve_ids(result.all_versions, lambda c: f"published {c.published_date}" if c.published_date
+                           else "no date")
 
     @staticmethod
     def _print_coverage(results: list[VulnerabilityResult], plan: Optional[VulnScanPlan]) -> None:
@@ -2581,26 +2634,27 @@ class VulnerabilityScanner:
             print(f"No known CVEs affect the {checked} program(s) checked.")
         else:
             print("No programs were checked, so nothing can be said about CVEs.")
+        all_versions_count = sum(len(r.all_versions) for r in results)
+        if all_versions_count:
+            print(f"Listed by NVD for every version (no version range, not counted): {all_versions_count}")
         if unconfirmed_count:
             print(f"Unconfirmed (not yet analysed by NVD, not counted): {unconfirmed_count}")
         print(f"{'='*80}\n")
 
         for result in results:
+            has_lists = result.cves or result.unconfirmed or result.all_versions
             if result.error:
                 print(f"[ERROR] {sanitize_output(result.software_name)}: Query failed")
-                if not result.cves and not result.unconfirmed:
-                    continue
-
-            if not result.cves and not result.unconfirmed:
+            if not has_lists:
                 continue
 
             print(f"\n{sanitize_output(result.software_name)} (v{sanitize_output(result.software_version)})")
-            if result.cves:
-                if result.total_available > len(result.cves):
-                    print(f"  {result.total_available} CVE(s) affect this version "
-                          f"(first {len(result.cves)} fetched; page limit reached):")
-                else:
-                    print(f"  {result.total_count} CVE(s) affect this version:")
+            fetched = len(result.cves) + len(result.all_versions)
+            if result.total_available > fetched:
+                print(f"  {result.total_available} CVE(s) affect this version "
+                      f"(first {fetched} fetched; page limit reached):")
+            elif result.cves:
+                print(f"  {result.total_count} CVE(s) affect this version:")
 
             for cve in result.cves[:5]:  # Show top 5 per software
                 kev = " [KEV: known exploited]" if cve.known_exploited else ""
@@ -2615,6 +2669,8 @@ class VulnerabilityScanner:
 
             if len(result.cves) > 5:
                 print(f"\n  ... and {len(result.cves) - 5} more CVE(s)")
+            if result.all_versions:
+                self._print_all_versions(result)
             if result.unconfirmed:
                 self._print_unconfirmed(result)
 

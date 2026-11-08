@@ -1262,6 +1262,26 @@ class TestBaselineFilters(_MainHarness, unittest.TestCase):
                 self.assertFalse(path.exists())
                 r.scan_all.assert_not_called()
 
+    def test_existing_file_is_not_replaced(self):
+        path = self.tmp / "notes.txt"
+        path.write_text("keep me\n", encoding="utf-8")
+        r = self.run_main("--save-baseline", str(path), "--quiet")
+        self.assertEqual(r.code, se.EXIT_ERROR)
+        self.assertIn("already exists; use --overwrite", r.err)
+        self.assertEqual(path.read_text(encoding="utf-8"), "keep me\n")
+
+    def test_overwrite_replaces_an_existing_file(self):
+        path = self.save_baseline(self.SOFTWARE[:1])
+        r = self.run_main("--save-baseline", str(path), "--overwrite", "--quiet")
+        self.assertEqual(r.code, se.EXIT_SUCCESS)
+        self.assertEqual(len(se.BaselineManager.load_baseline(str(path))[0]), len(self.SOFTWARE))
+
+    def test_overwrite_without_save_baseline_is_refused(self):
+        r = self.run_main("--overwrite", "--quiet")
+        self.assertEqual(r.code, 2)
+        self.assertIn("--overwrite only applies to --save-baseline", r.err)
+        r.scan_all.assert_not_called()
+
     def test_empty_exclude_terms_are_not_a_filter(self):
         path = self.tmp / "full.json"
         r = self.run_main("--save-baseline", str(path), "--exclude", " , ", "--quiet")
@@ -1700,8 +1720,9 @@ class TestBaselineManagerRoundtrip(unittest.TestCase):
         """Saved baseline should load back with identical software data."""
         original = [self._make_software("App1", "1.0"),
                     self._make_software("App2", "2.0")]
+        # setUp already created the (empty) file, so replace it
         se.BaselineManager.save_baseline(original, self.temp_file.name,
-                                         sources=["registry"])
+                                         sources=["registry"], overwrite=True)
         loaded, metadata = se.BaselineManager.load_baseline(self.temp_file.name)
         self.assertEqual(len(loaded), 2)
         self.assertEqual(loaded[0].name, "App1")

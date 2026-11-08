@@ -2920,15 +2920,18 @@ class BaselineManager:
     BASELINE_VERSION = "1.0"
 
     @staticmethod
-    def save_baseline(software_list: list[SoftwareInfo], filepath: str, sources: list[str] = None) -> None:
+    def save_baseline(software_list: list[SoftwareInfo], filepath: str, sources: list[str] = None,
+                      overwrite: bool = False) -> None:
         """Save current software state as a baseline.
 
         Args:
             software_list: Current list of installed software
             filepath: Path to save baseline file
             sources: List of sources used (e.g., ["registry", "store", "portable"])
+            overwrite: Replace the file if it exists (otherwise an existing file is kept)
 
         Raises:
+            FileExistsError: If the file exists and overwrite is False
             IsADirectoryError: If the path is a folder
             OSError: If the file can't be written (PermissionError when access is denied)
         """
@@ -2945,7 +2948,9 @@ class BaselineManager:
             "software": [asdict(s) for s in software_list]
         }
 
-        with open(filepath, "w", encoding="utf-8") as f:
+        # "x" creates the file only if it doesn't exist yet, in one step, so nothing can
+        # appear between a check and the write
+        with open(filepath, "w" if overwrite else "x", encoding="utf-8") as f:
             json.dump(baseline, f, indent=2, ensure_ascii=False)
 
         log_audit_event("BASELINE_SAVE", f"Baseline saved", file=filepath, count=len(software_list))
@@ -3259,6 +3264,8 @@ def _check_option_combinations(parser: argparse.ArgumentParser, args: argparse.N
     if args.save_baseline and (args.search or _parse_exclude_terms(args.exclude)):
         parser.error("--save-baseline saves a full snapshot, so it can't be combined with "
                      "--search or --exclude; use them with --diff instead")
+    if args.overwrite and not args.save_baseline:
+        parser.error("--overwrite only applies to --save-baseline")
 
 
 def main():
@@ -3326,6 +3333,12 @@ Examples:
         type=str,
         metavar="FILE",
         help="Save current software state as a baseline JSON file",
+    )
+
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Let --save-baseline replace an existing file",
     )
 
     parser.add_argument(
@@ -3602,9 +3615,13 @@ Examples:
 
         shown_path = sanitize_output(args.save_baseline)
         try:
-            BaselineManager.save_baseline(software_list, args.save_baseline, sources=sources)
+            BaselineManager.save_baseline(software_list, args.save_baseline, sources=sources,
+                                          overwrite=args.overwrite)
         except IsADirectoryError:
             print(f"Error: {shown_path} is a folder; give a file name for the baseline", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
+        except FileExistsError:
+            print(f"Error: {shown_path} already exists; use --overwrite to replace it", file=sys.stderr)
             sys.exit(EXIT_ERROR)
         except FileNotFoundError:
             print(f"Error: cannot write the baseline file (its folder doesn't exist): {shown_path}", file=sys.stderr)

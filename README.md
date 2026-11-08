@@ -79,7 +79,8 @@ python Software_Enumerator.py [OPTIONS]
 | `--exclude PATTERNS` | Exclude software matching patterns (comma-separated) |
 | `--sort {name,version,publisher,source}` | Sort results by field (default: name) |
 | `--output {table,json,csv}` | Output format (default: table) |
-| `--save-baseline FILE` | Save current state as baseline JSON file |
+| `--save-baseline FILE` | Save current state as baseline JSON file (an existing file is kept unless `--overwrite` is given) |
+| `--overwrite` | Let `--save-baseline` replace an existing file |
 | `--diff FILE` | Compare current state against a baseline file |
 | `--check-updates` | Check for available updates via winget |
 | `--extensions` | List browser extensions with permission analysis |
@@ -116,6 +117,9 @@ python Software_Enumerator.py --output csv > software.csv
 
 # Save a baseline snapshot
 python Software_Enumerator.py --save-baseline baseline.json
+
+# Replace an existing baseline (e.g. in a scheduled job)
+python Software_Enumerator.py --save-baseline baseline.json --overwrite
 
 # Compare against baseline (detect changes)
 python Software_Enumerator.py --diff baseline.json

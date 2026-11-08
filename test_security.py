@@ -1288,6 +1288,48 @@ class TestUpdateCheckFailures(_MainHarness, unittest.TestCase):
         self.assertIn("Google.Chrome", r.out)
 
 
+class TestAuditCheckFilters(_MainHarness, unittest.TestCase):
+    """--search / --exclude also filter --check-updates (name, winget ID) and --extensions (name, ID)."""
+
+    def test_search_filters_updates_by_name_or_winget_id(self):
+        for term in ("7-zip", "7ZIP.7zip"):
+            with self.subTest(term):
+                r = self.run_main("--check-updates", "--quiet", "--search", term)
+                self.assertIn("7zip.7zip", r.out)
+                self.assertNotIn("Google.Chrome", r.out)
+
+    def test_exclude_filters_updates(self):
+        r = self.run_main("--check-updates", "--quiet", "--exclude", "google,")
+        self.assertIn("7zip.7zip", r.out)
+        self.assertNotIn("Google.Chrome", r.out)
+
+    def test_search_filters_extensions_by_name_or_id(self):
+        for term in ("dark", "addon@darkreader"):
+            with self.subTest(term):
+                r = self.run_main("--extensions", "--quiet", "--search", term)
+                self.assertIn("Dark Reader", r.out)
+                self.assertNotIn("uBlock Origin", r.out)
+
+    def test_exclude_filters_extensions(self):
+        r = self.run_main("--extensions", "--quiet", "--exclude", "cjpalhdlnbpafiamejdnhcphjbkeiagm")
+        self.assertIn("Dark Reader", r.out)
+        self.assertNotIn("uBlock Origin", r.out)
+
+    def test_filters_are_literal_not_regex(self):
+        r = self.run_main("--check-updates", "--quiet", "--search", ".*")   # nothing contains ".*"
+        self.assertIn("None of the 2 available update(s) match", r.out)
+
+    def test_updates_hidden_by_a_filter_are_not_called_up_to_date(self):
+        r = self.run_main("--check-updates", "--quiet", "--exclude", "google,7-zip")
+        self.assertNotIn("up to date", r.out)
+        self.assertIn("None of the 2 available update(s) match --search / --exclude", r.out)
+
+    def test_extensions_hidden_by_a_filter_are_reported_as_such(self):
+        r = self.run_main("--extensions", "--quiet", "--search", "no-such-extension")
+        self.assertNotIn("No browser extensions found", r.out)
+        self.assertIn("None of the 2 browser extension(s) match --search / --exclude", r.out)
+
+
 class TestDiffExitCode(_MainHarness, unittest.TestCase):
     """--diff exits 5 when anything changed, 0 when nothing did, in every output format."""
 

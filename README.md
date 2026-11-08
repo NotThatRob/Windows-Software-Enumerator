@@ -75,8 +75,8 @@ python Software_Enumerator.py [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--source {registry,store,portable,all}` | Source to scan (default: all; registry for `--check-vulns`) |
-| `--search TERM` | Filter results by name, publisher, or version |
-| `--exclude PATTERNS` | Exclude software matching patterns (comma-separated) |
+| `--search TERM` | Filter results by name, publisher, or version (updates: name or winget ID; extensions: name or extension ID) |
+| `--exclude PATTERNS` | Exclude software matching patterns (comma-separated; name or publisher; updates and extensions: as `--search`) |
 | `--sort {name,version,publisher,source}` | Sort results by field (default: name) |
 | `--output {table,json,csv}` | Output format (default: table) |
 | `--save-baseline FILE` | Save current state as baseline JSON file (an existing file is kept unless `--overwrite` is given) |

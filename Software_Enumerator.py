@@ -802,6 +802,15 @@ class UpdateInfo:
     available_version: str
     winget_id: str = ""
 
+    def matches_search(self, search_term: str) -> bool:
+        """--search: literal, case-insensitive match on name or winget ID."""
+        term = search_term.lower()
+        return term in self.name.lower() or term in self.winget_id.lower()
+
+    def matches_exclude(self, exclude_term: str) -> bool:
+        """--exclude: same fields as --search."""
+        return self.matches_search(exclude_term)
+
 
 @dataclass
 class BrowserExtensionInfo:
@@ -844,6 +853,15 @@ class BrowserExtensionInfo:
         "geolocation",
         "contentSettings",
     ]
+
+    def matches_search(self, search_term: str) -> bool:
+        """--search: literal, case-insensitive match on name or extension ID."""
+        term = search_term.lower()
+        return term in self.name.lower() or term in self.extension_id.lower()
+
+    def matches_exclude(self, exclude_term: str) -> bool:
+        """--exclude: same fields as --search."""
+        return self.matches_search(exclude_term)
 
     def has_sensitive_permissions(self) -> bool:
         """Check if extension has potentially dangerous permissions."""
@@ -2764,14 +2782,7 @@ class SoftwareEnumerator:
         exclude_terms: list[str] = None
     ) -> list[SoftwareInfo]:
         """Filter software list by search term and exclusion patterns."""
-        if search_term:
-            software_list = [s for s in software_list if s.matches_search(search_term)]
-        if exclude_terms:
-            software_list = [
-                s for s in software_list
-                if not any(s.matches_exclude(term) for term in exclude_terms)
-            ]
-        return software_list
+        return _apply_filters(software_list, search_term, exclude_terms)
 
     def sort_results(
         self, software_list: list[SoftwareInfo], sort_by: str = "name"
@@ -3275,6 +3286,19 @@ def _parse_exclude_terms(value: Optional[str]) -> Optional[list[str]]:
     return terms or None
 
 
+def _apply_filters(items: list, search_term: Optional[str], exclude_terms: Optional[list[str]]) -> list:
+    """Keep the items that match --search and none of the --exclude terms.
+
+    Works for any item with matches_search() / matches_exclude() (programs, updates,
+    extensions); the matching itself is literal and case-insensitive, never a regex.
+    """
+    if search_term:
+        items = [i for i in items if i.matches_search(search_term)]
+    if exclude_terms:
+        items = [i for i in items if not any(i.matches_exclude(term) for term in exclude_terms)]
+    return items
+
+
 def _check_option_combinations(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Refuse option combinations that would be ignored or give misleading results.
 
@@ -3326,13 +3350,15 @@ Examples:
     parser.add_argument(
         "--search",
         type=str,
-        help="Search/filter results by name, publisher, or version",
+        help="Search/filter results by name, publisher, or version "
+             "(updates: name or winget ID; extensions: name or extension ID)",
     )
 
     parser.add_argument(
         "--exclude",
         type=str,
-        help="Exclude software matching patterns (comma-separated, e.g. 'redistributable,.NET Runtime')",
+        help="Exclude software matching patterns (comma-separated, e.g. 'redistributable,.NET Runtime'); "
+             "matches name or publisher (updates: name or winget ID; extensions: name or extension ID)",
     )
 
     parser.add_argument(
@@ -3453,7 +3479,8 @@ Examples:
             spinner.spin()
 
         update_checker = WingetUpdateChecker()
-        updates = update_checker.check_for_updates()
+        all_updates = update_checker.check_for_updates()
+        updates = _apply_filters(all_updates, args.search, _parse_exclude_terms(args.exclude))
 
         if not args.quiet:
             spinner.finish("Update check failed" if update_checker.error
@@ -3469,7 +3496,11 @@ Examples:
                 print("Updates winget listed before the error (the list may be incomplete):")
                 update_checker.display_updates_table(updates)
             sys.exit(EXIT_API_FAILURE)
-        update_checker.display_updates_table(updates)
+        if all_updates and not updates:
+            # Not "up to date": the filters hid the updates there are
+            print(f"None of the {len(all_updates)} available update(s) match --search / --exclude.")
+        else:
+            update_checker.display_updates_table(updates)
         return
 
     # Handle browser extensions mode
@@ -3480,7 +3511,8 @@ Examples:
             spinner.spin("Chrome, Edge, Firefox...")
 
         extension_scanner = BrowserExtensionScanner()
-        extensions = extension_scanner.get_all_extensions()
+        all_extensions = extension_scanner.get_all_extensions()
+        extensions = _apply_filters(all_extensions, args.search, _parse_exclude_terms(args.exclude))
 
         if not args.quiet:
             spinner.finish(f"Found {len(extensions)} extensions")
@@ -3493,7 +3525,10 @@ Examples:
         )
         if not args.quiet:
             print(file=sys.stderr)
-        extension_scanner.display_extensions_table(extensions)
+        if all_extensions and not extensions:
+            print(f"None of the {len(all_extensions)} browser extension(s) match --search / --exclude.")
+        else:
+            extension_scanner.display_extensions_table(extensions)
         return
 
     # Handle vulnerability scanning mode

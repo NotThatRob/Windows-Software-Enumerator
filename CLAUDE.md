@@ -23,7 +23,11 @@ python -m unittest test_security.TestOutputSanitization.test_removes_ansi_color_
 
 # Common usage examples
 python Software_Enumerator.py --source registry --output json
-python Software_Enumerator.py --check-updates --extensions --check-vulns --log-file audit.log
+python Software_Enumerator.py --check-updates --log-file audit.log
+python Software_Enumerator.py --extensions
+python Software_Enumerator.py --check-vulns
+# Note: --check-updates, --extensions and --check-vulns can't be combined yet: main() runs
+# the first one given and returns (README's "Combined security audit" example is wrong).
 python Software_Enumerator.py --save-baseline baseline.json
 python Software_Enumerator.py --diff baseline.json
 python Software_Enumerator.py --quiet --output json    # suppress progress output, print only results
@@ -32,17 +36,17 @@ python Software_Enumerator.py --exclude "redistributable,.NET Runtime"  # filter
 
 ## Architecture
 
-Everything lives in `Software_Enumerator.py` (~2600 lines). Key classes:
+Everything lives in `Software_Enumerator.py` (~3,260 lines). Key classes:
 
 **Data classes** (`@dataclass`): `SoftwareInfo`, `UpdateInfo`, `BrowserExtensionInfo`, `CVEInfo`, `VulnerabilityResult`
 
-**Scanners** (each has a `scan()` method returning lists):
-- `RegistryScanner` — reads HKLM (64/32-bit) and HKCU uninstall keys via `winreg`. Pre-compiles skip patterns (regex) at `__init__` time for filtering framework/runtime entries
-- `StoreAppScanner` — runs PowerShell `Get-AppxPackage` and parses CSV output
-- `PortableAppScanner` — walks common dirs with `os.scandir()`, skips symlinks, caps at 500 files
-- `WingetUpdateChecker` — runs `winget upgrade` subprocess
-- `BrowserExtensionScanner` — reads Chrome/Edge/Firefox extension manifests from disk
-- `VulnerabilityScanner` — queries NIST NVD REST API with sliding-window rate limiter
+**Scanners** (no shared base class or `scan()` method; each has its own entry point returning a list):
+- `RegistryScanner` (`get_all_registry_software()`) — reads HKLM (64/32-bit) and HKCU uninstall keys via `winreg`. Converts values to text by type per entry and warns once per scan if a text field had an unexpected type
+- `StoreAppScanner` (`get_store_apps()`) — runs PowerShell `Get-AppxPackage` and parses CSV output
+- `PortableAppScanner` (`get_all_portable_apps()`) — walks common dirs with `os.scandir()`, skips symlinks, caps at 500 files
+- `WingetUpdateChecker` (`check_for_updates()`) — runs `winget upgrade` subprocess
+- `BrowserExtensionScanner` (`get_all_extensions()`) — reads Chrome/Edge/Firefox extension manifests from disk
+- `VulnerabilityScanner` (`scan_software_list()`) — queries NIST NVD REST API with sliding-window rate limiter. Pre-compiles its skip patterns (regex, `SKIP_PATTERNS`) at `__init__` time to leave out framework/runtime entries
 
 **Orchestration & Output**:
 - `SoftwareEnumerator` — orchestrates scanners; uses `concurrent.futures.ThreadPoolExecutor` for parallel source scanning when `--source all`
@@ -63,14 +67,14 @@ Everything lives in `Software_Enumerator.py` (~2600 lines). Key classes:
 - **CVE limit**: Default 20, max 100 (`--cve-limit`). Prevents accidental API abuse
 - **Search and exclude use literal matching** (not regex) to avoid regex injection via `matches_search()` and `matches_exclude()`. `--exclude` is comma-separated and matches against name and publisher
 - **Structured exit codes**: `EXIT_SUCCESS=0`, `EXIT_ERROR=1`, `EXIT_NO_SOFTWARE=2`, `EXIT_API_FAILURE=3`, `EXIT_PERMISSION_DENIED=4` — defined as module-level constants for CI/CD scripting. Exit 4 is currently raised for `--log-file` problems; `EXIT_API_FAILURE` is not yet wired up
-- **`SOFTWARE_MAPPINGS` dict** in `VulnerabilityScanner`: maps normalized software names to `(vendor, product)` tuples for NVD CPE queries
+- **`SOFTWARE_MAPPINGS` dict** in `VulnerabilityScanner`: maps normalized software names to CPE-style `(vendor, product)` tuples. **Known problem:** `_query_nvd_api()` currently sends them as free-text `keywordSearch`, not as a CPE query. CPE tokens such as `vlc_media_player` never appear in CVE descriptions, and NVD returns results oldest-first (20 per request, no paging), so the CVE check misses most real CVEs
 - **Env file loading**: `_load_env_file()` reads `api.env` (then `.env`) only from the tool's own folder (`_env_search_dirs()`: the script's folder, or the `.exe`'s folder when frozen) — never the CWD — and only accepts keys in `_ENV_FILE_ALLOWED_KEYS` (`NVD_API_KEY`). Other keys are ignored and logged by name, never by value. Does not overwrite existing env vars. The `api.env` file in the repo root is gitignored and is the intended place for NVD API keys during local development. Tests must patch `_env_search_dirs()` so the real `api.env` is never read
 
 ## Testing
 
 Tests are in `test_security.py` using `unittest`. Import the main module as `import Software_Enumerator as se`. Tests use `unittest.mock.patch` extensively to mock Windows APIs and network calls. Run with `python test_security.py` — no test framework installation needed.
 
-Test classes are organized by feature area (e.g., `TestOutputSanitization`, `TestSlidingWindowRateLimit`, `TestBaselineManagerRoundtrip`, `TestParallelScanning`, `TestQuietMode`). The `SecurityTestSuite` class at the bottom defines the canonical test ordering.
+Test classes are organized by feature area (e.g., `TestOutputSanitization`, `TestSlidingWindowRateLimit`, `TestBaselineManagerRoundtrip`, `TestParallelScanning`, `TestQuietMode`). The `SecurityTestSuite` class at the bottom defines the canonical test ordering. **Add every new test class to it**: `python test_security.py` runs only the listed classes, so an unlisted class runs under `python -m unittest` but is silently skipped by the main command.
 
 ## Important Constraints
 

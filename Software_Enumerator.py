@@ -2503,9 +2503,10 @@ class VulnerabilityScanner:
     def scan_plan(self, plan: VulnScanPlan, progress_callback=None) -> list[VulnerabilityResult]:
         """Look up every program in the plan. Returns one result per program, clean ones included."""
         results = []
-        for i, software in enumerate(plan.targets):
+        for done, software in enumerate(plan.targets):
             if progress_callback:
-                progress_callback(i + 1, len(plan.targets), software.name)
+                # How many are finished, and which one is being looked up now
+                progress_callback(done, len(plan.targets), software.name)
             results.append(self.scan_software(software))
         return results
 

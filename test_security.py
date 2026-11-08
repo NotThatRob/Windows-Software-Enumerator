@@ -855,6 +855,19 @@ class TestCveTargetSelection(unittest.TestCase):
         backward = scanner.plan_scan(list(reversed(self.SOFTWARE)), limit=2).targets
         self.assertEqual([s.name for s in forward], [s.name for s in backward])
 
+    def test_progress_counts_finished_programs(self):
+        """The bar must not read N/N while the last program is still being looked up."""
+        scanner = se.VulnerabilityScanner()
+        plan = scanner.plan_scan(self.SOFTWARE, limit=10)
+        events = []
+        def fake_scan(s):
+            events.append(("scanned", s.name))
+            return se.VulnerabilityResult(software_name=s.name, software_version=s.version)
+        with patch.object(scanner, "scan_software", side_effect=fake_scan):
+            scanner.scan_plan(plan, progress_callback=lambda done, total, name: events.append((done, total)))
+        reported = [e for e in events if e[0] != "scanned"]
+        self.assertEqual(reported, [(i, len(plan.targets)) for i in range(len(plan.targets))])
+
     def test_every_checked_program_gets_a_result_even_when_clean(self):
         scanner = se.VulnerabilityScanner()
         plan = scanner.plan_scan(self.SOFTWARE, limit=10)

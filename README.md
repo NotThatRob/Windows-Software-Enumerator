@@ -291,6 +291,7 @@ Structured exit codes for scripting and CI/CD integration:
 | 2 | No software found |
 | 3 | API failure: `--check-vulns` couldn't query NVD for some programs (results incomplete) |
 | 4 | Permission denied (e.g. the `--log-file` can't be written, or is owned by another account or linked) |
+| 5 | Changes found: `--diff` found programs added, removed or changed since the baseline |
 
 ## Testing
 

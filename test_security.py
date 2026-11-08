@@ -1230,6 +1230,24 @@ class TestBaselineFileChecks(_MainHarness, unittest.TestCase):
         self.assertNotIn("\x07", r.err)
 
 
+class TestDiffExitCode(_MainHarness, unittest.TestCase):
+    """--diff exits 5 when anything changed, 0 when nothing did, in every output format."""
+
+    def test_changes_found_exit_code(self):
+        path = self.save_baseline(self.SOFTWARE[:2])           # 7-Zip installed since
+        for output in ("table", "json", "csv"):
+            with self.subTest(output):
+                r = self.run_main("--diff", str(path), "--output", output, "--quiet")
+                self.assertEqual(r.code, se.EXIT_CHANGES_FOUND)
+
+    def test_no_changes_exit_code(self):
+        path = self.save_baseline(self.SOFTWARE)
+        for output in ("table", "json", "csv"):
+            with self.subTest(output):
+                r = self.run_main("--diff", str(path), "--output", output, "--quiet")
+                self.assertEqual(r.code, se.EXIT_SUCCESS)
+
+
 class TestBaselineFilters(_MainHarness, unittest.TestCase):
     """--search / --exclude with baselines: --diff filters both sides alike."""
 
@@ -3014,10 +3032,12 @@ class TestExitCodes(unittest.TestCase):
         self.assertEqual(se.EXIT_NO_SOFTWARE, 2)
         self.assertEqual(se.EXIT_API_FAILURE, 3)
         self.assertEqual(se.EXIT_PERMISSION_DENIED, 4)
+        self.assertEqual(se.EXIT_CHANGES_FOUND, 5)
 
     def test_exit_codes_are_distinct(self):
         """All exit codes should be unique values."""
-        codes = [se.EXIT_SUCCESS, se.EXIT_ERROR, se.EXIT_NO_SOFTWARE, se.EXIT_API_FAILURE, se.EXIT_PERMISSION_DENIED]
+        codes = [se.EXIT_SUCCESS, se.EXIT_ERROR, se.EXIT_NO_SOFTWARE, se.EXIT_API_FAILURE, se.EXIT_PERMISSION_DENIED,
+                 se.EXIT_CHANGES_FOUND]
         self.assertEqual(len(codes), len(set(codes)))
 
 

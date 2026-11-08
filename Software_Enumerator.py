@@ -46,6 +46,7 @@ EXIT_ERROR = 1
 EXIT_NO_SOFTWARE = 2
 EXIT_API_FAILURE = 3
 EXIT_PERMISSION_DENIED = 4
+EXIT_CHANGES_FOUND = 5      # --diff: programs were added, removed or changed since the baseline
 
 
 def setup_console_encoding():
@@ -3604,6 +3605,9 @@ Examples:
         else:
             BaselineManager.display_diff(diff, baseline_metadata)
 
+        if diff.has_changes:
+            # Lets a scheduled job or script notice changes without reading the output
+            sys.exit(EXIT_CHANGES_FOUND)
         return
 
     # Handle save baseline

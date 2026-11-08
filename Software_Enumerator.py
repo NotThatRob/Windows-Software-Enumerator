@@ -2078,14 +2078,28 @@ class VulnerabilityScanner:
         name = re.sub(r"(?<!\S)v?\d+(?:\.\d+)+\S*", " ", name)
         return " ".join(name.split())
 
+    def _find_mapping(self, name: str) -> Optional[tuple[str, str]]:
+        """CPE (vendor, product) for a display name, or None if no mapping applies.
+
+        Keys match whole words of the normalised name, so "git" matches "Git" but not
+        "Logitech G HUB" or "GitHub Desktop", and "rust" doesn't match "RustDesk". When
+        several keys match, the longest wins ("vlc media player" over "vlc").
+        """
+        normalised = self._normalize_software_name(name)
+        for key in sorted(self.SOFTWARE_MAPPINGS, key=len, reverse=True):
+            # Word boundaries that also work for keys ending in "+" (notepad++) or starting with "."
+            if re.search(r"(?<![\w+])" + re.escape(key) + r"(?![\w+])", normalised):
+                return self.SOFTWARE_MAPPINGS[key]
+        return None
+
     def _get_search_terms(self, software: SoftwareInfo) -> tuple[str, str]:
         """Get vendor and product search terms for a software."""
         name_lower = self._normalize_software_name(software.name)
 
         # Check if we have a known mapping
-        for key, (vendor, product) in self.SOFTWARE_MAPPINGS.items():
-            if key in name_lower:
-                return vendor, product
+        mapping = self._find_mapping(software.name)
+        if mapping:
+            return mapping
 
         # Fall back to using the software name as both vendor and product keyword
         # Extract likely product name (first significant word)

@@ -650,6 +650,34 @@ class TestSoftwareMappings(unittest.TestCase):
         for display_name, expected in cases.items():
             self.assertEqual(scanner._normalize_software_name(display_name), expected, display_name)
 
+    def test_mapping_matches_whole_words_only(self):
+        """A short key must not match inside another word ("git" in "Logitech", "rust" in "RustDesk")."""
+        scanner = se.VulnerabilityScanner()
+        for display_name in ["Logitech G HUB", "GitHub Desktop", "RustDesk", "Digital Editions 4.5"]:
+            self.assertIsNone(scanner._find_mapping(display_name), display_name)
+
+    def test_mapping_finds_known_programs(self):
+        scanner = se.VulnerabilityScanner()
+        cases = {
+            "Git": ("git-scm", "git"),
+            "7-Zip 23.01 (x64)": ("7-zip", "7-zip"),
+            "Notepad++ (64-bit x64)": ("notepad-plus-plus", "notepad\\+\\+"),
+            "VLC media player": ("videolan", "vlc_media_player"),
+            "Microsoft Visual Studio Code": ("microsoft", "visual_studio_code"),
+            "Rust 1.75 (MSVC 64-bit)": ("rust-lang", "rust"),
+        }
+        for display_name, expected in cases.items():
+            self.assertEqual(scanner._find_mapping(display_name), expected, display_name)
+
+    def test_longest_matching_key_wins(self):
+        """When two keys match, the more specific (longer) one is used, whatever the table order."""
+        scanner = se.VulnerabilityScanner()
+        mappings = {"visual studio": ("microsoft", "visual_studio"),
+                    "visual studio code": ("microsoft", "visual_studio_code")}
+        with patch.object(se.VulnerabilityScanner, "SOFTWARE_MAPPINGS", mappings):
+            self.assertEqual(scanner._find_mapping("Microsoft Visual Studio Code"),
+                             ("microsoft", "visual_studio_code"))
+
 
 class TestLogRotation(unittest.TestCase):
     """Test that log rotation is configured correctly."""

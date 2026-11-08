@@ -2927,7 +2927,14 @@ class BaselineManager:
             software_list: Current list of installed software
             filepath: Path to save baseline file
             sources: List of sources used (e.g., ["registry", "store", "portable"])
+
+        Raises:
+            IsADirectoryError: If the path is a folder
+            OSError: If the file can't be written (PermissionError when access is denied)
         """
+        if os.path.isdir(filepath):
+            raise IsADirectoryError(filepath)
+
         baseline = {
             "version": BaselineManager.BASELINE_VERSION,
             "created_at": datetime.now().isoformat(),
@@ -2955,8 +2962,13 @@ class BaselineManager:
 
         Raises:
             FileNotFoundError: If baseline file doesn't exist
+            IsADirectoryError: If the path is a folder
+            OSError: If the file can't be read (PermissionError when access is denied)
             ValueError: If baseline format is invalid or incompatible version
         """
+        if os.path.isdir(filepath):
+            raise IsADirectoryError(filepath)
+
         # Guard against excessively large baseline files (max 50 MB)
         file_size = os.path.getsize(filepath)
         max_baseline_size = 50 * 1024 * 1024
@@ -2967,13 +2979,20 @@ class BaselineManager:
             )
 
         with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            try:
+                data = json.load(f)
+            except RecursionError:
+                raise ValueError("Invalid baseline format: nested too deeply") from None
 
-        if "version" not in data or "software" not in data:
+        # The file is untrusted input: check its shape before using it, so a malformed
+        # file gives a clear error instead of a crash
+        if not isinstance(data, dict) or "version" not in data or "software" not in data:
             raise ValueError("Invalid baseline format: missing required fields")
 
         # Validate baseline version compatibility
-        baseline_version = data.get("version", "")
+        baseline_version = data["version"]
+        if not isinstance(baseline_version, str):
+            raise ValueError("Invalid baseline format: the version must be text")
         if not baseline_version.startswith("1."):
             raise ValueError(
                 f"Incompatible baseline version: {baseline_version}. "
@@ -2981,36 +3000,59 @@ class BaselineManager:
                 f"Please create a new baseline with the current tool version."
             )
 
+        entries = data["software"]
+        if not isinstance(entries, list):
+            raise ValueError("Invalid baseline format: 'software' must be a list")
+
         # Guard against excessively large baselines
         max_baseline_entries = 50_000
-        entry_count = len(data.get("software", []))
+        entry_count = len(entries)
         if entry_count > max_baseline_entries:
             raise ValueError(
                 f"Baseline contains {entry_count} entries, exceeding the "
                 f"maximum of {max_baseline_entries}."
             )
 
+        sources = data.get("sources", [])
+        if not isinstance(sources, list) or not all(isinstance(s, str) for s in sources):
+            raise ValueError("Invalid baseline format: 'sources' must be a list of text")
+
+        # A malformed entry rejects the whole file: skipping it would make that program
+        # show up as added or removed, which is worse than no comparison
         software_list = []
-        for item in data["software"]:
-            software_list.append(SoftwareInfo(
-                name=item.get("name", ""),
-                version=item.get("version", ""),
-                publisher=item.get("publisher", ""),
-                install_date=item.get("install_date", ""),
-                source=item.get("source", ""),
-                install_location=item.get("install_location", ""),
-            ))
+        for number, item in enumerate(entries, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"Invalid baseline format: entry {number} is not an object")
+            software_list.append(SoftwareInfo(**{
+                key: BaselineManager._entry_text(item.get(key), number, key)
+                for key in ("name", "version", "publisher", "install_date", "source", "install_location")
+            }))
 
         metadata = {
             "version": data.get("version"),
             "created_at": data.get("created_at"),
             "hostname": data.get("hostname"),
             "user": data.get("user"),
-            "sources": data.get("sources", []),
+            "sources": sources,
             "software_count": data.get("software_count"),
         }
 
         return software_list, metadata
+
+    @staticmethod
+    def _entry_text(value, number: int, key: str) -> str:
+        """A text field of a baseline entry: text as is, numbers as text, missing or null empty.
+
+        Numbers are accepted because baselines saved by older versions can hold them (registry
+        DWORD values used to be stored unconverted). Anything else rejects the file.
+        """
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)
+        raise ValueError(f"Invalid baseline format: entry {number} has a {key} that isn't text")
 
     @staticmethod
     def _normalize_name(name: str) -> str:
@@ -3458,13 +3500,23 @@ Examples:
     # Read the baseline before scanning, so a wrong path or a bad file fails at once
     # instead of after a full scan
     if args.diff:
+        shown_path = sanitize_output(args.diff)
         try:
             baseline_list, baseline_metadata = BaselineManager.load_baseline(args.diff)
         except FileNotFoundError:
-            print(f"Error: Baseline file not found: {args.diff}", file=sys.stderr)
+            print(f"Error: Baseline file not found: {shown_path}", file=sys.stderr)
             sys.exit(EXIT_ERROR)
-        except (json.JSONDecodeError, ValueError) as e:
-            print(f"Error: Invalid baseline file: {e}", file=sys.stderr)
+        except IsADirectoryError:
+            print(f"Error: {shown_path} is a folder, not a baseline file", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
+        except PermissionError:
+            print(f"Error: cannot read the baseline file (access denied): {shown_path}", file=sys.stderr)
+            sys.exit(EXIT_PERMISSION_DENIED)
+        except OSError:
+            print(f"Error: cannot read the baseline file: {shown_path}", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
+        except ValueError as e:   # also invalid JSON and invalid UTF-8
+            print(f"Error: Invalid baseline file: {sanitize_output(str(e))}", file=sys.stderr)
             sys.exit(EXIT_ERROR)
 
     # Run enumeration
@@ -3530,7 +3582,21 @@ Examples:
             print("The baseline would be empty. Check your --source, --search, and --exclude options.", file=sys.stderr)
             sys.exit(EXIT_NO_SOFTWARE)
 
-        BaselineManager.save_baseline(software_list, args.save_baseline, sources=sources)
+        shown_path = sanitize_output(args.save_baseline)
+        try:
+            BaselineManager.save_baseline(software_list, args.save_baseline, sources=sources)
+        except IsADirectoryError:
+            print(f"Error: {shown_path} is a folder; give a file name for the baseline", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
+        except FileNotFoundError:
+            print(f"Error: cannot write the baseline file (its folder doesn't exist): {shown_path}", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
+        except PermissionError:
+            print(f"Error: cannot write the baseline file (access denied): {shown_path}", file=sys.stderr)
+            sys.exit(EXIT_PERMISSION_DENIED)
+        except OSError:
+            print(f"Error: cannot write the baseline file: {shown_path}", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
         if not args.quiet:
             print(f"Baseline saved to: {args.save_baseline}")
             print(f"Software count: {len(software_list)}")

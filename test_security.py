@@ -1154,6 +1154,72 @@ class TestBaselineFileChecks(_MainHarness, unittest.TestCase):
         self.assertIn("Invalid baseline file", r.err)
         r.scan_all.assert_not_called()
 
+    MALFORMED = {
+        "JSON is a number": "5",
+        "JSON is a list": '["version", "software"]',
+        "version is a number": '{"version": 1.0, "software": []}',
+        "software is an object": '{"version": "1.0", "software": {"a": 1}}',
+        "an entry is text": '{"version": "1.0", "software": ["Chrome"]}',
+        "a name is a list": '{"version": "1.0", "software": [{"name": ["Chrome"]}]}',
+        "a version is true": '{"version": "1.0", "software": [{"name": "Chrome", "version": true}]}',
+        "sources is a number": '{"version": "1.0", "sources": 5, "software": []}',
+        "nested too deeply": "[" * 100_000 + "]" * 100_000,
+        "not UTF-8": b"\xff\xfe{}",
+    }
+
+    def test_malformed_baselines_are_rejected_with_a_message(self):
+        for label, content in self.MALFORMED.items():
+            with self.subTest(label):
+                path = self.tmp / "malformed.json"
+                if isinstance(content, bytes):
+                    path.write_bytes(content)
+                else:
+                    path.write_text(content, encoding="utf-8")
+                r = self.run_main("--diff", str(path), "--quiet")
+                self.assertEqual(r.code, se.EXIT_ERROR)
+                self.assertIn("Invalid baseline file", r.err)
+                self.assertNotIn("Traceback", r.err)
+                r.scan_all.assert_not_called()
+
+    def test_numbers_in_text_fields_are_read_as_text(self):
+        # Baselines from older versions could hold registry DWORD values as numbers
+        path = self.tmp / "old.json"
+        path.write_text(json.dumps({"version": "1.0", "software": [
+            {"name": "Tool", "version": 5, "install_date": 20240101, "publisher": None}]}), encoding="utf-8")
+        software, _ = se.BaselineManager.load_baseline(str(path))
+        self.assertEqual((software[0].version, software[0].install_date, software[0].publisher),
+                         ("5", "20240101", ""))
+        r = self.run_main("--diff", str(path), "--output", "json")
+        self.assertEqual(json.loads(r.out)["summary"]["removed_count"], 1)
+
+    def test_baseline_path_that_is_a_folder(self):
+        r = self.run_main("--diff", str(self.tmp))
+        self.assertEqual(r.code, se.EXIT_ERROR)
+        self.assertIn("is a folder", r.err)
+
+    def test_unreadable_baseline_exits_permission_denied(self):
+        with patch.object(se.BaselineManager, "load_baseline", side_effect=PermissionError(13, "denied")):
+            r = self.run_main("--diff", str(self.tmp / "locked.json"))
+        self.assertEqual(r.code, se.EXIT_PERMISSION_DENIED)
+        self.assertIn("access denied", r.err)
+        r.scan_all.assert_not_called()
+
+    def test_save_into_a_missing_folder(self):
+        r = self.run_main("--save-baseline", str(self.tmp / "no_such_folder" / "b.json"))
+        self.assertEqual(r.code, se.EXIT_ERROR)
+        self.assertIn("folder doesn't exist", r.err)
+
+    def test_save_onto_a_folder(self):
+        r = self.run_main("--save-baseline", str(self.tmp))
+        self.assertEqual(r.code, se.EXIT_ERROR)
+        self.assertIn("is a folder", r.err)
+
+    def test_save_without_access_exits_permission_denied(self):
+        with patch.object(se.BaselineManager, "save_baseline", side_effect=PermissionError(13, "denied")):
+            r = self.run_main("--save-baseline", str(self.tmp / "b.json"))
+        self.assertEqual(r.code, se.EXIT_PERMISSION_DENIED)
+        self.assertIn("access denied", r.err)
+
 
 class TestAllVersionsCves(unittest.TestCase):
     """CVEs NVD records for every version of a product (no version info) are listed apart, not counted."""

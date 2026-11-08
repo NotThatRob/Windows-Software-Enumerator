@@ -3556,6 +3556,9 @@ Examples:
             print("  Results may include false positives. Consider using matching --source options.", file=sys.stderr)
             print(file=sys.stderr)
 
+        # --search / --exclude choose what is compared, so apply them to the baseline too;
+        # otherwise every program they leave out of the current scan would look removed
+        baseline_list = enumerator.filter_results(baseline_list, args.search, exclude_terms)
         diff = BaselineManager.compare(baseline_list, software_list)
 
         log_audit_event(

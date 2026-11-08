@@ -1230,6 +1230,29 @@ class TestBaselineFileChecks(_MainHarness, unittest.TestCase):
         self.assertNotIn("\x07", r.err)
 
 
+class TestBaselineFilters(_MainHarness, unittest.TestCase):
+    """--search / --exclude with baselines: --diff filters both sides alike."""
+
+    def diff_summary(self, *argv, baseline=None):
+        path = self.save_baseline(self.SOFTWARE if baseline is None else baseline)
+        r = self.run_main("--diff", str(path), "--output", "json", *argv)
+        return json.loads(r.out)["summary"]
+
+    def test_excluded_programs_are_not_reported_as_removed(self):
+        summary = self.diff_summary("--exclude", "redistributable")
+        self.assertEqual(summary["total_changes"], 0, summary)
+
+    def test_programs_outside_the_search_are_not_reported_as_removed(self):
+        summary = self.diff_summary("--search", "chrome")
+        self.assertEqual(summary["total_changes"], 0, summary)
+
+    def test_changes_inside_the_filter_are_still_found(self):
+        chrome, redist, seven_zip = self.SOFTWARE
+        old_chrome = se.SoftwareInfo(name=chrome.name, version="141.0", publisher=chrome.publisher)
+        summary = self.diff_summary("--search", "chrome", baseline=[old_chrome, redist])
+        self.assertEqual((summary["changed_count"], summary["total_changes"]), (1, 1), summary)
+
+
 class TestAllVersionsCves(unittest.TestCase):
     """CVEs NVD records for every version of a product (no version info) are listed apart, not counted."""
 

@@ -3039,6 +3039,18 @@ class BaselineManager:
             print("\nNOTE: Software has been removed since baseline was created.")
 
 
+def _parse_exclude_terms(value: Optional[str]) -> Optional[list[str]]:
+    """Split a comma-separated --exclude value into terms, ignoring empty ones.
+
+    An empty term would match every name ("" is in every string), so "chrome," must mean
+    just "chrome", not "everything". Returns None when no terms are left.
+    """
+    if not value:
+        return None
+    terms = [t.strip() for t in value.split(",") if t.strip()]
+    return terms or None
+
+
 def main():
     """Main entry point for the CLI."""
     _harden_process_environment()
@@ -3300,7 +3312,7 @@ Examples:
     # Suppress progress output if outputting to JSON/CSV (for clean piping) or quiet mode
     show_progress = args.output == "table" and not args.diff and not args.quiet
     software_list = enumerator.scan_all(sources, show_progress=show_progress)
-    exclude_terms = [t.strip() for t in args.exclude.split(",")] if args.exclude else None
+    exclude_terms = _parse_exclude_terms(args.exclude)
     software_list = enumerator.filter_results(software_list, args.search, exclude_terms)
     software_list = enumerator.sort_results(software_list, args.sort)
 

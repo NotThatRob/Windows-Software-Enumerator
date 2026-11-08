@@ -2414,6 +2414,16 @@ class TestExcludeFilter(unittest.TestCase):
         ]
         self.enumerator = se.SoftwareEnumerator()
 
+    def test_empty_terms_are_ignored(self):
+        """A stray comma used to add an empty term, and "" matches every name: everything was excluded."""
+        self.assertEqual(se._parse_exclude_terms("chrome,"), ["chrome"])
+        self.assertEqual(se._parse_exclude_terms("a,,b"), ["a", "b"])
+        self.assertEqual(se._parse_exclude_terms(" , "), None)
+        self.assertEqual(se._parse_exclude_terms(None), None)
+        kept = self.enumerator.filter_results(self.software_list, None, se._parse_exclude_terms("chrome,"))
+        self.assertEqual([s.name for s in kept],
+                         ["Microsoft .NET Runtime", "Visual C++ Redistributable", "Firefox"])
+
     def test_exclude_single_term(self):
         """Single exclude term should filter matching software."""
         result = self.enumerator.filter_results(self.software_list, exclude_terms=[".NET"])

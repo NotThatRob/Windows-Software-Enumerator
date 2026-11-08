@@ -76,6 +76,8 @@ Tests are in `test_security.py` using `unittest`. Import the main module as `imp
 
 Test classes are organized by feature area (e.g., `TestOutputSanitization`, `TestSlidingWindowRateLimit`, `TestBaselineManagerRoundtrip`, `TestParallelScanning`, `TestQuietMode`). `run_security_tests()` collects every `TestCase` class in the module automatically (`loadTestsFromModule`, alphabetical order), so a new class needs no registration. Tests must not depend on running in a particular order.
 
+CI (`.github/workflows/tests.yml`) runs `python test_security.py` plus one real CLI smoke run on `windows-latest` with Python 3.10 and 3.14, for every PR and every push to `master`. Actions are pinned to full commit SHAs (version in a comment); keep it that way when bumping them.
+
 ## Important Constraints
 
 - Windows-only: uses `winreg`, `ctypes`, PowerShell subprocesses

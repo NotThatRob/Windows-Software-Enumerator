@@ -1,0 +1,46 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+# Read-only token: this workflow only checks out code and runs tests.
+permissions:
+  contents: read
+
+# A newer push to the same branch or PR cancels the run it supersedes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: windows-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # Quoted so YAML doesn't read 3.10 as the number 3.1.
+        # Oldest supported version and the newest release.
+        python-version: ["3.10", "3.14"]
+
+    steps:
+      # Actions are pinned to full commit SHAs (a tag can be moved to different code; a SHA can't).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run tests
+        run: python test_security.py
+
+      # Nothing in the unit tests drives main() yet, so run the real CLI once to catch
+      # import or argument-parsing crashes. Output is discarded; only the exit code matters.
+      - name: Smoke-run the CLI
+        run: python Software_Enumerator.py --source registry --output json --quiet > $null

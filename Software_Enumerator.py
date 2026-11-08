@@ -873,6 +873,8 @@ class CVEInfo:
     references: list = field(default_factory=list)
     cvss_version: str = ""   # "4.0", "3.1", "3.0", "2.0"; "" if not scored yet
     score_source: str = ""   # "NVD" (NVD's own assessment) or "CNA" (assigner / other provider)
+    known_exploited: bool = False  # in CISA's Known Exploited Vulnerabilities (KEV) catalog
+    kev_added: str = ""            # date CISA added it to KEV
 
     @property
     def score_label(self) -> str:
@@ -904,6 +906,10 @@ class VulnerabilityResult:
     not_checked: str = ""    # reason the program wasn't looked up, e.g. "no CPE mapping"
     cpe: str = ""            # CPE name that was looked up
     total_available: int = 0  # CVEs NVD reported (can exceed len(cves) if the page cap was hit)
+
+    @property
+    def kev_count(self) -> int:
+        return sum(1 for c in self.cves if c.known_exploited)
 
     @property
     def critical_count(self) -> int:
@@ -2277,6 +2283,9 @@ class VulnerabilityScanner:
                 references=references,
                 cvss_version=cvss_version,
                 score_source=score_source,
+                # NVD includes CISA's KEV fields on CVEs that are known to be exploited
+                known_exploited=isinstance(cve.get("cisaExploitAdd"), str),
+                kev_added=str(cve.get("cisaExploitAdd") or "")[:10],
             )
         except (KeyError, TypeError, AttributeError):
             return None
@@ -2356,9 +2365,9 @@ class VulnerabilityScanner:
             if cve:  # every severity, including LOW and not yet scored
                 result.cves.append(cve)
 
-        # Sort by severity (CRITICAL first)
+        # Known-exploited first, then by severity (CRITICAL first) and score
         severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
-        result.cves.sort(key=lambda c: (severity_order.get(c.severity, 4), -c.cvss_score))
+        result.cves.sort(key=lambda c: (not c.known_exploited, severity_order.get(c.severity, 4), -c.cvss_score))
         return result
 
     def scan_software_list(
@@ -2418,7 +2427,8 @@ class VulnerabilityScanner:
             print(f"  Found {result.total_count} potential CVE(s):")
 
             for cve in result.cves[:5]:  # Show top 5 per software
-                print(f"\n  {cve.severity_color} {cve.cve_id} ({cve.score_label})")
+                kev = " [KEV: known exploited]" if cve.known_exploited else ""
+                print(f"\n  {cve.severity_color} {cve.cve_id} ({cve.score_label}){kev}")
                 print(f"      Severity: {cve.severity}")
                 print(f"      Published: {cve.published_date}")
                 # Wrap description

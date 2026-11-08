@@ -762,6 +762,30 @@ class TestCveScores(unittest.TestCase):
         self.assertEqual(by_id["CVE-2026-0001"].score_label, "not scored yet")
 
 
+class TestKnownExploitedFlag(unittest.TestCase):
+    """CVEs in CISA's KEV catalog are flagged (NVD includes the KEV fields) and listed first."""
+
+    def test_kev_fields_mark_a_cve_as_known_exploited(self):
+        scanner = se.VulnerabilityScanner()
+        kev = scanner._parse_cve(_nvd_vuln("CVE-2023-38831", cisaExploitAdd="2023-08-24",
+                                           cisaActionDue="2023-09-14"))
+        plain = scanner._parse_cve(_nvd_vuln("CVE-2023-0002"))
+        self.assertTrue(kev.known_exploited)
+        self.assertEqual(kev.kev_added, "2023-08-24")
+        self.assertFalse(plain.known_exploited)
+
+    def test_known_exploited_listed_first_and_counted(self):
+        scanner = se.VulnerabilityScanner()
+        scanner._rate_max = 1000
+        page = {"totalResults": 2, "vulnerabilities": [
+            _nvd_vuln("CVE-2024-0001", severity="CRITICAL", score=9.8),
+            _nvd_vuln("CVE-2024-0002", severity="MEDIUM", score=5.0, cisaExploitAdd="2024-05-01")]}
+        with patch("urllib.request.urlopen", side_effect=_FakeNvd(page)):
+            result = scanner.scan_software(se.SoftwareInfo(name="WinRAR 6.22 (64-bit)", version="6.22"))
+        self.assertEqual([c.cve_id for c in result.cves], ["CVE-2024-0002", "CVE-2024-0001"])
+        self.assertEqual(result.kev_count, 1)
+
+
 class TestLogRotation(unittest.TestCase):
     """Test that log rotation is configured correctly."""
 

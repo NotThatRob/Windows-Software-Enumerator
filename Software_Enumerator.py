@@ -3549,7 +3549,9 @@ Examples:
         current_sources = set(sources)
         if baseline_sources and baseline_sources != current_sources:
             print("WARNING: Source mismatch detected!", file=sys.stderr)
-            print(f"  Baseline sources: {', '.join(sorted(baseline_sources)) or 'unknown'}", file=sys.stderr)
+            # The names come from the baseline file (untrusted), so sanitize them
+            print(f"  Baseline sources: {sanitize_output(', '.join(sorted(baseline_sources))) or 'unknown'}",
+                  file=sys.stderr)
             print(f"  Current sources:  {', '.join(sorted(current_sources))}", file=sys.stderr)
             print("  Results may include false positives. Consider using matching --source options.", file=sys.stderr)
             print(file=sys.stderr)

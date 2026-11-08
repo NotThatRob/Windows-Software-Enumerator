@@ -1220,6 +1220,15 @@ class TestBaselineFileChecks(_MainHarness, unittest.TestCase):
         self.assertEqual(r.code, se.EXIT_PERMISSION_DENIED)
         self.assertIn("access denied", r.err)
 
+    def test_source_names_from_the_baseline_are_sanitized_in_the_mismatch_warning(self):
+        path = self.tmp / "crafted.json"
+        path.write_text(json.dumps({"version": "1.0", "sources": ["store\x1b]0;owned\x07\x1b[2J", "portable"],
+                                    "software": []}), encoding="utf-8")
+        r = self.run_main("--diff", str(path), "--source", "registry", "--quiet")
+        self.assertIn("Source mismatch", r.err)
+        self.assertNotIn("\x1b", r.err)
+        self.assertNotIn("\x07", r.err)
+
 
 class TestAllVersionsCves(unittest.TestCase):
     """CVEs NVD records for every version of a product (no version info) are listed apart, not counted."""

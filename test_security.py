@@ -1254,6 +1254,69 @@ class TestCsvFormulaInjection(unittest.TestCase):
                     self.assertTrue(cell.startswith("'"), f"not neutralised: {cell!r}")
 
 
+class TestCsvLineEndings(unittest.TestCase):
+    """CSV written to a Windows text-mode stream must end each line with exactly one CRLF.
+
+    Text-mode stdout and files on Windows turn "\\n" into "\\r\\n". If the CSV text already
+    used "\\r\\n", every line came out as "\\r\\r\\n", which Excel shows as a blank row.
+    """
+
+    ITEMS = [se.SoftwareInfo(name="App1", version="1.0", publisher="P1", source="Registry"),
+             se.SoftwareInfo(name="App2", version="2.0", publisher="P2", source="Registry")]
+
+    @staticmethod
+    def _through_windows_text_stream(text):
+        """Bytes produced by writing text the way Windows text-mode stdout does."""
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="utf-8", newline="\r\n")
+        stream.write(text)
+        stream.flush()
+        return raw.getvalue()
+
+    def _assert_one_crlf_per_line(self, data, expected_lines):
+        self.assertNotIn(b"\r\r\n", data)
+        self.assertEqual(data.count(b"\r\n"), expected_lines)
+        self.assertEqual(data.count(b"\n"), expected_lines)       # no bare LF either
+
+    def test_to_csv_lines_end_with_single_crlf(self):
+        data = self._through_windows_text_stream(se.SoftwareExporter.to_csv(self.ITEMS))
+        self._assert_one_crlf_per_line(data, expected_lines=3)    # header + 2 rows
+
+    def test_diff_csv_lines_end_with_single_crlf(self):
+        old, new = self.ITEMS[0], se.SoftwareInfo(name="App1", version="1.1", publisher="P1",
+                                                  source="Registry")
+        diff = se.BaselineDiff(added=[self.ITEMS[1]], changed=[(old, new)])
+        data = self._through_windows_text_stream(se.BaselineManager.diff_to_csv(diff))
+        self._assert_one_crlf_per_line(data, expected_lines=3)    # header + added + changed
+
+    def test_export_to_file_lines_end_with_single_crlf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.csv")
+            with patch.object(se, "log_audit_event"):
+                se.SoftwareExporter.export(self.ITEMS, "csv", output_file=path)
+            with open(path, "rb") as f:
+                data = f.read()
+        self._assert_one_crlf_per_line(data, expected_lines=3)
+
+    def _export_to_stdout(self, fmt):
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="utf-8", newline="\r\n")
+        with patch("sys.stdout", stream):
+            se.SoftwareExporter.export(self.ITEMS, fmt)
+        stream.flush()
+        return raw.getvalue()
+
+    def test_csv_on_stdout_ends_after_last_record(self):
+        """No extra empty line after the last record (the CSV text already ends with one)."""
+        data = self._export_to_stdout("csv")
+        self.assertFalse(data.endswith(b"\r\n\r\n"), f"ends with {data[-8:]!r}")
+        self._assert_one_crlf_per_line(data, expected_lines=3)
+
+    def test_json_on_stdout_still_ends_with_newline(self):
+        data = self._export_to_stdout("json")
+        self.assertTrue(data.endswith(b"}\r\n"), f"ends with {data[-8:]!r}")
+
+
 class _FakeRegistry:
     """Minimal winreg stand-in: {subkey_name: {value_name: value}} under a single path.
 
@@ -1628,6 +1691,26 @@ class TestLogFilePermissions(unittest.TestCase):
         self._assert_owner_only(log)
         self.assertIn("hello", log.read_text(encoding="utf-8"))   # owner can still write and read
 
+    def test_setting_up_logging_again_closes_the_previous_log_file(self):
+        """A second setup_logging() call must close the first log file, not just drop its handler.
+
+        The log file is opened without FILE_SHARE_DELETE, so while it is still open Windows
+        refuses to delete it: deleting it is a direct check that the handle was released.
+        """
+        first, second = self.dir / "first.log", self.dir / "second.log"
+        se.setup_logging(log_file=str(first))
+        first_handlers = list(se.logger.handlers)
+        try:
+            se.setup_logging(log_file=str(second))
+            try:
+                first.unlink()
+            except PermissionError:
+                self.fail("first log file is still open after setup_logging() was called again")
+        finally:
+            for h in first_handlers:     # don't leave the file open if the check failed
+                h.close()
+        self.assertTrue(second.exists())
+
     def test_existing_explicit_grant_is_removed(self):
         import subprocess
         log = self.dir / "audit.log"
@@ -1779,9 +1862,6 @@ class TestLogFilePermissions(unittest.TestCase):
             with patch.object(se, "_handle_owner_sid", return_value=sid):
                 se.setup_logging(log_file=str(log))                          # must not raise
             self._assert_owner_only(log)
-            for h in list(se.logger.handlers):   # setup_logging() drops old handlers without closing them
-                h.close()
-            se.logger.handlers.clear()
 
     def test_own_existing_file_is_accepted(self):
         """Owner of a file this process creates is one of our own SIDs (real check, no mocks)."""
@@ -2196,57 +2276,20 @@ class TestExitCodes(unittest.TestCase):
         self.assertEqual(len(codes), len(set(codes)))
 
 
-class SecurityTestSuite(unittest.TestSuite):
-    """Aggregate all security tests."""
-
-    def __init__(self):
-        super().__init__()
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestOutputSanitization))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestApiKeyEnvironmentVariable))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestUserAgent))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestSymlinkProtection))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestErrorMessageSanitization))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestAuditLogging))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestTOCTOUFixes))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestDataclassSecurity))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestVersionMatching))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCsvParsing))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestSoftwareMappings))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestLogRotation))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCveLimitArg))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestPortableAppFileLimit))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestSlidingWindowRateLimit))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestEnhancedPermissions))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestBaselineLimits))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestSoftwareExporter))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestBaselineManagerRoundtrip))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestParallelScanning))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestQuietMode))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCsvSanitizationConsistency))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestDiffExportSanitization))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCsvFormulaInjection))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestRegistryMalformedValues))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestBrowserMalformedInput))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestExecutableResolution))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestLogFilePermissions))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCompiledSkipPatterns))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestLoadEnvFile))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestWingetUpdateChecker))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestStoreAppScanner))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestExcludeFilter))
-        self.addTests(unittest.TestLoader().loadTestsFromTestCase(TestExitCodes))
-
-
 def run_security_tests():
-    """Run all security tests and print results."""
+    """Run every test class in this module and print results."""
     print("=" * 70)
     print("SOFTWARE ENUMERATOR - SECURITY TEST SUITE")
     print("=" * 70)
     print()
 
+    # Collect test classes automatically, so a new class can't be left out by
+    # forgetting to add it to a hand-maintained list.
+    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+
     # Run with verbosity
     runner = unittest.TextTestRunner(verbosity=2)
-    result = runner.run(SecurityTestSuite())
+    result = runner.run(suite)
 
     print()
     print("=" * 70)

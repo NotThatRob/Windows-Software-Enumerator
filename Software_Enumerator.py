@@ -511,8 +511,12 @@ def setup_logging(log_file: str = None, verbose: bool = False) -> None:
     log_format = "%(asctime)s | %(levelname)-8s | %(message)s"
     date_format = "%Y-%m-%d %H:%M:%S"
 
-    # Clear any existing handlers to prevent accumulation on repeated calls
-    logger.handlers.clear()
+    # Remove handlers from an earlier call so they don't accumulate, and close them so an
+    # earlier log file isn't left open (and locked against deletion) until the process exits.
+    # Closing a StreamHandler doesn't close the stream itself, so stderr stays usable.
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
 
     # Set base logging level
     level = logging.DEBUG if verbose else logging.INFO
@@ -2587,7 +2591,11 @@ class SoftwareExporter:
         """
         output = io.StringIO()
         fieldnames = ["name", "version", "publisher", "install_date", "source", "install_location"]
-        writer = csv.DictWriter(output, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+        # "\n", not csv's default "\r\n": the text is written through a text-mode stream
+        # (stdout or a file), which already turns "\n" into "\r\n" on Windows. With "\r\n"
+        # here every line would end "\r\r\n" and Excel shows a blank row between records.
+        writer = csv.DictWriter(output, fieldnames=fieldnames, quoting=csv.QUOTE_ALL,
+                                lineterminator="\n")
         writer.writeheader()
 
         for software in software_list:
@@ -2617,7 +2625,8 @@ class SoftwareExporter:
                 f.write(content)
             log_audit_event("EXPORT", f"Exported to {format}", file=output_file, count=len(software_list))
         else:
-            print(content)
+            # CSV text already ends with a line ending; JSON doesn't, so print() adds one.
+            print(content, end="" if format == "csv" else "\n")
 
 
 @dataclass
@@ -2820,7 +2829,8 @@ class BaselineManager:
         Columns: change_type, name, baseline_version, current_version, publisher, source
         """
         output = io.StringIO()
-        writer = csv.writer(output, quoting=csv.QUOTE_ALL)
+        # "\n" for the same reason as SoftwareExporter.to_csv: the text-mode stream adds the "\r".
+        writer = csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator="\n")
         writer.writerow(["change_type", "name", "baseline_version", "current_version", "publisher", "source"])
 
         def row(change_type, name, baseline_version, current_version, publisher, source):
@@ -3206,7 +3216,7 @@ Examples:
             if args.output == "json":
                 print(BaselineManager.diff_to_json(diff, baseline_metadata, args.diff))
             elif args.output == "csv":
-                print(BaselineManager.diff_to_csv(diff))
+                print(BaselineManager.diff_to_csv(diff), end="")   # CSV text ends with its own line ending
             else:
                 BaselineManager.display_diff(diff, baseline_metadata)
 

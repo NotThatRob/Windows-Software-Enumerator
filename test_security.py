@@ -685,6 +685,26 @@ class TestNvdCpeQuery(unittest.TestCase):
             self.assertEqual(fake.urls, [], version)
             self.assertTrue(result.not_checked, version)
 
+    def test_installer_versions_are_translated_for_nvd(self):
+        """Python and Java installers report versions that NVD would read as different versions."""
+        cases = [
+            (("python", "python"), "3.11.4150.0", "3.11.4"),
+            (("python", "python"), "3.13.150.0", "3.13.0"),
+            (("python", "python"), "3.12.1", "3.12.1"),             # already plain
+            (("oracle", "jre"), "8.0.4010.10", "1.8.0:update401"),
+            (("oracle", "jre"), "8.0.3910.13", "1.8.0:update391"),
+            (("oracle", "jre"), "17.0.9.0", "17.0.9"),
+            (("videolan", "vlc_media_player"), "3.0.18.0", "3.0.18.0"),  # other products untouched
+        ]
+        for (vendor, product), raw, expected in cases:
+            self.assertEqual(se.VulnerabilityScanner._cpe_version(vendor, product, raw), expected, raw)
+
+    def test_translated_version_is_what_nvd_is_asked_about(self):
+        _, fake = self._scan(se.SoftwareInfo(name="Python 3.11.4 (64-bit)", version="3.11.4150.0"))
+        self.assertIn("cpeName=cpe:2.3:a:python:python:3.11.4&", fake.urls[0])
+        _, fake = self._scan(se.SoftwareInfo(name="Java 8 Update 401 (64-bit)", version="8.0.4010.10"))
+        self.assertIn("cpeName=cpe:2.3:a:oracle:jre:1.8.0:update401&", fake.urls[0])
+
     def test_nvd_failure_is_reported_not_hidden(self):
         import urllib.error
         result, _ = self._scan(self.VLC, urllib.error.URLError("down"))

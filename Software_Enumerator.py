@@ -2105,16 +2105,51 @@ class VulnerabilityScanner:
         return None
 
     @staticmethod
-    def _cpe_version(vendor: str, product: str, version: str) -> Optional[str]:
+    def _python_installer_version(version: str) -> str:
+        """Python's Windows installer reports 3.11.4 as "3.11.4150.0" (micro * 1000 + build).
+
+        Read literally, NVD treats 3.11.4150 as newer than 3.11.5 and misses CVEs fixed since.
+        """
+        m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:\.\d+)?", version)
+        if m and int(m.group(3)) >= 100:
+            return f"{m.group(1)}.{m.group(2)}.{int(m.group(3)) // 1000}"
+        return version
+
+    @staticmethod
+    def _java_installer_version(version: str) -> str:
+        """Java 8's installer reports 8u401 as "8.0.4010.10"; NVD names it "1.8.0:update401".
+
+        Java 9 and later report e.g. "17.0.9.0", which NVD names "17.0.9".
+        """
+        m = re.fullmatch(r"8\.0\.(\d+)(?:\.\d+)?", version)
+        if m:
+            return f"1.8.0:update{int(m.group(1)) // 10}"
+        m = re.fullmatch(r"(\d+\.\d+\.\d+)\.0", version)
+        if m:
+            return m.group(1)
+        return version
+
+    # Products whose installers report versions in a form NVD reads differently
+    VERSION_TRANSLATORS = {
+        ("python", "python"): "_python_installer_version",
+        ("oracle", "jre"): "_java_installer_version",
+    }
+
+    @classmethod
+    def _cpe_version(cls, vendor: str, product: str, version: str) -> Optional[str]:
         """The installed version as it goes into a CPE name, or None if it can't be used.
 
         Only plain version strings are accepted: anything with spaces or CPE special
         characters (":", "*", "?", "\\", ...) would change the meaning of the CPE name.
+        Then products in VERSION_TRANSLATORS get their installer's format translated.
         """
         version = (version or "").strip()
-        if re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._-]*", version):
-            return version
-        return None
+        if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._-]*", version):
+            return None
+        translator = cls.VERSION_TRANSLATORS.get((vendor, product))
+        if translator:
+            version = getattr(cls, translator)(version)
+        return version
 
     @staticmethod
     def _cpe_name(vendor: str, product: str, cpe_version: str) -> str:

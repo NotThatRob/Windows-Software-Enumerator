@@ -1902,17 +1902,20 @@ class VulnerabilityScanner:
 
     NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
-    # Software name mappings to improve CVE search accuracy
-    # Maps common software names to their CPE vendor/product names
+    # Display-name keys -> CPE (vendor, product) as NVD names them. Every pair must exist in
+    # NVD's CPE dictionary: a pair NVD doesn't know makes the check find nothing, silently.
+    # Deliberately absent because NVD has no CPE product for them (checked 2026-11):
+    # OBS Studio, HandBrake, ShareX, Atom, AdoptOpenJDK, Slack desktop, Vivaldi (installer only),
+    # Sublime Text 4 (only sublime_text_3 exists). They are reported as "not checked".
     SOFTWARE_MAPPINGS = {
         # Browsers
         "google chrome": ("google", "chrome"),
         "mozilla firefox": ("mozilla", "firefox"),
         "firefox": ("mozilla", "firefox"),
-        "microsoft edge": ("microsoft", "edge"),
+        "microsoft edge": ("microsoft", "edge_chromium"),  # "edge" is the retired EdgeHTML browser
+        "microsoft edge update": ("microsoft", "edge_update"),
         "opera": ("opera", "opera_browser"),
         "brave": ("brave", "brave"),
-        "vivaldi": ("vivaldi", "vivaldi"),
         "tor browser": ("torproject", "tor"),
         # Dev tools - Editors & IDEs
         "notepad++": ("notepad-plus-plus", "notepad\\+\\+"),
@@ -1928,15 +1931,12 @@ class VulnerabilityScanner:
         "phpstorm": ("jetbrains", "phpstorm"),
         "datagrip": ("jetbrains", "datagrip"),
         "eclipse": ("eclipse", "eclipse_ide"),
-        "sublime text": ("sublimetext", "sublime_text"),
-        "atom": ("atom", "atom"),
         # Dev tools - Languages & Runtimes
         "python": ("python", "python"),
         "nodejs": ("nodejs", "node.js"),
         "node.js": ("nodejs", "node.js"),
         "java": ("oracle", "jre"),
         "openjdk": ("oracle", "openjdk"),
-        "adoptopenjdk": ("adoptopenjdk", "openjdk"),
         "go programming language": ("golang", "go"),
         "rust": ("rust-lang", "rust"),
         "ruby": ("ruby-lang", "ruby"),
@@ -1950,7 +1950,6 @@ class VulnerabilityScanner:
         # Productivity
         "libreoffice": ("libreoffice", "libreoffice"),
         "thunderbird": ("mozilla", "thunderbird"),
-        "slack": ("slack", "slack"),
         "microsoft teams": ("microsoft", "teams"),
         "notion": ("notion", "notion"),
         # Media
@@ -1960,11 +1959,9 @@ class VulnerabilityScanner:
         "gimp": ("gimp", "gimp"),
         "inkscape": ("inkscape", "inkscape"),
         "blender": ("blender", "blender"),
-        "handbrake": ("handbrake", "handbrake"),
         "ffmpeg": ("ffmpeg", "ffmpeg"),
         "kodi": ("kodi", "kodi"),
         "itunes": ("apple", "itunes"),
-        "obs studio": ("obsproject", "obs_studio"),
         "spotify": ("spotify", "spotify"),
         # Security
         "keepass": ("keepass", "keepass"),
@@ -1981,13 +1978,13 @@ class VulnerabilityScanner:
         "winrar": ("rarlab", "winrar"),
         "peazip": ("peazip", "peazip"),
         "everything": ("voidtools", "everything"),
-        "sharex": ("sharex", "sharex"),
         "autohotkey": ("autohotkey", "autohotkey"),
         "ccleaner": ("piriform", "ccleaner"),
         "powershell": ("microsoft", "powershell"),
         # Communication & Collaboration
         "discord": ("discord", "discord"),
         "zoom": ("zoom", "zoom"),
+        "zoom workplace": ("zoom", "workplace_desktop"),
         "filezilla": ("filezilla-project", "filezilla_client"),
         # System & Virtualization
         "vmware workstation": ("vmware", "workstation"),
@@ -2004,13 +2001,13 @@ class VulnerabilityScanner:
         "sqlite": ("sqlite", "sqlite"),
         # Network & Web
         "nginx": ("f5", "nginx"),
-        "apache": ("apache", "http_server"),
+        "apache http server": ("apache", "http_server"),  # not bare "apache": OpenOffice, NetBeans, ...
         "postman": ("postman", "postman"),
         "curl": ("haxx", "curl"),
         "wget": ("gnu", "wget"),
         # Gaming
         "steam": ("valvesoftware", "steam_client"),
-        "epic games launcher": ("epicgames", "epic_games_launcher"),
+        "epic games launcher": ("epicgames", "launcher"),
         "gog galaxy": ("gog", "galaxy"),
     }
 

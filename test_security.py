@@ -669,6 +669,20 @@ class TestSoftwareMappings(unittest.TestCase):
         for display_name, expected in cases.items():
             self.assertEqual(scanner._find_mapping(display_name), expected, display_name)
 
+    def test_repaired_mappings_point_at_products_nvd_knows(self):
+        """Mappings NVD doesn't know (0 dictionary entries) are fixed or removed, not left to find nothing."""
+        scanner = se.VulnerabilityScanner()
+        cases = {
+            "Microsoft Edge": ("microsoft", "edge_chromium"),        # "edge" is the retired EdgeHTML browser
+            "Microsoft Edge Update": ("microsoft", "edge_update"),
+            "Zoom Workplace (64-bit)": ("zoom", "workplace_desktop"),
+            "Epic Games Launcher": ("epicgames", "launcher"),
+            "OBS Studio": None, "HandBrake 1.7.2": None, "ShareX": None, "Slack": None, "Vivaldi": None,
+            "Apache OpenOffice 4.1.15": None,                       # not Apache HTTP Server
+        }
+        for display_name, expected in cases.items():
+            self.assertEqual(scanner._find_mapping(display_name), expected, display_name)
+
     def test_longest_matching_key_wins(self):
         """When two keys match, the more specific (longer) one is used, whatever the table order."""
         scanner = se.VulnerabilityScanner()
